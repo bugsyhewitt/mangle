@@ -1,0 +1,47 @@
+mangle
+======
+
+A structured H.265 (HEVC) bitstream fuzzer for security research.
+
+This product includes work inspired by and built on top of the following.
+
+
+Design inspiration
+------------------
+
+h26forge
+  Vasudev Bhaskaran, Sam Crow, Hovav Shacham, et al.,
+  "h26forge: Generating Syntactically Correct but Semantically Spec-Non-Compliant
+  H.264 Video Files," USENIX Security 2024.
+  https://www.usenix.org/conference/usenixsecurity24
+
+  mangle adopts h26forge's core idea — generating syntactically-correct but
+  semantically spec-non-compliant video bitstreams via structured, parameter-level
+  mutation — and applies it to H.265 (HEVC), which the h26forge paper explicitly
+  identified as a fuzzing gap. mangle reuses no h26forge source code; only the
+  design approach is shared.
+
+
+Decoders (used, not bundled)
+----------------------------
+
+ffmpeg
+  https://ffmpeg.org/
+  Licensed under the GNU LGPL/GPL. mangle invokes ffmpeg as an external decode
+  target via subprocess; it does not bundle, link, or modify ffmpeg.
+
+libde265
+  https://github.com/strukturag/libde265
+  An open-source HEVC decoder. mangle can invoke libde265's `dec265` CLI as a
+  decode target; it does not bundle, link, or modify libde265.
+
+
+HEVC patent acknowledgment
+--------------------------
+
+H.265 / HEVC is an ITU-T / ISO-IEC standard covered by patents licensed through
+pools including MPEG LA / Access Advance and others. mangle does NOT implement an
+HEVC encoder or decoder. It reads, mutates, and writes HEVC bitstream syntax for
+the express purpose of security research, and feeds the resulting bitstreams to
+pre-existing, separately-obtained decoders (ffmpeg / libde265). See README.md for
+the full research-purpose statement.
