@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mangle"
+version = "0.1.0"
+description = "A structured H.265 (HEVC) bitstream fuzzer for security research"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { file = "LICENSE" }
+authors = [{ name = "necromancer suite" }]
+keywords = ["hevc", "h265", "fuzzing", "security", "bitstream", "codec"]
+classifiers = [
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Multimedia :: Video",
+    "Intended Audience :: Developers",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+mangle = "mangle.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/bugsyhewitt/mangle"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mangle = ["py.typed"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that require a real ffmpeg/libde265 install (deselect with '-m \"not integration\"')",
+]
+testpaths = ["tests"]
