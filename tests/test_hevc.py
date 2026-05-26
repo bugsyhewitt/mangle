@@ -53,6 +53,25 @@ class TestSpsParsing:
         assert reparsed.pic_height_in_luma_samples == 96
 
 
+class TestSpsRpsParsing:
+    def test_dpb_and_poc_fields_parsed(self):
+        sps = parse_sps(_nal_rbsp(33))
+        # The seed is a single intra IDR frame: it parses to the RPS region.
+        assert sps.sps_max_dec_pic_buffering_minus1, "DPB sizing not parsed"
+        assert sps.log2_max_pic_order_cnt_lsb_minus4 is not None
+        assert sps.num_short_term_ref_pic_sets is not None
+        assert sps.long_term_ref_pics_present_flag is not None
+
+    def test_rps_field_spans_present(self):
+        sps = parse_sps(_nal_rbsp(33))
+        # These spans drive the RPS mutators.
+        st = sps.span("num_short_term_ref_pic_sets")
+        lt = sps.span("long_term_ref_pics_present_flag")
+        assert st.bit_length >= 1
+        assert lt.bit_length == 1
+        assert lt.bit_offset > st.bit_offset
+
+
 class TestPpsParsing:
     def test_tiles_flag_present(self):
         pps = parse_pps(_nal_rbsp(34))

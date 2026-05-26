@@ -23,10 +23,12 @@ from ..bitstream import (
     split_nal_units,
 )
 from ..hevc import (
+    ShortTermRps,
     parse_pps,
     parse_slice_header,
     parse_sps,
     splice_fixed_bits,
+    splice_replace_region,
     splice_ue_field,
 )
 from .registry import MutationResult, count_changed_bytes, register
@@ -195,6 +197,168 @@ def nal_unit_type_swap(nals: list[NalUnit], rng: random.Random) -> MutationResul
         mutator="nal-unit-type-swap",
         bytes_changed=count_changed_bytes(original_stream, mutated_stream),
         detail=f"nal_unit_type: {old_type} -> {new_type} (NAL #{idx})",
+    )
+
+
+def _write_st_ref_pic_set(writer, rps: ShortTermRps) -> None:
+    """Serialise an ``st_ref_pic_set()`` block (stRpsIdx==0, H.265 7.3.7)."""
+    writer.write_ue(rps.num_negative_pics)
+    writer.write_ue(rps.num_positive_pics)
+    for delta, used in zip(rps.delta_poc_s0_minus1, rps.used_by_curr_pic_s0_flag):
+        writer.write_ue(delta)
+        writer.write_bit(used)
+    for delta, used in zip(rps.delta_poc_s1_minus1, rps.used_by_curr_pic_s1_flag):
+        writer.write_ue(delta)
+        writer.write_bit(used)
+
+
+@register("rps-overflow")
+def rps_overflow(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Overflow DPB index arrays via an out-of-range short-term RPS picture count.
+
+    Sets ``num_negative_pics`` (or ``num_positive_pics``) in the SPS short-term
+    RPS above ``sps_max_dec_pic_buffering_minus1[0]``. Decoders that size DPB index
+    arrays from the DPB bound but then loop on the raw RPS count walk past the end
+    of those arrays — the bug class behind CVE-2026-33164's DPB-sizing path.
+
+    The seed's SPS may declare zero short-term RPS sets (an intra-only stream). In
+    that case the mutator *synthesises* one ``st_ref_pic_set()`` carrying the
+    overflow count, bumping ``num_short_term_ref_pic_sets`` to 1, so the malformed
+    RPS reaches the decoder. If the SPS already carries an RPS set, its first set's
+    ``num_negative_pics`` is rewritten in place.
+    """
+    out = _clone(nals)
+    idx = _first(out, 33)  # SPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    sps = parse_sps(rbsp)
+
+    if not sps.sps_max_dec_pic_buffering_minus1:
+        raise ValueError("SPS did not parse to the DPB-sizing region; cannot overflow RPS")
+    dpb_bound = sps.sps_max_dec_pic_buffering_minus1[0]
+    overflow_count = dpb_bound + 1 + rng.choice([1, 2, 8, 16])
+
+    num_st = sps.num_short_term_ref_pic_sets
+    if num_st:
+        # Mutate the first existing short-term RPS in place: rewrite its
+        # num_negative_pics span by rebuilding the whole st_ref_pic_set(0).
+        first = sps.short_term_rps[0]
+        target = rng.choice(["num_negative_pics", "num_positive_pics"])
+        crafted = ShortTermRps(
+            num_negative_pics=overflow_count if target == "num_negative_pics" else first.num_negative_pics,
+            num_positive_pics=overflow_count if target == "num_positive_pics" else first.num_positive_pics,
+        )
+        # Keep the deltas parseable: emit one zero-delta used pair per picture.
+        crafted.delta_poc_s0_minus1 = [0] * crafted.num_negative_pics
+        crafted.used_by_curr_pic_s0_flag = [1] * crafted.num_negative_pics
+        crafted.delta_poc_s1_minus1 = [0] * crafted.num_positive_pics
+        crafted.used_by_curr_pic_s1_flag = [1] * crafted.num_positive_pics
+        # The region to replace is the first st_ref_pic_set(0): from the bit just
+        # after num_short_term_ref_pic_sets to the bit before the long-term flag,
+        # only valid when there is exactly one set. With >1 set, replace just the
+        # first by recomputing its encoded length.
+        st_span = sps.span("num_short_term_ref_pic_sets")
+        prefix = st_span.bit_offset + st_span.bit_length
+        old_region = _encoded_st_rps_bits(first)
+        new_rbsp = splice_replace_region(
+            rbsp, prefix, old_region, lambda w: _write_st_ref_pic_set(w, crafted)
+        )
+        detail = (
+            f"{target}: {getattr(first, target)} -> {overflow_count} "
+            f"(> sps_max_dec_pic_buffering_minus1[0]={dpb_bound})"
+        )
+    else:
+        # Synthesise a single short-term RPS carrying the overflow count.
+        target = rng.choice(["num_negative_pics", "num_positive_pics"])
+        neg = overflow_count if target == "num_negative_pics" else 0
+        pos = overflow_count if target == "num_positive_pics" else 0
+        crafted = ShortTermRps(
+            num_negative_pics=neg,
+            num_positive_pics=pos,
+            delta_poc_s0_minus1=[0] * neg,
+            used_by_curr_pic_s0_flag=[1] * neg,
+            delta_poc_s1_minus1=[0] * pos,
+            used_by_curr_pic_s1_flag=[1] * pos,
+        )
+        st_span = sps.span("num_short_term_ref_pic_sets")
+
+        def _emit(w):
+            w.write_ue(1)  # num_short_term_ref_pic_sets = 1
+            _write_st_ref_pic_set(w, crafted)
+
+        new_rbsp = splice_replace_region(
+            rbsp, st_span.bit_offset, st_span.bit_length, _emit
+        )
+        detail = (
+            f"injected st_ref_pic_set with {target}={overflow_count} "
+            f"(> sps_max_dec_pic_buffering_minus1[0]={dpb_bound})"
+        )
+
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="rps-overflow",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=detail,
+    )
+
+
+def _encoded_st_rps_bits(rps: ShortTermRps) -> int:
+    """Number of RBSP bits the given st_ref_pic_set(0) occupies when re-encoded."""
+    from ..bitstream import BitWriter
+
+    w = BitWriter()
+    _write_st_ref_pic_set(w, rps)
+    return w.bit_length
+
+
+@register("rps-lt-poc-ambiguity")
+def rps_lt_poc_ambiguity(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Craft two long-term RPS entries sharing one ``poc_lsb_lt`` value.
+
+    Triggers the ambiguous POC-LSB condition of HEVC trac #1097: when two DPB
+    entries carry the same long-term POC LSB and ``delta_poc_msb_present_flag`` is
+    absent, the reference model (and downstream forks) miscalculate which picture
+    a long-term reference resolves to. The two entries are emitted in the SPS
+    long-term RPS block with identical ``poc_lsb_lt`` and no MSB-cycle override.
+
+    The seed's SPS may have ``long_term_ref_pics_present_flag == 0``; the mutator
+    flips it on and synthesises the two-entry block. ``poc_lsb_lt`` is u(v) with
+    width ``log2_max_pic_order_cnt_lsb_minus4 + 4``.
+    """
+    out = _clone(nals)
+    idx = _first(out, 33)  # SPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    sps = parse_sps(rbsp)
+
+    if sps.log2_max_pic_order_cnt_lsb_minus4 is None or sps.long_term_ref_pics_present_flag is None:
+        raise ValueError("SPS did not parse to the long-term RPS region")
+
+    poc_bits = sps.log2_max_pic_order_cnt_lsb_minus4 + 4
+    shared_lsb = rng.randrange(0, 1 << poc_bits)
+
+    lt_span = sps.span("long_term_ref_pics_present_flag")
+
+    def _emit(w):
+        w.write_bit(1)  # long_term_ref_pics_present_flag = 1
+        w.write_ue(2)  # num_long_term_ref_pics_sps = 2
+        for _ in range(2):
+            w.write_bits(shared_lsb, poc_bits)  # lt_ref_pic_poc_lsb_sps (identical)
+            w.write_bit(1)  # used_by_curr_pic_lt_sps_flag
+
+    new_rbsp = splice_replace_region(rbsp, lt_span.bit_offset, lt_span.bit_length, _emit)
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="rps-lt-poc-ambiguity",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=(
+            f"two long-term entries share poc_lsb_lt={shared_lsb} "
+            f"({poc_bits}-bit), delta_poc_msb absent (trac #1097)"
+        ),
     )
 
 

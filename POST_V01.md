@@ -20,7 +20,18 @@ Items sorted by `coverage × breadth / cost`.
 
 ---
 
-## 1. Reference Picture Set (RPS) mutator [HIGHEST PRIORITY]
+## 1. Reference Picture Set (RPS) mutator [HIGHEST PRIORITY] — ✅ IMPLEMENTED (2026-05-26)
+
+**Status:** Shipped. `parse_sps` in `hevc.py` now advances through the conformance
+window, bit-depths, DPB sizing and coding-block geometry to the RPS region,
+recording `sps_max_dec_pic_buffering_minus1[i]`, `log2_max_pic_order_cnt_lsb_minus4`,
+`num_short_term_ref_pic_sets`, the `st_ref_pic_set()` block, and the long-term RPS
+block. Two mutators were added to `builtin.py`: `rps-overflow` (DPB index-array
+overflow via `num_negative_pics`/`num_positive_pics` > `sps_max_dec_pic_buffering_minus1[0]`)
+and `rps-lt-poc-ambiguity` (two long-term entries sharing one `poc_lsb_lt`, trac
+#1097). Both synthesise the RPS structure when the seed declares none. Tests in
+`tests/test_mutators.py` and `tests/test_hevc.py` cover the overflow invariant, the
+matching-`poc_lsb_lt` invariant, and Annex-B framing integrity.
 
 **What:** Add a mutator that corrupts the short-term and long-term RPS fields in
 the SPS and/or in the slice header delta-RPS syntax. Targets include:
@@ -323,7 +334,7 @@ introduces *incorrect* EBSP to exercise the decoder's EBSP scanner, not mangle's
 
 | # | Name | Attack surface | New CVE class | Cost (LOC) | Priority |
 |---|---|---|---|---|---|
-| 1 | rps-overflow / rps-lt-poc-ambiguity | RPS / DPB sizing | DPB OOB write | ~180 | HIGHEST |
+| 1 | rps-overflow / rps-lt-poc-ambiguity | RPS / DPB sizing | DPB OOB write | ~180 | ✅ DONE |
 | 2 | vps-layer-count | VPS layer/sublayer arrays | Array index OOB | ~90 | HIGH |
 | 3 | sei-hrd-timing | SEI HRD / timing payloads | Integer overflow | ~160 | HIGH |
 | 4 | corpus builder | Seed diversity | Coverage breadth | ~140 | HIGH |

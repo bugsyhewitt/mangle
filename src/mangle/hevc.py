@@ -57,8 +57,47 @@ def _parse_profile_tier_level(
 
 
 @dataclass
+class ShortTermRps:
+    """One short-term reference-picture set, parsed from an ``st_ref_pic_set()``.
+
+    Only the ``stRpsIdx == 0`` form (no inter-RPS prediction) is modelled, which
+    is the form mangle's RPS mutator constructs and the most common in seeds.
+    """
+
+    num_negative_pics: int
+    num_positive_pics: int
+    delta_poc_s0_minus1: list[int] = field(default_factory=list)
+    used_by_curr_pic_s0_flag: list[int] = field(default_factory=list)
+    delta_poc_s1_minus1: list[int] = field(default_factory=list)
+    used_by_curr_pic_s1_flag: list[int] = field(default_factory=list)
+
+
+@dataclass
+class LongTermRefPic:
+    """One long-term reference picture entry from the SPS long-term RPS block."""
+
+    poc_lsb_lt: int
+    used_by_curr_pic_lt_sps_flag: int
+
+
+@dataclass
 class SeqParameterSet:
-    """A minimally-parsed HEVC SPS exposing dimension field spans."""
+    """A minimally-parsed HEVC SPS exposing dimension and RPS field spans.
+
+    In addition to the v0.1 dimension spans, the parser advances all the way to
+    the reference-picture-set region (H.265 7.3.2.2.1) so RPS mutators can locate
+    and rewrite it. The fields needed for RPS mutation are recorded:
+
+      * ``sps_max_dec_pic_buffering_minus1`` — the DPB-size bound that
+        ``num_negative_pics``/``num_positive_pics`` must exceed to overflow DPB
+        index arrays.
+      * ``log2_max_pic_order_cnt_lsb_minus4`` — sets the ``poc_lsb_lt`` field
+        width, needed to encode long-term POC LSB entries.
+      * ``num_short_term_ref_pic_sets`` and its bit offset / following tail bits,
+        so a synthesised ``st_ref_pic_set()`` can be spliced in.
+      * ``long_term_ref_pics_present_flag`` and its bit offset / following tail
+        bits, so a synthesised long-term RPS block can be spliced in.
+    """
 
     sps_video_parameter_set_id: int
     sps_max_sub_layers_minus1: int
@@ -66,6 +105,13 @@ class SeqParameterSet:
     pic_width_in_luma_samples: int
     pic_height_in_luma_samples: int
     spans: list[FieldSpan] = field(default_factory=list)
+    # RPS-relevant fields (None if SPS could not be parsed that far).
+    sps_max_dec_pic_buffering_minus1: list[int] = field(default_factory=list)
+    log2_max_pic_order_cnt_lsb_minus4: int | None = None
+    num_short_term_ref_pic_sets: int | None = None
+    long_term_ref_pics_present_flag: int | None = None
+    short_term_rps: list[ShortTermRps] = field(default_factory=list)
+    long_term_ref_pics: list[LongTermRefPic] = field(default_factory=list)
 
     def span(self, name: str) -> FieldSpan:
         for s in self.spans:
@@ -74,11 +120,43 @@ class SeqParameterSet:
         raise KeyError(name)
 
 
+def _parse_short_term_rps(reader: BitReader, st_rps_idx: int) -> ShortTermRps:
+    """Parse one ``st_ref_pic_set()`` (H.265 7.3.7).
+
+    Only the non-inter-predicted form is modelled. For ``st_rps_idx > 0`` an
+    ``inter_ref_pic_set_prediction_flag`` precedes the block; we read it and bail
+    to the explicit form when it is 0 (the inter-predicted form is not modelled).
+    """
+    if st_rps_idx != 0:
+        inter_flag = reader.read_bit()
+        if inter_flag:
+            raise ValueError(
+                "inter-predicted short-term RPS not modelled by mangle's parser"
+            )
+    num_negative = reader.read_ue()
+    num_positive = reader.read_ue()
+    rps = ShortTermRps(num_negative_pics=num_negative, num_positive_pics=num_positive)
+    for _ in range(num_negative):
+        rps.delta_poc_s0_minus1.append(reader.read_ue())
+        rps.used_by_curr_pic_s0_flag.append(reader.read_bit())
+    for _ in range(num_positive):
+        rps.delta_poc_s1_minus1.append(reader.read_ue())
+        rps.used_by_curr_pic_s1_flag.append(reader.read_bit())
+    return rps
+
+
 def parse_sps(rbsp: bytes) -> SeqParameterSet:
-    """Parse an SPS RBSP up to the picture dimensions.
+    """Parse an SPS RBSP through to the reference-picture-set region.
 
     ``rbsp`` must be the SPS NAL payload *without* the 2-byte NAL header and
     *with* emulation-prevention bytes already removed.
+
+    Parsing proceeds in two stages. The first stage (always succeeds for a valid
+    SPS) records the dimension spans v0.1 relies on. The second stage advances
+    through the conformance window, bit-depths, DPB sizing and coding-block
+    geometry to reach ``num_short_term_ref_pic_sets`` and the long-term-RPS flag.
+    If the SPS is too truncated or uses syntax mangle does not model, the RPS
+    fields are left as ``None`` and only the dimension view is returned.
     """
     reader = BitReader(rbsp)
     vps_id = reader.read_bits(4)  # sps_video_parameter_set_id
@@ -107,7 +185,7 @@ def parse_sps(rbsp: bytes) -> SeqParameterSet:
         "pic_height_in_luma_samples", height_off, reader.bit_position - height_off, height
     )
 
-    return SeqParameterSet(
+    sps = SeqParameterSet(
         sps_video_parameter_set_id=vps_id,
         sps_max_sub_layers_minus1=max_sub_layers_minus1,
         chroma_format_idc=chroma_format_idc,
@@ -115,6 +193,93 @@ def parse_sps(rbsp: bytes) -> SeqParameterSet:
         pic_height_in_luma_samples=height,
         spans=[chroma_span, width_span, height_span],
     )
+
+    # Second stage: advance to the RPS region. Any parse error here leaves the
+    # RPS fields unset but keeps the dimension view intact.
+    try:
+        conformance_window_flag = reader.read_bit()
+        if conformance_window_flag:
+            reader.read_ue()  # conf_win_left_offset
+            reader.read_ue()  # conf_win_right_offset
+            reader.read_ue()  # conf_win_top_offset
+            reader.read_ue()  # conf_win_bottom_offset
+        reader.read_ue()  # bit_depth_luma_minus8
+        reader.read_ue()  # bit_depth_chroma_minus8
+
+        log2_max_poc_off = reader.bit_position
+        log2_max_poc = reader.read_ue()  # log2_max_pic_order_cnt_lsb_minus4
+        sps.log2_max_pic_order_cnt_lsb_minus4 = log2_max_poc
+        sps.spans.append(
+            FieldSpan(
+                "log2_max_pic_order_cnt_lsb_minus4",
+                log2_max_poc_off,
+                reader.bit_position - log2_max_poc_off,
+                log2_max_poc,
+            )
+        )
+
+        sub_layer_ordering = reader.read_bit()  # sub_layer_ordering_info_present
+        start = 0 if sub_layer_ordering else max_sub_layers_minus1
+        dpb: list[int] = []
+        for _ in range(start, max_sub_layers_minus1 + 1):
+            dpb.append(reader.read_ue())  # sps_max_dec_pic_buffering_minus1[i]
+            reader.read_ue()  # sps_max_num_reorder_pics[i]
+            reader.read_ue()  # sps_max_latency_increase_plus1[i]
+        sps.sps_max_dec_pic_buffering_minus1 = dpb
+
+        reader.read_ue()  # log2_min_luma_coding_block_size_minus3
+        reader.read_ue()  # log2_diff_max_min_luma_coding_block_size
+        reader.read_ue()  # log2_min_luma_transform_block_size_minus2
+        reader.read_ue()  # log2_diff_max_min_luma_transform_block_size
+        reader.read_ue()  # max_transform_hierarchy_depth_inter
+        reader.read_ue()  # max_transform_hierarchy_depth_intra
+        scaling_list_enabled = reader.read_bit()
+        if scaling_list_enabled:
+            # sps_scaling_list_data_present_flag + optional scaling_list_data()
+            # is variable-length and not modelled; bail out cleanly.
+            raise ValueError("scaling_list_data present; RPS region not reached")
+        reader.read_bit()  # amp_enabled_flag
+        reader.read_bit()  # sample_adaptive_offset_enabled_flag
+        pcm_enabled = reader.read_bit()
+        if pcm_enabled:
+            reader.read_bits(4)  # pcm_sample_bit_depth_luma_minus1
+            reader.read_bits(4)  # pcm_sample_bit_depth_chroma_minus1
+            reader.read_ue()  # log2_min_pcm_luma_coding_block_size_minus3
+            reader.read_ue()  # log2_diff_max_min_pcm_luma_coding_block_size
+            reader.read_bit()  # pcm_loop_filter_disabled_flag
+
+        num_st_off = reader.bit_position
+        num_st = reader.read_ue()  # num_short_term_ref_pic_sets
+        sps.num_short_term_ref_pic_sets = num_st
+        sps.spans.append(
+            FieldSpan(
+                "num_short_term_ref_pic_sets",
+                num_st_off,
+                reader.bit_position - num_st_off,
+                num_st,
+            )
+        )
+        for i in range(num_st):
+            sps.short_term_rps.append(_parse_short_term_rps(reader, i))
+
+        lt_off = reader.bit_position
+        lt_present = reader.read_bit()  # long_term_ref_pics_present_flag
+        sps.long_term_ref_pics_present_flag = lt_present
+        sps.spans.append(
+            FieldSpan("long_term_ref_pics_present_flag", lt_off, 1, lt_present)
+        )
+        if lt_present:
+            num_lt = reader.read_ue()  # num_long_term_ref_pics_sps
+            poc_bits = log2_max_poc + 4
+            for _ in range(num_lt):
+                poc_lsb = reader.read_bits(poc_bits)  # lt_ref_pic_poc_lsb_sps
+                used = reader.read_bit()  # used_by_curr_pic_lt_sps_flag
+                sps.long_term_ref_pics.append(LongTermRefPic(poc_lsb, used))
+    except (EOFError, ValueError):
+        # Leave whatever RPS fields we managed to fill; dimension view stands.
+        pass
+
+    return sps
 
 
 @dataclass
@@ -268,6 +433,33 @@ def splice_fixed_bits(rbsp: bytes, bit_offset: int, bit_length: int, new_value: 
         writer.write_bit(reader.read_bit())
     reader.read_bits(bit_length)  # discard old
     writer.write_bits(new_value, bit_length)
+    total_bits = len(rbsp) * 8
+    while reader.bit_position < total_bits:
+        writer.write_bit(reader.read_bit())
+    return writer.to_bytes()
+
+
+def splice_replace_region(
+    rbsp: bytes,
+    prefix_bits: int,
+    old_region_bits: int,
+    writer_fn,
+) -> bytes:
+    """Replace the ``old_region_bits`` bits after ``prefix_bits`` with new bits.
+
+    The first ``prefix_bits`` bits of ``rbsp`` are copied verbatim, ``writer_fn``
+    is invoked with a :class:`BitWriter` to emit the replacement region, the next
+    ``old_region_bits`` bits of the original are discarded, and the remaining tail
+    is copied verbatim. This lets a mutator splice in a variable-length syntax
+    block (e.g. a synthesised ``st_ref_pic_set()``) without disturbing the rest of
+    the parameter set.
+    """
+    reader = BitReader(rbsp)
+    writer = BitWriter()
+    for _ in range(prefix_bits):
+        writer.write_bit(reader.read_bit())
+    writer_fn(writer)
+    reader.read_bits(old_region_bits)  # discard the region we are replacing
     total_bits = len(rbsp) * 8
     while reader.bit_position < total_bits:
         writer.write_bit(reader.read_bit())

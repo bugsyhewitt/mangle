@@ -115,7 +115,7 @@ mangle mutators
 
 ---
 
-## Mutators (v0.1)
+## Mutators
 
 | Mutator | Target | What it does |
 |---|---|---|
@@ -123,9 +123,31 @@ mangle mutators
 | `pps-tile-config` | PPS | Flips `tiles_enabled_flag` / `entropy_coding_sync_enabled_flag` without the dependent geometry |
 | `slice-header-ref-pic-list` | Slice header | Corrupts the fields driving reference-picture-list management (PPS id, first-slice flag) |
 | `nal-unit-type-swap` | NAL header | Relabels a NAL unit to a different, inconsistent `nal_unit_type` |
+| `rps-overflow` | SPS short-term RPS | Sets `num_negative_pics` / `num_positive_pics` above `sps_max_dec_pic_buffering_minus1[0]` to overflow decoder DPB index arrays |
+| `rps-lt-poc-ambiguity` | SPS long-term RPS | Crafts two long-term reference entries sharing one `poc_lsb_lt`, triggering the ambiguous-POC-LSB condition |
 
 All mutators keep the stream a parseable Annex-B bitstream while pushing it out of
 semantic spec-compliance — the input class that exercises decoder edge cases.
+
+### Reference Picture Set (RPS) mutators
+
+The two RPS mutators target the reference-picture-set syntax in the SPS
+(H.265 §7.3.7), the region that informs decoder-picture-buffer (DPB) sizing and
+long-term reference resolution:
+
+- **`rps-overflow`** raises `num_negative_pics` (or `num_positive_pics`) in the
+  short-term RPS above `sps_max_dec_pic_buffering_minus1[0]`. Decoders that size
+  DPB index arrays from the DPB bound but loop on the raw RPS count walk past the
+  end of those arrays — the DPB-sizing bug class behind **CVE-2026-33164**
+  (libde265 `set_derived_values()`). When the seed declares zero short-term RPS
+  sets (an intra-only stream), the mutator synthesises one carrying the overflow
+  count; otherwise it rewrites the first existing set.
+
+- **`rps-lt-poc-ambiguity`** emits two long-term RPS entries with an identical
+  `poc_lsb_lt` and no `delta_poc_msb` override, reproducing the ambiguous POC-LSB
+  condition of **HEVC trac #1097** — where multiple DPB entries share the same
+  long-term POC LSB and the reference model (and downstream forks) miscalculate
+  which picture a long-term reference resolves to.
 
 ---
 
