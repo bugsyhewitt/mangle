@@ -145,6 +145,74 @@ def _parse_short_term_rps(reader: BitReader, st_rps_idx: int) -> ShortTermRps:
     return rps
 
 
+@dataclass
+class VideoParameterSet:
+    """A minimally-parsed HEVC VPS exposing layer/sublayer field spans.
+
+    Parses the VPS RBSP (H.265 §7.3.2.1) through the first 16 bits of fixed-
+    width fields that control per-layer loop bounds and temporal-nesting
+    validation in both software and hardware decoders.
+    """
+
+    vps_id: int
+    vps_max_layers_minus1: int
+    vps_max_sub_layers_minus1: int
+    vps_temporal_id_nesting_flag: int
+    spans: list[FieldSpan] = field(default_factory=list)
+
+    def span(self, name: str) -> FieldSpan:
+        for s in self.spans:
+            if s.name == name:
+                return s
+        raise KeyError(name)
+
+
+def parse_vps(rbsp: bytes) -> VideoParameterSet:
+    """Parse a VPS RBSP through the first 16 fixed-width bits.
+
+    ``rbsp`` must be the VPS NAL payload *without* the 2-byte NAL header and
+    *with* emulation-prevention bytes already removed.
+
+    Fields parsed (H.265 §7.3.2.1):
+      - vps_video_parameter_set_id  (4 bits)
+      - vps_base_layer_internal_flag (1 bit)  — skipped, not mutated
+      - vps_base_layer_available_flag (1 bit)  — skipped, not mutated
+      - vps_max_layers_minus1        (6 bits, spec range 0..62)
+      - vps_max_sub_layers_minus1    (3 bits, spec range 0..6)
+      - vps_temporal_id_nesting_flag (1 bit)
+    """
+    reader = BitReader(rbsp)
+    spans: list[FieldSpan] = []
+
+    vps_id = reader.read_bits(4)  # vps_video_parameter_set_id
+    reader.read_bit()             # vps_base_layer_internal_flag (skip)
+    reader.read_bit()             # vps_base_layer_available_flag (skip)
+
+    layers_off = reader.bit_position
+    max_layers = reader.read_bits(6)  # vps_max_layers_minus1
+    spans.append(FieldSpan("vps_max_layers_minus1", layers_off, 6, max_layers))
+
+    sub_layers_off = reader.bit_position
+    max_sub_layers = reader.read_bits(3)  # vps_max_sub_layers_minus1
+    spans.append(
+        FieldSpan("vps_max_sub_layers_minus1", sub_layers_off, 3, max_sub_layers)
+    )
+
+    nesting_off = reader.bit_position
+    nesting_flag = reader.read_bit()  # vps_temporal_id_nesting_flag
+    spans.append(
+        FieldSpan("vps_temporal_id_nesting_flag", nesting_off, 1, nesting_flag)
+    )
+
+    return VideoParameterSet(
+        vps_id=vps_id,
+        vps_max_layers_minus1=max_layers,
+        vps_max_sub_layers_minus1=max_sub_layers,
+        vps_temporal_id_nesting_flag=nesting_flag,
+        spans=spans,
+    )
+
+
 def parse_sps(rbsp: bytes) -> SeqParameterSet:
     """Parse an SPS RBSP through to the reference-picture-set region.
 

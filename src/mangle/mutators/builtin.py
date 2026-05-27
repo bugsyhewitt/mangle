@@ -27,6 +27,7 @@ from ..hevc import (
     parse_pps,
     parse_slice_header,
     parse_sps,
+    parse_vps,
     splice_fixed_bits,
     splice_replace_region,
     splice_ue_field,
@@ -359,6 +360,78 @@ def rps_lt_poc_ambiguity(nals: list[NalUnit], rng: random.Random) -> MutationRes
             f"two long-term entries share poc_lsb_lt={shared_lsb} "
             f"({poc_bits}-bit), delta_poc_msb absent (trac #1097)"
         ),
+    )
+
+
+@register("vps-layer-count")
+def vps_layer_count(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Corrupt VPS layer/sublayer counts and temporal-nesting flag.
+
+    The VPS carries two small integer fields that downstream hardware and
+    software decoders use to bound per-layer loops and allocate DPB arrays:
+
+      * ``vps_max_layers_minus1``     — spec range [0, 62]; overflow target: 63+
+      * ``vps_max_sub_layers_minus1`` — spec range [0, 6];  overflow target: 7+
+      * ``vps_temporal_id_nesting_flag`` — flip when sub_layers=0 (spec violation)
+
+    One of three mutations is chosen at random:
+
+      1. Set ``vps_max_layers_minus1`` to 63 or 127, overflowing the
+         ``HEVC_MAX_LAYERS = 63`` array-bound guard in decoders that use the raw
+         field value as a loop count.
+      2. Set ``vps_max_sub_layers_minus1`` to 7, overflowing per-layer DPB
+         arrays indexed up to this value.
+      3. Flip ``vps_temporal_id_nesting_flag`` while clamping
+         ``vps_max_sub_layers_minus1`` to 0 — the spec requires nesting_flag=1
+         when sub_layers=0; the violation exercises "nesting check" code paths.
+
+    Reference: TWINFUZZ (NDSS 2025); ffmpeg hevcdec.c layer-loop guards.
+    """
+    out = _clone(nals)
+    idx = _first(out, 32)  # VPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    vps = parse_vps(rbsp)
+
+    choice = rng.randint(0, 2)
+
+    if choice == 0:
+        # Mutation 1: vps_max_layers_minus1 overflow
+        new_layers = rng.choice([63, 127])
+        span = vps.span("vps_max_layers_minus1")
+        # Field is 6 bits; 63 fits (0x3F), 127 does not — clamp to 6-bit max
+        new_layers_encoded = min(new_layers, 63)  # 6-bit field max is 63 (0x3F)
+        new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_layers_encoded)
+        detail = f"vps_max_layers_minus1: {vps.vps_max_layers_minus1} -> {new_layers_encoded} (overflow HEVC_MAX_LAYERS=63)"
+
+    elif choice == 1:
+        # Mutation 2: vps_max_sub_layers_minus1 overflow (3-bit field, max=7)
+        span = vps.span("vps_max_sub_layers_minus1")
+        new_sub = 7  # max 3-bit value; spec range is 0..6, so 7 is the violation
+        new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_sub)
+        detail = f"vps_max_sub_layers_minus1: {vps.vps_max_sub_layers_minus1} -> {new_sub} (spec range 0..6)"
+
+    else:
+        # Mutation 3: flip nesting_flag with sub_layers clamped to 0
+        # First clamp vps_max_sub_layers_minus1 to 0
+        sub_span = vps.span("vps_max_sub_layers_minus1")
+        tmp_rbsp = splice_fixed_bits(rbsp, sub_span.bit_offset, sub_span.bit_length, 0)
+        # Re-parse to get updated nesting_flag position (offsets unchanged, same field)
+        nesting_span = vps.span("vps_temporal_id_nesting_flag")
+        flipped = 1 - vps.vps_temporal_id_nesting_flag
+        new_rbsp = splice_fixed_bits(tmp_rbsp, nesting_span.bit_offset, nesting_span.bit_length, flipped)
+        detail = (
+            f"vps_temporal_id_nesting_flag: {vps.vps_temporal_id_nesting_flag} -> {flipped} "
+            f"(vps_max_sub_layers_minus1 clamped to 0; spec violation)"
+        )
+
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="vps-layer-count",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=detail,
     )
 
 

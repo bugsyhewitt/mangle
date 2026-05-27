@@ -125,6 +125,7 @@ mangle mutators
 | `nal-unit-type-swap` | NAL header | Relabels a NAL unit to a different, inconsistent `nal_unit_type` |
 | `rps-overflow` | SPS short-term RPS | Sets `num_negative_pics` / `num_positive_pics` above `sps_max_dec_pic_buffering_minus1[0]` to overflow decoder DPB index arrays |
 | `rps-lt-poc-ambiguity` | SPS long-term RPS | Crafts two long-term reference entries sharing one `poc_lsb_lt`, triggering the ambiguous-POC-LSB condition |
+| `vps-layer-count` | VPS | Corrupts `vps_max_layers_minus1` / `vps_max_sub_layers_minus1` / `vps_temporal_id_nesting_flag` to overflow per-layer array bounds in hardware and software decoders |
 
 All mutators keep the stream a parseable Annex-B bitstream while pushing it out of
 semantic spec-compliance — the input class that exercises decoder edge cases.
@@ -148,6 +149,25 @@ long-term reference resolution:
   condition of **HEVC trac #1097** — where multiple DPB entries share the same
   long-term POC LSB and the reference model (and downstream forks) miscalculate
   which picture a long-term reference resolves to.
+
+### VPS (Video Parameter Set) mutator
+
+- **`vps-layer-count`** targets the three fixed-width fields that open the VPS
+  RBSP (H.265 §7.3.2.1). One mutation is chosen per invocation:
+  - **Layer overflow**: sets `vps_max_layers_minus1` to 63 (the 6-bit field max),
+    overflowing the `HEVC_MAX_LAYERS = 63` array-bound guard used by decoders
+    (e.g. ffmpeg `hevcdec.c`) that loop on this value to allocate per-layer state.
+  - **Sub-layer overflow**: sets `vps_max_sub_layers_minus1` to 7 (3-bit field
+    max; spec range 0..6), overflowing per-sublayer DPB arrays indexed up to this
+    value.
+  - **Nesting-flag violation**: flips `vps_temporal_id_nesting_flag` while
+    clamping `vps_max_sub_layers_minus1` to 0 — a direct spec violation (the
+    standard requires nesting_flag=1 when sub_layers=0) that exercises
+    "nesting check" code paths in conformance validators and decoders.
+
+  Motivation: the **TWINFUZZ** paper (NDSS 2025) showed hardware-acceleration
+  stacks are disproportionately vulnerable to spec violations in the
+  parameter-set layer. No prior mangle mutator touched the VPS at all.
 
 ---
 
