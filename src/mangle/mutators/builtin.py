@@ -25,6 +25,7 @@ from ..bitstream import (
 from ..hevc import (
     ShortTermRps,
     parse_pps,
+    parse_sei,
     parse_slice_header,
     parse_sps,
     parse_vps,
@@ -430,6 +431,169 @@ def vps_layer_count(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     return MutationResult(
         nals=out,
         mutator="vps-layer-count",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=detail,
+    )
+
+
+def _first_sei(nals: list[NalUnit]) -> int:
+    """Return the index of the first PREFIX_SEI_NUT (39) or SUFFIX_SEI_NUT (40) NAL."""
+    for i, n in enumerate(nals):
+        if n.nal_unit_type in (39, 40):
+            return i
+    raise ValueError("no SEI NAL (type 39 or 40) found in stream")
+
+
+def _sei_inject_buffering_period_overflow(
+    out: list[NalUnit],
+    idx: int | None,
+    nal: "NalUnit | None",
+    rbsp: "bytes | None",
+    messages: list,
+) -> tuple[list[NalUnit], str]:
+    """Apply the buffering_period overflow mutation.  Returns (updated_nals, detail)."""
+    from ..bitstream import BitWriter
+
+    w = BitWriter()
+    w.write_ue(0xFFFFFFFF)
+    payload_bytes = w.to_bytes()
+    if len(payload_bytes) > 254:
+        payload_bytes = payload_bytes[:254]
+    sei_rbsp_synth = bytes([0x00, len(payload_bytes)]) + payload_bytes + b"\x80"
+
+    if idx is not None and messages:
+        assert nal is not None and rbsp is not None
+        bp_msg = next((m for m in messages if m.payload_type == 0), None)
+        if bp_msg is None:
+            trail_pos = rbsp.rfind(b"\x80")
+            if trail_pos < 0:
+                trail_pos = len(rbsp)
+            insert = bytes([0x00, len(payload_bytes)]) + payload_bytes
+            new_rbsp = rbsp[:trail_pos] + insert + rbsp[trail_pos:]
+        else:
+            pre = rbsp[: bp_msg.payload_offset]
+            post = rbsp[bp_msg.payload_offset + bp_msg.payload_size :]
+            new_payload = (payload_bytes + b"\x00" * bp_msg.payload_size)[: bp_msg.payload_size]
+            new_rbsp = pre + new_payload + post
+        out[idx] = _rewrite_payload(nal, new_rbsp)
+        detail = (
+            f"buffering_period.initial_cpb_removal_delay -> 0xFFFFFFFF "
+            f"(ue(v) overflow, SEI NAL #{idx})"
+        )
+    else:
+        param_set_types = {32, 33, 34}
+        last_ps = -1
+        for i, n in enumerate(out):
+            if n.nal_unit_type in param_set_types:
+                last_ps = i
+        sei_header = bytes([0x4E, 0x01])
+        sei_ebsp = sei_header + rbsp_to_ebsp(sei_rbsp_synth)
+        sei_nal = NalUnit(start_code_len=4, offset=0, ebsp=sei_ebsp)
+        out.insert(last_ps + 1, sei_nal)
+        detail = (
+            "synthetic PREFIX_SEI injected: buffering_period.initial_cpb_removal_delay "
+            "= 0xFFFFFFFF (HRD arithmetic overflow)"
+        )
+    return out, detail
+
+
+@register("sei-buffering-overflow")
+def sei_buffering_overflow(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Corrupt SEI message fields to trigger HRD and POC arithmetic edge cases.
+
+    Three targeted SEI payload corruptions, one chosen per invocation:
+
+      1. **buffering_period (payloadType 0) — HRD overflow**
+         Overwrites the first ue(v) field (``initial_cpb_removal_delay``) with
+         ``0xFFFFFFFF``, encoded as exp-Golomb. Decoders that compute HRD
+         conformance timing arithmetic from the raw delay value may overflow
+         when adding this to a base clock.
+
+      2. **pic_timing (payloadType 1) — cpb_removal_delay length mismatch**
+         Overwrites the first two bytes of the payload with ``0xFF 0xFF``,
+         placing max-value bit patterns into whatever fixed-width fields
+         ``cpb_removal_delay`` occupies. This creates a length-field mismatch
+         that exercises the decoder's payload-length-check path.
+
+      3. **recovery_point (payloadType 6) — POC underflow**
+         Overwrites the first se(v) (``recovery_poc_cnt``) with the most
+         negative se(v) value encodable in 32 bits (``-2147483648``). Decoders
+         that add this to the current POC without a signed-overflow guard
+         underflow the POC counter.
+
+    If the stream has no SEI NAL, a synthetic PREFIX_SEI NAL carrying a
+    buffering_period payload is injected immediately after the last parameter-
+    set NAL (VPS/SPS/PPS), so the mutation always exercises a code path.
+    """
+    from ..bitstream import BitWriter
+
+    out = _clone(nals)
+    original_stream = assemble_nal_units(nals)
+    mutation_choice = rng.randint(0, 2)
+
+    try:
+        idx = _first_sei(out)
+        nal = out[idx]
+        rbsp = ebsp_to_rbsp(nal.ebsp[2:])
+        messages = parse_sei(rbsp)
+    except ValueError:
+        idx = None
+        nal = None
+        rbsp = None
+        messages = []
+
+    def _encode_se(v: int) -> bytes:
+        w = BitWriter()
+        w.write_se(v)
+        return w.to_bytes()
+
+    detail: str
+
+    if not messages or mutation_choice == 0:
+        # Mutation 0 / fallback: buffering_period overflow
+        out, detail = _sei_inject_buffering_period_overflow(out, idx, nal, rbsp, messages)
+
+    elif mutation_choice == 1:
+        # Mutation 1: pic_timing — overwrite first two payload bytes with 0xFF 0xFF
+        pt_msg = next((m for m in messages if m.payload_type == 1), None)
+        if pt_msg is not None and pt_msg.payload_size >= 2:
+            assert nal is not None and rbsp is not None
+            rbsp_list = bytearray(rbsp)
+            rbsp_list[pt_msg.payload_offset] = 0xFF
+            rbsp_list[pt_msg.payload_offset + 1] = 0xFF
+            new_rbsp = bytes(rbsp_list)
+            out[idx] = _rewrite_payload(nal, new_rbsp)
+            detail = (
+                f"pic_timing payload bytes [0:2] -> 0xFF 0xFF "
+                f"(cpb_removal_delay length-mismatch, SEI NAL #{idx})"
+            )
+        else:
+            # No suitable pic_timing — fall back to buffering_period overflow
+            out, detail = _sei_inject_buffering_period_overflow(out, idx, nal, rbsp, messages)
+
+    else:
+        # Mutation 2: recovery_point (payloadType 6) — POC underflow
+        rp_msg = next((m for m in messages if m.payload_type == 6), None)
+        if rp_msg is not None and rp_msg.payload_size >= 1:
+            assert nal is not None and rbsp is not None
+            underflow_se = _encode_se(-2147483648)
+            pre = rbsp[: rp_msg.payload_offset]
+            post = rbsp[rp_msg.payload_offset + rp_msg.payload_size :]
+            new_payload = (underflow_se + b"\x00" * rp_msg.payload_size)[: rp_msg.payload_size]
+            new_rbsp = pre + new_payload + post
+            out[idx] = _rewrite_payload(nal, new_rbsp)
+            detail = (
+                f"recovery_point.recovery_poc_cnt -> -2147483648 "
+                f"(se(v) underflow, SEI NAL #{idx})"
+            )
+        else:
+            # No recovery_point — fall back to buffering_period overflow
+            out, detail = _sei_inject_buffering_period_overflow(out, idx, nal, rbsp, messages)
+
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="sei-buffering-overflow",
         bytes_changed=count_changed_bytes(original_stream, mutated_stream),
         detail=detail,
     )

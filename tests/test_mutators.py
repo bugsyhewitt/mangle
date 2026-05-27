@@ -12,10 +12,11 @@ from mangle.bitstream import (
     START_CODE_LONG,
     START_CODE_SHORT,
 )
-from mangle.hevc import parse_sps
+from mangle.hevc import parse_sei, parse_sps
 from mangle.mutators import get_mutator, list_mutators
 
 SEED = Path(__file__).parent / "fixtures" / "clean.h265"
+SEI_SEED = Path(__file__).parent / "fixtures" / "sei-buffering.hevc"
 
 REQUIRED_MUTATORS = {
     "sps-dimensions",
@@ -25,6 +26,7 @@ REQUIRED_MUTATORS = {
 }
 
 RPS_MUTATORS = {"rps-overflow", "rps-lt-poc-ambiguity"}
+SEI_MUTATORS = {"sei-buffering-overflow"}
 
 
 def _seed_nals():
@@ -193,3 +195,102 @@ class TestRpsLtPocAmbiguity:
             if orig.nal_unit_type == 33:
                 continue
             assert orig.ebsp == mut.ebsp, "rps-lt-poc-ambiguity modified a non-SPS NAL"
+
+
+def _sei_seed_nals():
+    return split_nal_units(SEI_SEED.read_bytes())
+
+
+class TestSeiMutatorsRegistered:
+    def test_sei_mutator_present(self):
+        available = set(list_mutators())
+        assert SEI_MUTATORS.issubset(available)
+
+
+class TestSeiBufferingOverflow:
+    """Tests for the sei-buffering-overflow mutator."""
+
+    def test_mutator_changes_bytes(self):
+        """The mutator must produce a stream different from the input."""
+        original = SEI_SEED.read_bytes()
+        result = get_mutator("sei-buffering-overflow")(_sei_seed_nals(), random.Random(0))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated != original
+        assert result.bytes_changed > 0
+        assert result.detail
+
+    def test_reproducible_with_same_seed(self):
+        """Same rng seed must produce identical output."""
+        r1 = get_mutator("sei-buffering-overflow")(_sei_seed_nals(), random.Random(42))
+        r2 = get_mutator("sei-buffering-overflow")(_sei_seed_nals(), random.Random(42))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.detail == r2.detail
+
+    def test_framing_intact(self):
+        """Output must remain valid Annex-B (start codes intact, NALs splittable)."""
+        result = get_mutator("sei-buffering-overflow")(_sei_seed_nals(), random.Random(0))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated[:4] == START_CODE_LONG or mutated[:3] == START_CODE_SHORT
+        split = split_nal_units(mutated)
+        assert len(split) >= 1
+
+    def test_buffering_period_path(self):
+        """Some rng seed exercises the buffering_period overflow path."""
+        for seed in range(20):
+            result = get_mutator("sei-buffering-overflow")(_sei_seed_nals(), random.Random(seed))
+            if "buffering_period" in result.detail:
+                assert "0xFFFFFFFF" in result.detail
+                return
+        raise AssertionError("no seed exercised the buffering_period overflow path")
+
+    def test_pic_timing_path(self):
+        """Find a seed that takes the pic_timing path (mutation_choice == 1)."""
+        for seed in range(100):
+            result = get_mutator("sei-buffering-overflow")(_sei_seed_nals(), random.Random(seed))
+            if "pic_timing" in result.detail:
+                assert "0xFF" in result.detail
+                return
+        raise AssertionError("no seed exercised the pic_timing path within 100 tries")
+
+    def test_recovery_point_path(self):
+        """Find a seed that takes the recovery_point path (mutation_choice == 2)."""
+        for seed in range(100):
+            result = get_mutator("sei-buffering-overflow")(_sei_seed_nals(), random.Random(seed))
+            if "recovery_point" in result.detail:
+                assert "-2147483648" in result.detail
+                return
+        raise AssertionError("no seed exercised the recovery_point path within 100 tries")
+
+    def test_synthetic_injection_on_no_sei_stream(self):
+        """When the input has no SEI NAL, a synthetic PREFIX_SEI must be injected."""
+        # Build a minimal stream with VPS + SPS + PPS but no SEI.
+        from mangle.bitstream import NalUnit, assemble_nal_units
+        vps_header = bytes([(32 << 1), 0x01])
+        sps_header = bytes([(33 << 1), 0x01])
+        pps_header = bytes([(34 << 1), 0x01])
+        no_sei_nals = [
+            NalUnit(4, 0, vps_header + b"\x80"),
+            NalUnit(4, 8, sps_header + b"\x80"),
+            NalUnit(4, 16, pps_header + b"\x80"),
+        ]
+        result = get_mutator("sei-buffering-overflow")(no_sei_nals, random.Random(0))
+        mutated_nals = result.nals
+        # A new SEI NAL should have been injected
+        sei_types = [n.nal_unit_type for n in mutated_nals if n.nal_unit_type in (39, 40)]
+        assert len(sei_types) >= 1, "no SEI NAL injected into no-SEI stream"
+        assert "synthetic" in result.detail or "PREFIX_SEI" in result.detail
+
+    def test_output_nal_count_with_sei_fixture(self):
+        """Output from the SEI fixture must have the same number of NALs (no new injection)."""
+        result = get_mutator("sei-buffering-overflow")(_sei_seed_nals(), random.Random(0))
+        # The fixture already has a SEI NAL — we mutate in-place, not inject
+        original_count = len(_sei_seed_nals())
+        mutated_count = len(result.nals)
+        assert mutated_count == original_count, (
+            f"expected {original_count} NALs, got {mutated_count} "
+            f"(unexpected injection on stream that already has SEI)"
+        )
+
+    def test_mutator_result_name(self):
+        result = get_mutator("sei-buffering-overflow")(_sei_seed_nals(), random.Random(0))
+        assert result.mutator == "sei-buffering-overflow"

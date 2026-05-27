@@ -507,6 +507,79 @@ def splice_fixed_bits(rbsp: bytes, bit_offset: int, bit_length: int, new_value: 
     return writer.to_bytes()
 
 
+@dataclass
+class SeiMessage:
+    """One SEI message located within a SEI NAL RBSP.
+
+    Attributes:
+        payload_type: SEI payloadType value (e.g. 0=buffering_period, 1=pic_timing, 6=recovery_point).
+        payload_offset: byte offset where the payload data starts within the RBSP
+            (i.e. after the payloadType and payloadSize length-prefix bytes).
+        payload_size: number of bytes in the payload (as declared by the SEI message header).
+    """
+
+    payload_type: int
+    payload_offset: int
+    payload_size: int
+
+
+def parse_sei(rbsp: bytes) -> list[SeiMessage]:
+    """Parse a SEI NAL RBSP into a list of SEI messages.
+
+    ``rbsp`` must be the SEI NAL payload *without* the 2-byte NAL header and
+    *with* emulation-prevention bytes already removed.
+
+    The SEI message framing (H.265 §7.3.2.4) uses a variable-length prefix for
+    both payloadType and payloadSize: a sequence of 0xFF bytes accumulates 255
+    each, and the final non-0xFF byte contributes its value to the total.
+
+    Parsing stops at the RBSP trailing bits marker (the 0x80 alignment byte at
+    the end of the RBSP), or when there are no more full messages to read.
+    Returns a list of :class:`SeiMessage` in order of appearance.
+    """
+    messages: list[SeiMessage] = []
+    pos = 0
+    n = len(rbsp)
+
+    while pos < n:
+        # RBSP trailing bits: a 0x80 byte (stop bit + zero-padding) signals end.
+        if rbsp[pos] == 0x80:
+            break
+
+        # Decode payloadType
+        payload_type = 0
+        while pos < n and rbsp[pos] == 0xFF:
+            payload_type += 255
+            pos += 1
+        if pos >= n:
+            break
+        payload_type += rbsp[pos]
+        pos += 1
+
+        # Decode payloadSize
+        payload_size = 0
+        while pos < n and rbsp[pos] == 0xFF:
+            payload_size += 255
+            pos += 1
+        if pos >= n:
+            break
+        payload_size += rbsp[pos]
+        pos += 1
+
+        # Record the payload start offset
+        payload_offset = pos
+        messages.append(SeiMessage(
+            payload_type=payload_type,
+            payload_offset=payload_offset,
+            payload_size=payload_size,
+        ))
+
+        # Advance past the payload bytes
+        pos += payload_size
+
+    return messages
+
+
 def splice_replace_region(
     rbsp: bytes,
     prefix_bits: int,

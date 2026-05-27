@@ -6,7 +6,9 @@ from pathlib import Path
 
 from mangle.bitstream import ebsp_to_rbsp, split_nal_units
 from mangle.hevc import (
+    SeiMessage,
     parse_pps,
+    parse_sei,
     parse_slice_header,
     parse_sps,
     splice_fixed_bits,
@@ -26,6 +28,74 @@ def _first_vcl_rbsp_and_type():
     nals = split_nal_units(SEED.read_bytes())
     nal = next(n for n in nals if n.is_vcl)
     return ebsp_to_rbsp(nal.ebsp[2:]), nal.nal_unit_type
+
+
+SEI_FIXTURE = Path(__file__).parent / "fixtures" / "sei-buffering.hevc"
+
+
+class TestParseSei:
+    """Tests for parse_sei() using the synthetic sei-buffering.hevc fixture."""
+
+    def _sei_rbsp(self) -> bytes:
+        data = SEI_FIXTURE.read_bytes()
+        nals = split_nal_units(data)
+        sei = next(n for n in nals if n.nal_unit_type in (39, 40))
+        return ebsp_to_rbsp(sei.ebsp[2:])
+
+    def test_fixture_has_three_messages(self):
+        msgs = parse_sei(self._sei_rbsp())
+        assert len(msgs) == 3
+
+    def test_payload_types(self):
+        msgs = parse_sei(self._sei_rbsp())
+        types = [m.payload_type for m in msgs]
+        assert types == [0, 1, 6], f"expected [0, 1, 6], got {types}"
+
+    def test_buffering_period_payload_size(self):
+        msgs = parse_sei(self._sei_rbsp())
+        bp = msgs[0]
+        assert isinstance(bp, SeiMessage)
+        assert bp.payload_size == 2  # ue(100) encodes to 2 bytes
+
+    def test_pic_timing_payload_size(self):
+        msgs = parse_sei(self._sei_rbsp())
+        pt = msgs[1]
+        assert pt.payload_size == 4
+
+    def test_recovery_point_payload_size(self):
+        msgs = parse_sei(self._sei_rbsp())
+        rp = msgs[2]
+        assert rp.payload_size == 1  # se(5) encodes to 1 byte
+
+    def test_payload_offsets_are_within_rbsp(self):
+        rbsp = self._sei_rbsp()
+        msgs = parse_sei(rbsp)
+        for m in msgs:
+            assert m.payload_offset >= 0
+            assert m.payload_offset + m.payload_size <= len(rbsp)
+
+    def test_empty_rbsp_returns_empty_list(self):
+        assert parse_sei(b"\x80") == []
+
+    def test_trailing_byte_only_returns_empty_list(self):
+        assert parse_sei(b"\x80\x00") == []
+
+    def test_single_buffering_period_no_trailer(self):
+        # Minimal: payloadType=0 (1 byte), payloadSize=1 (1 byte), payload 0xAA
+        rbsp = bytes([0x00, 0x01, 0xAA])
+        msgs = parse_sei(rbsp)
+        assert len(msgs) == 1
+        assert msgs[0].payload_type == 0
+        assert msgs[0].payload_size == 1
+        assert msgs[0].payload_offset == 2
+
+    def test_high_payload_type_via_ff_prefix(self):
+        # payloadType = 255 + 3 = 258, payloadSize = 0
+        rbsp = bytes([0xFF, 0x03, 0x00, 0x80])
+        msgs = parse_sei(rbsp)
+        assert len(msgs) == 1
+        assert msgs[0].payload_type == 258
+        assert msgs[0].payload_size == 0
 
 
 class TestSpsParsing:
