@@ -127,6 +127,8 @@ mangle mutators
 | `rps-lt-poc-ambiguity` | SPS long-term RPS | Crafts two long-term reference entries sharing one `poc_lsb_lt`, triggering the ambiguous-POC-LSB condition |
 | `vps-layer-count` | VPS | Corrupts `vps_max_layers_minus1` / `vps_max_sub_layers_minus1` / `vps_temporal_id_nesting_flag` to overflow per-layer array bounds in hardware and software decoders |
 | `pps-deblocking` | PPS | Corrupts the deblocking / loop-filter control fields — pushes `pps_beta_offset_div2` / `pps_tc_offset_div2` out of the spec range `[-6, 6]`, flips `pps_deblocking_filter_disabled_flag`, or flips `pps_loop_filter_across_slices_enabled_flag` |
+| `sps-chroma-format` | SPS | Rewrites `chroma_format_idc` to a reserved value (4) or forces 4:4:4 (3) without a reserved `separate_colour_plane_flag` bit, desynchronising the sample format |
+| `sps-bit-depth` | SPS | Pushes `bit_depth_luma_minus8` / `bit_depth_chroma_minus8` above the spec ceiling of 8 (>16-bit samples) to stress sample-buffer sizing |
 
 All mutators keep the stream a parseable Annex-B bitstream while pushing it out of
 semantic spec-compliance — the input class that exercises decoder edge cases.
@@ -188,6 +190,28 @@ long-term reference resolution:
     `pps_loop_filter_across_slices_enabled_flag`, exercising the slice-boundary
     filter path. This field is reachable in any untiled PPS, so it is the
     conservative fallback when the deeper control block is absent.
+
+### Chroma-format and bit-depth SPS mutators
+
+These two mutators target the sample-format fields of the SPS (H.265 §7.3.2.2.1)
+— the values that drive chroma subsampling and per-sample buffer sizing
+throughout a decoder:
+
+- **`sps-chroma-format`** rewrites `chroma_format_idc` (ue(v)). Valid values are
+  0 (monochrome), 1 (4:2:0), 2 (4:2:2), 3 (4:4:4). One of two corruptions is
+  chosen per invocation: setting it to **4** (reserved — one entry past the
+  chroma-subsampling lookup table), or, when the seed is not already 4:4:4,
+  forcing it to **3** so the decoder expects a `separate_colour_plane_flag` bit
+  the bitstream never reserved, desynchronising every following field. This is the
+  sample-format analogue of the width/height/container mismatch class behind
+  **CVE-2022-3266** (Firefox).
+
+- **`sps-bit-depth`** rewrites `bit_depth_luma_minus8` or `bit_depth_chroma_minus8`
+  (ue(v), spec range `[0, 8]`) to a value well past 8 — i.e. claiming >16-bit
+  samples. Decoders that size sample buffers as `(bit_depth + 1)` bytes (or shift
+  by the raw value) over-allocate, mis-shift, or wrap a size computation; many
+  hardware HEVC decoders branch 8-bit and 10-bit paths into separate firmware,
+  and a bit depth they do not recognise forces a guess or a fault.
 
 ---
 

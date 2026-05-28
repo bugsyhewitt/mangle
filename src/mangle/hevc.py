@@ -105,6 +105,12 @@ class SeqParameterSet:
     pic_width_in_luma_samples: int
     pic_height_in_luma_samples: int
     spans: list[FieldSpan] = field(default_factory=list)
+    # separate_colour_plane_flag is present in the bitstream only when
+    # chroma_format_idc == 3; None means "not present in this SPS".
+    separate_colour_plane_flag: int | None = None
+    # Bit-depth fields (None if the SPS could not be parsed that far).
+    bit_depth_luma_minus8: int | None = None
+    bit_depth_chroma_minus8: int | None = None
     # RPS-relevant fields (None if SPS could not be parsed that far).
     sps_max_dec_pic_buffering_minus1: list[int] = field(default_factory=list)
     log2_max_pic_order_cnt_lsb_minus4: int | None = None
@@ -118,6 +124,9 @@ class SeqParameterSet:
             if s.name == name:
                 return s
         raise KeyError(name)
+
+    def has_span(self, name: str) -> bool:
+        return any(s.name == name for s in self.spans)
 
 
 def _parse_short_term_rps(reader: BitReader, st_rps_idx: int) -> ShortTermRps:
@@ -238,8 +247,9 @@ def parse_sps(rbsp: bytes) -> SeqParameterSet:
     chroma_span = FieldSpan(
         "chroma_format_idc", chroma_off, reader.bit_position - chroma_off, chroma_format_idc
     )
+    separate_colour_plane_flag: int | None = None
     if chroma_format_idc == 3:
-        reader.read_bit()  # separate_colour_plane_flag
+        separate_colour_plane_flag = reader.read_bit()  # separate_colour_plane_flag
 
     width_off = reader.bit_position
     width = reader.read_ue()
@@ -260,6 +270,7 @@ def parse_sps(rbsp: bytes) -> SeqParameterSet:
         pic_width_in_luma_samples=width,
         pic_height_in_luma_samples=height,
         spans=[chroma_span, width_span, height_span],
+        separate_colour_plane_flag=separate_colour_plane_flag,
     )
 
     # Second stage: advance to the RPS region. Any parse error here leaves the
@@ -271,8 +282,29 @@ def parse_sps(rbsp: bytes) -> SeqParameterSet:
             reader.read_ue()  # conf_win_right_offset
             reader.read_ue()  # conf_win_top_offset
             reader.read_ue()  # conf_win_bottom_offset
-        reader.read_ue()  # bit_depth_luma_minus8
-        reader.read_ue()  # bit_depth_chroma_minus8
+        bd_luma_off = reader.bit_position
+        bd_luma = reader.read_ue()  # bit_depth_luma_minus8
+        sps.bit_depth_luma_minus8 = bd_luma
+        sps.spans.append(
+            FieldSpan(
+                "bit_depth_luma_minus8",
+                bd_luma_off,
+                reader.bit_position - bd_luma_off,
+                bd_luma,
+            )
+        )
+
+        bd_chroma_off = reader.bit_position
+        bd_chroma = reader.read_ue()  # bit_depth_chroma_minus8
+        sps.bit_depth_chroma_minus8 = bd_chroma
+        sps.spans.append(
+            FieldSpan(
+                "bit_depth_chroma_minus8",
+                bd_chroma_off,
+                reader.bit_position - bd_chroma_off,
+                bd_chroma,
+            )
+        )
 
         log2_max_poc_off = reader.bit_position
         log2_max_poc = reader.read_ue()  # log2_max_pic_order_cnt_lsb_minus4

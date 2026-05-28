@@ -478,3 +478,196 @@ class TestPpsDeblockingMutator:
     def test_result_name(self):
         result = get_mutator("pps-deblocking")(_seed_nals(), random.Random(0))
         assert result.mutator == "pps-deblocking"
+
+
+# --- Item 5: chroma-format and bit-depth SPS mutators ---------------------
+
+CHROMA_BITDEPTH_MUTATORS = {"sps-chroma-format", "sps-bit-depth"}
+
+
+def _build_sps_rbsp(
+    *,
+    chroma_format_idc: int = 1,
+    bit_depth_luma_minus8: int = 0,
+    bit_depth_chroma_minus8: int = 0,
+) -> bytes:
+    """Construct a minimal SPS RBSP that parses through the bit-depth region.
+
+    Uses max_sub_layers_minus1 == 0 so the profile_tier_level block is a fixed
+    96 bits, and stops just after bit_depth_chroma_minus8 — far enough for the
+    chroma and bit-depth spans, which is all these mutators need.
+    """
+    from mangle.bitstream import BitWriter
+
+    w = BitWriter()
+    w.write_bits(0, 4)  # sps_video_parameter_set_id
+    w.write_bits(0, 3)  # sps_max_sub_layers_minus1 = 0
+    w.write_bit(0)      # sps_temporal_id_nesting_flag
+    # profile_tier_level (general block only, max_sub_layers_minus1 == 0): 96 bits
+    w.write_bits(0, 8)   # profile_space/tier/profile_idc
+    w.write_bits(0, 32)  # profile_compatibility_flag[32]
+    w.write_bits(0, 48)  # constraint flags
+    w.write_bits(0, 8)   # general_level_idc
+    w.write_ue(0)        # sps_seq_parameter_set_id
+    w.write_ue(chroma_format_idc)  # chroma_format_idc
+    if chroma_format_idc == 3:
+        w.write_bit(0)   # separate_colour_plane_flag
+    w.write_ue(64)       # pic_width_in_luma_samples
+    w.write_ue(64)       # pic_height_in_luma_samples
+    w.write_bit(0)       # conformance_window_flag
+    w.write_ue(bit_depth_luma_minus8)    # bit_depth_luma_minus8
+    w.write_ue(bit_depth_chroma_minus8)  # bit_depth_chroma_minus8
+    w.write_bit(1)       # rbsp_stop_one_bit (we stop here; deeper fields absent)
+    return w.to_bytes()
+
+
+def _sps_stream(**kwargs) -> list[NalUnit]:
+    """Wrap a synthesised SPS RBSP in a minimal VPS+SPS+PPS NAL list."""
+    sps_rbsp = _build_sps_rbsp(**kwargs)
+    sps_header = bytes([(33 << 1), 0x01])
+    sps_nal = NalUnit(4, 0, sps_header + rbsp_to_ebsp(sps_rbsp))
+    vps_nal = NalUnit(4, 0, bytes([(32 << 1), 0x01]) + b"\x80")
+    pps_nal = NalUnit(4, 0, bytes([(34 << 1), 0x01]) + b"\x80")
+    return [vps_nal, sps_nal, pps_nal]
+
+
+def _reparse_sps(result_nals: list[NalUnit]):
+    mutated = assemble_nal_units(result_nals)
+    sps_nal = next(n for n in split_nal_units(mutated) if n.nal_unit_type == 33)
+    return parse_sps(ebsp_to_rbsp(sps_nal.ebsp[2:]))
+
+
+class TestChromaBitDepthMutatorsRegistered:
+    def test_present(self):
+        assert CHROMA_BITDEPTH_MUTATORS.issubset(set(list_mutators()))
+
+    def test_reproducible(self):
+        for name in CHROMA_BITDEPTH_MUTATORS:
+            r1 = get_mutator(name)(_seed_nals(), random.Random(42))
+            r2 = get_mutator(name)(_seed_nals(), random.Random(42))
+            assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+            assert r1.detail == r2.detail
+
+
+class TestSpsChromaFormat:
+    def test_changes_only_sps(self):
+        original = _seed_nals()
+        result = get_mutator("sps-chroma-format")(_seed_nals(), random.Random(0))
+        for orig, mut in zip(original, result.nals):
+            if orig.nal_unit_type == 33:
+                continue
+            assert orig.ebsp == mut.ebsp, "non-SPS NAL modified"
+
+    def test_seed_idc3_only_offers_reserved(self):
+        # The bundled seed is 4:4:4 (idc == 3), so the force_444 branch is never
+        # chosen; every result must be the reserved value 4.
+        for s in range(16):
+            result = get_mutator("sps-chroma-format")(_seed_nals(), random.Random(s))
+            sps = _reparse_sps(result.nals)
+            assert sps.chroma_format_idc == 4
+            assert "reserved" in result.detail
+
+    def test_reserved_value_is_out_of_range(self):
+        # Synthetic 4:2:0 SPS, force the reserved branch via the constructed seed.
+        nals = _sps_stream(chroma_format_idc=1)
+        # Force "reserved" deterministically: idc==1 means choices = [reserved, force_444]
+        # so we just check that at least one seed yields the reserved value 4.
+        got_reserved = False
+        for s in range(20):
+            result = get_mutator("sps-chroma-format")(nals, random.Random(s))
+            sps = _reparse_sps(result.nals)
+            if sps.chroma_format_idc == 4:
+                got_reserved = True
+                assert "reserved" in result.detail
+        assert got_reserved, "reserved (idc=4) mutation never produced"
+
+    def test_force_444_branch_reaches_3(self):
+        # With a non-3 seed, the force_444 branch must be reachable and set idc=3.
+        nals = _sps_stream(chroma_format_idc=1)
+        got_444 = False
+        for s in range(20):
+            result = get_mutator("sps-chroma-format")(nals, random.Random(s))
+            sps = _reparse_sps(result.nals)
+            if sps.chroma_format_idc == 3:
+                got_444 = True
+                assert "4:4:4" in result.detail
+        assert got_444, "force_444 (idc=3) mutation never produced"
+
+    def test_result_name_and_changes(self):
+        result = get_mutator("sps-chroma-format")(_seed_nals(), random.Random(0))
+        assert result.mutator == "sps-chroma-format"
+        assert result.bytes_changed > 0
+
+
+class TestSpsBitDepth:
+    def test_changes_only_sps(self):
+        original = _seed_nals()
+        result = get_mutator("sps-bit-depth")(_seed_nals(), random.Random(0))
+        for orig, mut in zip(original, result.nals):
+            if orig.nal_unit_type == 33:
+                continue
+            assert orig.ebsp == mut.ebsp, "non-SPS NAL modified"
+
+    def test_value_exceeds_spec_ceiling(self):
+        # Spec range is [0, 8]; every produced value must be > 8.
+        nals = _sps_stream(bit_depth_luma_minus8=0, bit_depth_chroma_minus8=0)
+        for s in range(16):
+            result = get_mutator("sps-bit-depth")(nals, random.Random(s))
+            sps = _reparse_sps(result.nals)
+            assert sps.bit_depth_luma_minus8 is not None
+            assert sps.bit_depth_chroma_minus8 is not None
+            mutated = max(sps.bit_depth_luma_minus8, sps.bit_depth_chroma_minus8)
+            assert mutated > 8, f"bit depth not pushed past 8 (seed {s})"
+
+    def test_both_targets_reachable(self):
+        nals = _sps_stream()
+        targets = set()
+        for s in range(24):
+            result = get_mutator("sps-bit-depth")(nals, random.Random(s))
+            if "bit_depth_luma_minus8" in result.detail:
+                targets.add("luma")
+            if "bit_depth_chroma_minus8" in result.detail:
+                targets.add("chroma")
+        assert targets == {"luma", "chroma"}, f"only hit {targets}"
+
+    def test_raises_when_bit_depth_unreachable(self):
+        # An SPS that parses its dimensions (stage 1) but is truncated before the
+        # bit-depth region (stage 2) leaves the bit-depth fields unset; the mutator
+        # must then bail so the engine can pick another mutator.
+        from mangle.bitstream import BitWriter
+
+        w = BitWriter()
+        w.write_bits(0, 4)  # sps_video_parameter_set_id
+        w.write_bits(0, 3)  # sps_max_sub_layers_minus1 = 0
+        w.write_bit(0)      # sps_temporal_id_nesting_flag
+        w.write_bits(0, 8)   # profile_tier_level: profile_space/tier/profile_idc
+        w.write_bits(0, 32)  # profile_compatibility_flag[32]
+        w.write_bits(0, 48)  # constraint flags
+        w.write_bits(0, 8)   # general_level_idc
+        w.write_ue(0)        # sps_seq_parameter_set_id
+        w.write_ue(1)        # chroma_format_idc (not 3, no separate-plane flag)
+        w.write_ue(64)       # pic_width_in_luma_samples
+        w.write_ue(64)       # pic_height_in_luma_samples
+        # truncate here: stage 2 (conformance/bit-depth) is unreachable.
+        truncated = w.to_bytes()
+        # Sanity: the parser yields dimensions but no bit-depth span.
+        sps_view = parse_sps(truncated)
+        assert sps_view.pic_width_in_luma_samples == 64
+        assert not sps_view.has_span("bit_depth_luma_minus8")
+
+        sps_nal = NalUnit(4, 0, bytes([(33 << 1), 0x01]) + rbsp_to_ebsp(truncated))
+        nals = [
+            NalUnit(4, 0, bytes([(32 << 1), 0x01]) + b"\x80"),
+            sps_nal,
+            NalUnit(4, 0, bytes([(34 << 1), 0x01]) + b"\x80"),
+        ]
+        try:
+            get_mutator("sps-bit-depth")(nals, random.Random(0))
+        except ValueError as exc:
+            assert "bit-depth" in str(exc).lower()
+        else:
+            raise AssertionError("expected ValueError for truncated SPS")
+
+    def test_result_name(self):
+        result = get_mutator("sps-bit-depth")(_seed_nals(), random.Random(0))
+        assert result.mutator == "sps-bit-depth"

@@ -178,6 +178,40 @@ class TestSpsParsing:
         assert reparsed.pic_height_in_luma_samples == 96
 
 
+class TestSpsChromaBitDepthParsing:
+    def test_chroma_and_separate_plane_recorded(self):
+        sps = parse_sps(_nal_rbsp(33))
+        # The bundled seed is 4:4:4 (idc == 3) and so carries the flag bit.
+        assert sps.chroma_format_idc == 3
+        assert sps.separate_colour_plane_flag == 0
+
+    def test_bit_depth_fields_parsed(self):
+        sps = parse_sps(_nal_rbsp(33))
+        assert sps.bit_depth_luma_minus8 == 0
+        assert sps.bit_depth_chroma_minus8 == 0
+
+    def test_bit_depth_spans_present_and_ordered(self):
+        sps = parse_sps(_nal_rbsp(33))
+        chroma = sps.span("chroma_format_idc")
+        bd_luma = sps.span("bit_depth_luma_minus8")
+        bd_chroma = sps.span("bit_depth_chroma_minus8")
+        # bit-depth fields follow the chroma/dimension block.
+        assert bd_luma.bit_offset > chroma.bit_offset
+        assert bd_chroma.bit_offset > bd_luma.bit_offset
+        assert sps.has_span("bit_depth_luma_minus8")
+        assert sps.has_span("bit_depth_chroma_minus8")
+
+    def test_splice_bit_depth_round_trips(self):
+        rbsp = _nal_rbsp(33)
+        sps = parse_sps(rbsp)
+        span = sps.span("bit_depth_luma_minus8")
+        new_rbsp = splice_ue_field(rbsp, span, 16)
+        reparsed = parse_sps(new_rbsp)
+        assert reparsed.bit_depth_luma_minus8 == 16
+        # chroma bit depth untouched
+        assert reparsed.bit_depth_chroma_minus8 == 0
+
+
 class TestSpsRpsParsing:
     def test_dpb_and_poc_fields_parsed(self):
         sps = parse_sps(_nal_rbsp(33))
