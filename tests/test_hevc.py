@@ -233,6 +233,52 @@ class TestSpsRpsParsing:
         assert lt.bit_offset > st.bit_offset
 
 
+class TestSpsFeatureFlagParsing:
+    def test_feature_flags_parsed(self):
+        sps = parse_sps(_nal_rbsp(33))
+        # The single intra IDR seed reaches the feature-toggle flag region; both
+        # flags are off (which is what lets the parser continue to the RPS region).
+        assert sps.scaling_list_enabled_flag == 0
+        assert sps.pcm_enabled_flag == 0
+
+    def test_feature_flag_spans_present_and_ordered(self):
+        sps = parse_sps(_nal_rbsp(33))
+        assert sps.has_span("scaling_list_enabled_flag")
+        assert sps.has_span("pcm_enabled_flag")
+        sl = sps.span("scaling_list_enabled_flag")
+        pcm = sps.span("pcm_enabled_flag")
+        assert sl.bit_length == 1
+        assert pcm.bit_length == 1
+        # scaling_list precedes pcm (amp / sao flags sit between them).
+        assert pcm.bit_offset > sl.bit_offset
+        # num_short_term_ref_pic_sets must come after both flags (parser advanced).
+        num_st = sps.span("num_short_term_ref_pic_sets")
+        assert num_st.bit_offset > pcm.bit_offset
+
+    def test_splice_pcm_flag_round_trips(self):
+        rbsp = _nal_rbsp(33)
+        sps = parse_sps(rbsp)
+        span = sps.span("pcm_enabled_flag")
+        new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1)
+        reparsed = parse_sps(new_rbsp)
+        assert reparsed.pcm_enabled_flag == 1
+        # length unchanged: a single u(1) flip never shifts the bitstream.
+        assert len(new_rbsp) == len(rbsp)
+
+    def test_scaling_list_flag_recorded_even_when_set(self):
+        # When scaling_list_enabled is set the parser bails before the RPS region,
+        # but the flag span must still be recorded so a mutator can find it.
+        rbsp = _nal_rbsp(33)
+        sps = parse_sps(rbsp)
+        span = sps.span("scaling_list_enabled_flag")
+        flipped = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1)
+        reparsed = parse_sps(flipped)
+        assert reparsed.scaling_list_enabled_flag == 1
+        assert reparsed.has_span("scaling_list_enabled_flag")
+        # parser bailed → pcm flag and RPS region not reached
+        assert not reparsed.has_span("pcm_enabled_flag")
+
+
 class TestPpsParsing:
     def test_tiles_flag_present(self):
         pps = parse_pps(_nal_rbsp(34))

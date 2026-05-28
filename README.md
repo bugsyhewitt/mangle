@@ -204,6 +204,7 @@ mangle mutators
 | `sps-bit-depth` | SPS | Pushes `bit_depth_luma_minus8` / `bit_depth_chroma_minus8` above the spec ceiling of 8 (>16-bit samples) to stress sample-buffer sizing |
 | `pps-slice-qp` | PPS | Pushes `init_qp_minus26` out of the spec range `[-26, 25]`, or flips `transform_skip_enabled_flag` without the matching SPS range-extension flags |
 | `nal-emulation-bytes` | NAL EBSP (raw bytes) | Inserts a phantom `0x000003` emulation sequence, drops a real emulation-prevention byte, or floods the payload head with `0x000003` triplets to stress the decoder's EBSP-to-RBSP scanner |
+| `sps-feature-flags` | SPS | Flips `scaling_list_enabled_flag` or `pcm_enabled_flag` on without supplying the variable-length data block it gates, desynchronising the rest of the SPS |
 
 All structured mutators keep the stream a parseable Annex-B bitstream while pushing
 it out of semantic spec-compliance — the input class that exercises decoder edge
@@ -305,6 +306,29 @@ throughout a decoder:
   - **`transform_skip_enabled_flag` flip**: toggles the u(1) flag. Enabling it
     without the matching SPS range-extension flags (`transform_skip_rotation_enabled_flag`
     etc.) creates an inconsistency that exercises range-extension handling paths.
+
+### SPS feature-toggle flag mutator
+
+- **`sps-feature-flags`** flips an SPS feature-toggle flag *on* without supplying
+  the variable-length data block it gates (H.265 §7.3.2.2.1), creating an internal
+  inconsistency that desynchronises every field after the flag. One reachable
+  flag that is currently *off* is chosen per invocation:
+  - **`scaling_list_enabled_flag`**: when set to 1 the decoder expects an
+    `sps_scaling_list_data_present_flag` (and, if set, a full `scaling_list_data()`
+    structure) that the bitstream never reserved. Scaling lists are a previously
+    untouched SPS attack surface (gap-analysis item #8) and feed quantization
+    matrices that several decoders copy into fixed-size tables.
+  - **`pcm_enabled_flag`**: when set to 1 a five-element PCM configuration block
+    follows; forcing it on without that block makes the decoder read PCM geometry
+    out of unrelated downstream bits, exercising the I_PCM sample-copy path that
+    has historically produced out-of-bounds sample writes.
+
+  Both targets are single u(1) bits, so the splice never shifts the bitstream
+  length — only one flag bit changes; the downstream desync is purely semantic,
+  exactly the input class that exercises decoder code paths without being rejected
+  as malformed framing. Only flags the seed currently has *off* are offered; if
+  neither reachable flag is off (or the SPS truncates before the flag region) the
+  mutator raises so the engine picks another.
 
 ### Emulation-prevention byte stress mutator
 

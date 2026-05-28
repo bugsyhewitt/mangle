@@ -870,6 +870,72 @@ def sps_bit_depth(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     )
 
 
+@register("sps-feature-flags")
+def sps_feature_flags(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Flip an SPS feature-toggle flag on without supplying its data block.
+
+    The SPS carries several single-bit feature flags (H.265 §7.3.2.2.1) that each
+    gate a *variable-length* data block immediately following:
+
+      * ``scaling_list_enabled_flag`` — when 1, an
+        ``sps_scaling_list_data_present_flag`` (and, if set, a full
+        ``scaling_list_data()`` structure) follows. Flipping a seed's 0 to a 1
+        makes the decoder expect scaling-list syntax the bitstream never reserved,
+        desynchronising every field after it. Scaling lists are gap-analysis item
+        #8 — a previously untouched SPS attack surface — and feed quantization
+        matrices that several decoders copy into fixed-size tables.
+      * ``pcm_enabled_flag`` — when 1, a five-element PCM configuration block
+        (``pcm_sample_bit_depth_luma_minus1`` etc.) follows. Flipping it on
+        without the block forces the decoder to read PCM geometry out of unrelated
+        downstream bits, exercising the I_PCM sample-copy path that has historically
+        produced out-of-bounds sample writes.
+
+    Only flags the seed currently has *off* are offered (flipping an enabled flag
+    off would be a no-op for the inconsistency we want, since the data block stays
+    in the stream and the tail is still desynchronised — we want the cleaner
+    "claims data that isn't there" direction). Each flag's span is reachable
+    whenever the SPS parses through the coding-block geometry; if neither flag was
+    reached, or both are already on, the mutator raises so the engine picks another.
+
+    [Worker decision: flag-flip splice keeps the SPS byte-stable]
+    Both targets are single u(1) bits, so the splice never shifts the bit-length of
+    the stream — only the one flag bit changes; the downstream desync is purely
+    semantic, which is exactly the input class that exercises decoder code paths
+    without being rejected as malformed framing.
+    """
+    out = _clone(nals)
+    idx = _first(out, 33)  # SPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    sps = parse_sps(rbsp)
+
+    candidates = []
+    for name in ("scaling_list_enabled_flag", "pcm_enabled_flag"):
+        if sps.has_span(name) and sps.span(name).value == 0:
+            candidates.append(name)
+    if not candidates:
+        raise ValueError(
+            "SPS did not parse to a togglable feature flag that is currently off; "
+            "cannot mutate feature flags"
+        )
+
+    target = rng.choice(candidates)
+    span = sps.span(target)
+    new_value = 1  # turn the gate on; the data block it expects is absent
+    new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="sps-feature-flags",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=(
+            f"{target}: 0 -> 1 (gate enabled without its dependent data block; "
+            f"downstream SPS desync)"
+        ),
+    )
+
+
 def _find_emulation_byte_offsets(ebsp: bytes) -> list[int]:
     """Return offsets of emulation-prevention bytes (the 0x03) within an EBSP.
 

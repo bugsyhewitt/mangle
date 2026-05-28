@@ -111,6 +111,10 @@ class SeqParameterSet:
     # Bit-depth fields (None if the SPS could not be parsed that far).
     bit_depth_luma_minus8: int | None = None
     bit_depth_chroma_minus8: int | None = None
+    # Feature-toggle flags that gate variable-length data blocks (None if the
+    # SPS could not be parsed that far). Each is a single u(1) bit.
+    scaling_list_enabled_flag: int | None = None
+    pcm_enabled_flag: int | None = None
     # RPS-relevant fields (None if SPS could not be parsed that far).
     sps_max_dec_pic_buffering_minus1: list[int] = field(default_factory=list)
     log2_max_pic_order_cnt_lsb_minus4: int | None = None
@@ -333,14 +337,30 @@ def parse_sps(rbsp: bytes) -> SeqParameterSet:
         reader.read_ue()  # log2_diff_max_min_luma_transform_block_size
         reader.read_ue()  # max_transform_hierarchy_depth_inter
         reader.read_ue()  # max_transform_hierarchy_depth_intra
-        scaling_list_enabled = reader.read_bit()
+
+        # Four single-bit feature-toggle flags (H.265 §7.3.2.2.1). Each gates a
+        # variable-length data block that follows; recording their spans lets a
+        # mutator flip a flag on without supplying the dependent data, creating an
+        # internal inconsistency that desynchronises the rest of the SPS.
+        sl_off = reader.bit_position
+        scaling_list_enabled = reader.read_bit()  # scaling_list_enabled_flag
+        sps.scaling_list_enabled_flag = scaling_list_enabled
+        sps.spans.append(
+            FieldSpan("scaling_list_enabled_flag", sl_off, 1, scaling_list_enabled)
+        )
         if scaling_list_enabled:
             # sps_scaling_list_data_present_flag + optional scaling_list_data()
-            # is variable-length and not modelled; bail out cleanly.
+            # is variable-length and not modelled; bail out cleanly. The span is
+            # already recorded so the feature-flags mutator can still flip it.
             raise ValueError("scaling_list_data present; RPS region not reached")
+
         reader.read_bit()  # amp_enabled_flag
         reader.read_bit()  # sample_adaptive_offset_enabled_flag
-        pcm_enabled = reader.read_bit()
+
+        pcm_off = reader.bit_position
+        pcm_enabled = reader.read_bit()  # pcm_enabled_flag
+        sps.pcm_enabled_flag = pcm_enabled
+        sps.spans.append(FieldSpan("pcm_enabled_flag", pcm_off, 1, pcm_enabled))
         if pcm_enabled:
             reader.read_bits(4)  # pcm_sample_bit_depth_luma_minus1
             reader.read_bits(4)  # pcm_sample_bit_depth_chroma_minus1

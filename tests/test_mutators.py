@@ -941,3 +941,198 @@ class TestNalEmulationBytesMutator:
         for seed in range(40):
             result = get_mutator("nal-emulation-bytes")(nals, random.Random(seed))
             assert not result.detail.startswith("dropped emulation")
+
+
+# --- Item: SPS feature-toggle flag mutator --------------------------------
+
+FEATURE_FLAG_MUTATORS = {"sps-feature-flags"}
+
+
+def _build_feature_flag_sps_rbsp(
+    *,
+    scaling_list_enabled: int = 0,
+    pcm_enabled: int = 0,
+) -> bytes:
+    """A minimal SPS RBSP that parses through the feature-toggle flag region.
+
+    Uses max_sub_layers_minus1 == 0 (fixed 96-bit profile_tier_level) and stops
+    right after pcm_enabled_flag — far enough for the scaling-list and pcm spans.
+    When pcm_enabled is 1 a minimal PCM config block is emitted so the parser does
+    not run off the end before the flag span is recorded.
+    """
+    from mangle.bitstream import BitWriter
+
+    w = BitWriter()
+    w.write_bits(0, 4)  # sps_video_parameter_set_id
+    w.write_bits(0, 3)  # sps_max_sub_layers_minus1 = 0
+    w.write_bit(0)      # sps_temporal_id_nesting_flag
+    w.write_bits(0, 8)   # profile_tier_level: profile_space/tier/profile_idc
+    w.write_bits(0, 32)  # profile_compatibility_flag[32]
+    w.write_bits(0, 48)  # constraint flags
+    w.write_bits(0, 8)   # general_level_idc
+    w.write_ue(0)        # sps_seq_parameter_set_id
+    w.write_ue(1)        # chroma_format_idc (4:2:0, no separate-plane flag)
+    w.write_ue(64)       # pic_width_in_luma_samples
+    w.write_ue(64)       # pic_height_in_luma_samples
+    w.write_bit(0)       # conformance_window_flag
+    w.write_ue(0)        # bit_depth_luma_minus8
+    w.write_ue(0)        # bit_depth_chroma_minus8
+    w.write_ue(4)        # log2_max_pic_order_cnt_lsb_minus4
+    w.write_bit(0)       # sps_sub_layer_ordering_info_present_flag
+    w.write_ue(0)        # sps_max_dec_pic_buffering_minus1[0]
+    w.write_ue(0)        # sps_max_num_reorder_pics[0]
+    w.write_ue(0)        # sps_max_latency_increase_plus1[0]
+    w.write_ue(0)        # log2_min_luma_coding_block_size_minus3
+    w.write_ue(0)        # log2_diff_max_min_luma_coding_block_size
+    w.write_ue(0)        # log2_min_luma_transform_block_size_minus2
+    w.write_ue(0)        # log2_diff_max_min_luma_transform_block_size
+    w.write_ue(0)        # max_transform_hierarchy_depth_inter
+    w.write_ue(0)        # max_transform_hierarchy_depth_intra
+    w.write_bit(scaling_list_enabled)  # scaling_list_enabled_flag
+    # When scaling lists are enabled the parser bails right after recording the
+    # span, so we do not need to emit scaling_list_data() for the span to exist.
+    w.write_bit(0)       # amp_enabled_flag
+    w.write_bit(0)       # sample_adaptive_offset_enabled_flag
+    w.write_bit(pcm_enabled)  # pcm_enabled_flag
+    if pcm_enabled:
+        w.write_bits(0, 4)  # pcm_sample_bit_depth_luma_minus1
+        w.write_bits(0, 4)  # pcm_sample_bit_depth_chroma_minus1
+        w.write_ue(0)       # log2_min_pcm_luma_coding_block_size_minus3
+        w.write_ue(0)       # log2_diff_max_min_pcm_luma_coding_block_size
+        w.write_bit(0)      # pcm_loop_filter_disabled_flag
+    w.write_bit(1)       # rbsp_stop_one_bit
+    return w.to_bytes()
+
+
+def _feature_flag_stream(**kwargs) -> list[NalUnit]:
+    sps_rbsp = _build_feature_flag_sps_rbsp(**kwargs)
+    sps_nal = NalUnit(4, 0, bytes([(33 << 1), 0x01]) + rbsp_to_ebsp(sps_rbsp))
+    vps_nal = NalUnit(4, 0, bytes([(32 << 1), 0x01]) + b"\x80")
+    pps_nal = NalUnit(4, 0, bytes([(34 << 1), 0x01]) + b"\x80")
+    return [vps_nal, sps_nal, pps_nal]
+
+
+class TestSpsFeatureFlagsRegistered:
+    def test_present(self):
+        assert FEATURE_FLAG_MUTATORS.issubset(set(list_mutators()))
+
+    def test_reproducible(self):
+        r1 = get_mutator("sps-feature-flags")(_seed_nals(), random.Random(7))
+        r2 = get_mutator("sps-feature-flags")(_seed_nals(), random.Random(7))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.detail == r2.detail
+
+
+class TestSpsFeatureFlags:
+    def test_parser_records_both_flag_spans(self):
+        sps = parse_sps(_build_feature_flag_sps_rbsp())
+        assert sps.has_span("scaling_list_enabled_flag")
+        assert sps.has_span("pcm_enabled_flag")
+        assert sps.scaling_list_enabled_flag == 0
+        assert sps.pcm_enabled_flag == 0
+
+    def test_clean_fixture_reaches_flags(self):
+        # The bundled seed must parse through to the feature flags (both off),
+        # which is what makes it a valid target for this mutator.
+        sps_nal = next(n for n in _seed_nals() if n.nal_unit_type == 33)
+        sps = parse_sps(ebsp_to_rbsp(sps_nal.ebsp[2:]))
+        assert sps.scaling_list_enabled_flag == 0
+        assert sps.pcm_enabled_flag == 0
+
+    def test_changes_only_sps(self):
+        original = _seed_nals()
+        result = get_mutator("sps-feature-flags")(_seed_nals(), random.Random(0))
+        for orig, mut in zip(original, result.nals):
+            if orig.nal_unit_type == 33:
+                continue
+            assert orig.ebsp == mut.ebsp, "non-SPS NAL modified"
+
+    def test_flag_is_flipped_on(self):
+        # Every produced mutant must have its targeted flag set to 1.
+        for s in range(24):
+            result = get_mutator("sps-feature-flags")(_seed_nals(), random.Random(s))
+            sps = _reparse_sps(result.nals)
+            target = result.detail.split(":")[0]
+            assert sps.span(target).value == 1, (target, s)
+
+    def test_both_flags_reachable(self):
+        targets = set()
+        for s in range(40):
+            result = get_mutator("sps-feature-flags")(_seed_nals(), random.Random(s))
+            if "scaling_list_enabled_flag" in result.detail:
+                targets.add("scaling")
+            if "pcm_enabled_flag" in result.detail:
+                targets.add("pcm")
+        assert targets == {"scaling", "pcm"}, f"only hit {targets}"
+
+    def test_single_bit_change_preserves_length(self):
+        # Flipping a u(1) flag must not shift the bitstream length.
+        original = assemble_nal_units(_seed_nals())
+        result = get_mutator("sps-feature-flags")(_seed_nals(), random.Random(3))
+        mutated = assemble_nal_units(result.nals)
+        assert len(mutated) == len(original)
+        assert result.bytes_changed >= 1
+
+    def test_framing_integrity(self):
+        result = get_mutator("sps-feature-flags")(_seed_nals(), random.Random(1))
+        mutated = assemble_nal_units(result.nals)
+        # The NAL count must be unchanged (in-place flip, no injection).
+        assert len(split_nal_units(mutated)) == len(_seed_nals())
+
+    def test_only_offers_flags_that_are_off(self):
+        # An SPS whose pcm flag is already on (but scaling-list off) must only
+        # offer the scaling-list flag. (scaling_list=0 keeps the parser advancing
+        # far enough to reach and record the pcm flag.)
+        nals = _feature_flag_stream(scaling_list_enabled=0, pcm_enabled=1)
+        sps = parse_sps(ebsp_to_rbsp(nals[1].ebsp[2:]))
+        assert sps.scaling_list_enabled_flag == 0
+        assert sps.pcm_enabled_flag == 1
+        for s in range(20):
+            result = get_mutator("sps-feature-flags")(nals, random.Random(s))
+            assert "scaling_list_enabled_flag" in result.detail
+            assert "pcm_enabled_flag" not in result.detail
+
+    def test_raises_when_no_off_flag_available(self):
+        # No reachable off-flag → no inconsistency to create → mutator bails so
+        # the engine can pick another mutator. A stream truncated before the flag
+        # region records no flag spans at all, the cleanest bail case.
+        truncated = _truncated_pre_flag_stream()
+        try:
+            get_mutator("sps-feature-flags")(truncated, random.Random(0))
+        except ValueError as exc:
+            assert "feature flag" in str(exc).lower()
+        else:
+            raise AssertionError("expected ValueError when no off-flag reachable")
+
+    def test_result_name(self):
+        result = get_mutator("sps-feature-flags")(_seed_nals(), random.Random(0))
+        assert result.mutator == "sps-feature-flags"
+
+
+def _truncated_pre_flag_stream() -> list[NalUnit]:
+    """An SPS truncated before the feature-flag region (no flag spans recorded)."""
+    from mangle.bitstream import BitWriter
+
+    w = BitWriter()
+    w.write_bits(0, 4)  # sps_video_parameter_set_id
+    w.write_bits(0, 3)  # sps_max_sub_layers_minus1 = 0
+    w.write_bit(0)      # sps_temporal_id_nesting_flag
+    w.write_bits(0, 8)
+    w.write_bits(0, 32)
+    w.write_bits(0, 48)
+    w.write_bits(0, 8)
+    w.write_ue(0)        # sps_seq_parameter_set_id
+    w.write_ue(1)        # chroma_format_idc
+    w.write_ue(64)       # width
+    w.write_ue(64)       # height
+    # truncate here, before the conformance/bit-depth/flag region
+    truncated = w.to_bytes()
+    sps_view = parse_sps(truncated)
+    assert not sps_view.has_span("scaling_list_enabled_flag")
+    assert not sps_view.has_span("pcm_enabled_flag")
+    sps_nal = NalUnit(4, 0, bytes([(33 << 1), 0x01]) + rbsp_to_ebsp(truncated))
+    return [
+        NalUnit(4, 0, bytes([(32 << 1), 0x01]) + b"\x80"),
+        sps_nal,
+        NalUnit(4, 0, bytes([(34 << 1), 0x01]) + b"\x80"),
+    ]
