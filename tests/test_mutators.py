@@ -6,13 +6,15 @@ import random
 from pathlib import Path
 
 from mangle.bitstream import (
+    NalUnit,
     assemble_nal_units,
     ebsp_to_rbsp,
+    rbsp_to_ebsp,
     split_nal_units,
     START_CODE_LONG,
     START_CODE_SHORT,
 )
-from mangle.hevc import parse_sei, parse_sps
+from mangle.hevc import parse_pps, parse_sei, parse_sps
 from mangle.mutators import get_mutator, list_mutators
 
 SEED = Path(__file__).parent / "fixtures" / "clean.h265"
@@ -294,3 +296,185 @@ class TestSeiBufferingOverflow:
     def test_mutator_result_name(self):
         result = get_mutator("sei-buffering-overflow")(_sei_seed_nals(), random.Random(0))
         assert result.mutator == "sei-buffering-overflow"
+
+
+DEBLOCKING_MUTATORS = {"pps-deblocking"}
+
+
+def _build_deblocking_pps_rbsp(
+    *, ctl_present: int = 1, disabled: int = 0, beta: int = 0, tc: int = 0
+) -> bytes:
+    """A minimal PPS RBSP reaching the deblocking-control region (no tiles)."""
+    from mangle.bitstream import BitWriter
+
+    w = BitWriter()
+    w.write_ue(0)  # pps_pic_parameter_set_id
+    w.write_ue(0)  # pps_seq_parameter_set_id
+    w.write_bit(0)  # dependent_slice_segments_enabled_flag
+    w.write_bit(0)  # output_flag_present_flag
+    w.write_bits(0, 3)  # num_extra_slice_header_bits
+    w.write_bit(0)  # sign_data_hiding_enabled_flag
+    w.write_bit(0)  # cabac_init_present_flag
+    w.write_ue(0)  # num_ref_idx_l0_default_active_minus1
+    w.write_ue(0)  # num_ref_idx_l1_default_active_minus1
+    w.write_se(0)  # init_qp_minus26
+    w.write_bit(0)  # constrained_intra_pred_flag
+    w.write_bit(0)  # transform_skip_enabled_flag
+    w.write_bit(0)  # cu_qp_delta_enabled_flag
+    w.write_se(0)  # pps_cb_qp_offset
+    w.write_se(0)  # pps_cr_qp_offset
+    w.write_bit(0)  # pps_slice_chroma_qp_offsets_present_flag
+    w.write_bit(0)  # weighted_pred_flag
+    w.write_bit(0)  # weighted_bipred_flag
+    w.write_bit(0)  # transquant_bypass_enabled_flag
+    w.write_bit(0)  # tiles_enabled_flag
+    w.write_bit(0)  # entropy_coding_sync_enabled_flag
+    w.write_bit(1)  # pps_loop_filter_across_slices_enabled_flag
+    w.write_bit(ctl_present)  # deblocking_filter_control_present_flag
+    if ctl_present:
+        w.write_bit(0)  # deblocking_filter_override_enabled_flag
+        w.write_bit(disabled)  # pps_deblocking_filter_disabled_flag
+        if not disabled:
+            w.write_se(beta)  # pps_beta_offset_div2
+            w.write_se(tc)  # pps_tc_offset_div2
+    w.write_bit(0)  # pps_scaling_list_data_present_flag
+    w.write_bit(0)  # lists_modification_present_flag
+    w.write_ue(0)  # log2_parallel_merge_level_minus2
+    w.write_bit(0)  # slice_segment_header_extension_present_flag
+    w.write_bit(0)  # pps_extension_present_flag
+    w.write_bit(1)  # rbsp_stop_one_bit
+    return w.to_bytes()
+
+
+def _deblocking_stream(**kwargs) -> list[NalUnit]:
+    """A VPS+SPS+PPS stream whose PPS reaches the deblocking-control region."""
+    seed = _seed_nals()
+    sps = next(n for n in seed if n.nal_unit_type == 33)
+    pps_header = bytes([(34 << 1), 0x01])
+    pps_rbsp = _build_deblocking_pps_rbsp(**kwargs)
+    pps_nal = NalUnit(4, 0, pps_header + rbsp_to_ebsp(pps_rbsp))
+    vps_header = bytes([(32 << 1), 0x01])
+    return [
+        NalUnit(4, 0, vps_header + b"\x80"),
+        NalUnit(4, 0, sps.ebsp),
+        pps_nal,
+    ]
+
+
+class TestPpsDeblockingMutator:
+    def test_registered(self):
+        assert DEBLOCKING_MUTATORS.issubset(set(list_mutators()))
+
+    def test_changes_bytes_on_seed(self):
+        original = SEED.read_bytes()
+        result = get_mutator("pps-deblocking")(_seed_nals(), random.Random(0))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated != original
+        assert result.bytes_changed > 0
+        assert result.detail
+
+    def test_reproducible(self):
+        r1 = get_mutator("pps-deblocking")(_seed_nals(), random.Random(42))
+        r2 = get_mutator("pps-deblocking")(_seed_nals(), random.Random(42))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.detail == r2.detail
+
+    def test_framing_intact(self):
+        result = get_mutator("pps-deblocking")(_seed_nals(), random.Random(0))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated[:4] == START_CODE_LONG or mutated[:3] == START_CODE_SHORT
+        assert len(split_nal_units(mutated)) == len(_seed_nals())
+
+    def test_only_pps_nal_changes(self):
+        original = _seed_nals()
+        result = get_mutator("pps-deblocking")(_seed_nals(), random.Random(0))
+        for orig, mut in zip(original, result.nals):
+            if orig.nal_unit_type == 34:
+                continue
+            assert orig.ebsp == mut.ebsp, "pps-deblocking modified a non-PPS NAL"
+
+    def test_seed_takes_loop_filter_path(self):
+        # The seed has deblocking_filter_control_present_flag == 0, so the only
+        # available branch is the loop-filter-across-slices flip; the mutant must
+        # re-parse with that flag flipped.
+        original_pps = next(n for n in _seed_nals() if n.nal_unit_type == 34)
+        orig = parse_pps(ebsp_to_rbsp(original_pps.ebsp[2:]))
+        result = get_mutator("pps-deblocking")(_seed_nals(), random.Random(0))
+        mutated_pps = next(n for n in result.nals if n.nal_unit_type == 34)
+        mut = parse_pps(ebsp_to_rbsp(mutated_pps.ebsp[2:]))
+        assert "loop_filter_across_slices" in result.detail
+        assert (
+            mut.pps_loop_filter_across_slices_enabled_flag
+            == 1 - orig.pps_loop_filter_across_slices_enabled_flag
+        )
+
+    def test_beta_tc_offset_goes_out_of_range(self):
+        # With a control-present PPS, some seed exercises the beta/tc path and
+        # pushes an offset outside the spec range [-6, 6].
+        for seed in range(60):
+            nals = _deblocking_stream(ctl_present=1, beta=0, tc=0)
+            result = get_mutator("pps-deblocking")(nals, random.Random(seed))
+            if "offset_div2" in result.detail:
+                mutated_pps = next(n for n in result.nals if n.nal_unit_type == 34)
+                mut = parse_pps(ebsp_to_rbsp(mutated_pps.ebsp[2:]))
+                out_of_range = [
+                    v
+                    for v in (mut.pps_beta_offset_div2, mut.pps_tc_offset_div2)
+                    if v is not None and not (-6 <= v <= 6)
+                ]
+                assert out_of_range, f"no offset out of [-6,6]: {result.detail}"
+                return
+        raise AssertionError("no seed exercised the beta/tc offset path")
+
+    def test_disabled_flag_path(self):
+        for seed in range(60):
+            nals = _deblocking_stream(ctl_present=1, disabled=0, beta=0, tc=0)
+            result = get_mutator("pps-deblocking")(nals, random.Random(seed))
+            if "pps_deblocking_filter_disabled_flag" in result.detail:
+                return
+        raise AssertionError("no seed exercised the disabled-flag path")
+
+    def test_tiles_pps_raises(self):
+        # A tiles-enabled PPS cannot reach the deblocking region; the mutator must
+        # signal that so the engine can choose another mutator.
+        seed = _seed_nals()
+        sps = next(n for n in seed if n.nal_unit_type == 33)
+        # Build a PPS with tiles_enabled = 1 (truncated right after the flag).
+        from mangle.bitstream import BitWriter
+
+        w = BitWriter()
+        w.write_ue(0)  # pps_pic_parameter_set_id
+        w.write_ue(0)  # pps_seq_parameter_set_id
+        w.write_bit(0)  # dependent_slice_segments_enabled_flag
+        w.write_bit(0)  # output_flag_present_flag
+        w.write_bits(0, 3)  # num_extra_slice_header_bits
+        w.write_bit(0)  # sign_data_hiding_enabled_flag
+        w.write_bit(0)  # cabac_init_present_flag
+        w.write_ue(0)  # num_ref_idx_l0_default_active_minus1
+        w.write_ue(0)  # num_ref_idx_l1_default_active_minus1
+        w.write_se(0)  # init_qp_minus26
+        w.write_bit(0)  # constrained_intra_pred_flag
+        w.write_bit(0)  # transform_skip_enabled_flag
+        w.write_bit(0)  # cu_qp_delta_enabled_flag
+        w.write_se(0)  # pps_cb_qp_offset
+        w.write_se(0)  # pps_cr_qp_offset
+        w.write_bit(0)  # pps_slice_chroma_qp_offsets_present_flag
+        w.write_bit(0)  # weighted_pred_flag
+        w.write_bit(0)  # weighted_bipred_flag
+        w.write_bit(0)  # transquant_bypass_enabled_flag
+        w.write_bit(1)  # tiles_enabled_flag
+        w.write_bit(1)  # rbsp_stop_one_bit
+        pps_header = bytes([(34 << 1), 0x01])
+        pps_nal = NalUnit(4, 0, pps_header + rbsp_to_ebsp(w.to_bytes()))
+        vps_header = bytes([(32 << 1), 0x01])
+        tiled = [NalUnit(4, 0, vps_header + b"\x80"), NalUnit(4, 0, sps.ebsp), pps_nal]
+        try:
+            get_mutator("pps-deblocking")(tiled, random.Random(0))
+        except ValueError as exc:
+            assert "deblocking" in str(exc).lower()
+        else:
+            raise AssertionError("expected ValueError for tiles-enabled PPS")
+
+    def test_result_name(self):
+        result = get_mutator("pps-deblocking")(_seed_nals(), random.Random(0))
+        assert result.mutator == "pps-deblocking"

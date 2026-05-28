@@ -330,6 +330,41 @@ introduces *incorrect* EBSP to exercise the decoder's EBSP scanner, not mangle's
 
 ---
 
+## 11. PPS deblocking / loop-filter mutator — ✅ IMPLEMENTED (2026-05-28)
+
+**Status:** Shipped. `parse_pps` in `hevc.py` now advances past the (untiled)
+entropy/loop-filter flags into the deblocking-filter control region
+(H.265 §7.3.2.3), recording spans for `pps_loop_filter_across_slices_enabled_flag`,
+`deblocking_filter_control_present_flag`, `deblocking_filter_override_enabled_flag`,
+`pps_deblocking_filter_disabled_flag`, `pps_beta_offset_div2`, and
+`pps_tc_offset_div2`. A `splice_se_field` helper was added for re-encoding the se(v)
+offsets in place. One mutator, `pps-deblocking`, was added to `builtin.py`; it picks
+from the branches the seed PPS actually exposes — out-of-range beta/tc offset
+(spec range [-6, 6] → ±32/±64), disable-flag flip, or loop-filter-scope flip —
+raising cleanly on tiled PPSes so the engine can choose another mutator. Tests in
+`tests/test_hevc.py` (`TestPpsDeblockingParsing`) and `tests/test_mutators.py`
+(`TestPpsDeblockingMutator`) cover each parse branch, the out-of-range offset
+invariant, reproducibility, framing integrity, and PPS-only-NAL containment.
+
+**What:** Corrupt the PPS deblocking-filter control fields, addressing gap-analysis
+item #9 ("Deblocking filter parameters in PPS/slice header"). Targets:
+
+- `pps_beta_offset_div2` / `pps_tc_offset_div2` (se(v), spec range [-6, 6]) — set
+  far out of range to push filter-strength table lookups past their bounds.
+- `pps_deblocking_filter_disabled_flag` — flip to create an inconsistency between
+  the claimed filter state and the offsets that follow.
+- `pps_loop_filter_across_slices_enabled_flag` — flip to exercise the slice-
+  boundary loop-filter path (reachable in any untiled PPS; conservative fallback).
+
+**Why now:** CVE-2026-33164 (libde265 <1.0.17) crashes in `set_derived_values()`
+on a malformed PPS — the deblocking control fields sit in that same derive path.
+The deblocking region was an untouched PPS attack surface; the existing PPS parser
+already reached the tile-config flags just before it, so the extension was low-cost.
+
+**Estimated LOC:** ~110 (parser extension ~95 + splice_se_field ~15 + mutator ~85).
+
+---
+
 ## Summary table
 
 | # | Name | Attack surface | New CVE class | Cost (LOC) | Priority |
@@ -344,6 +379,7 @@ introduces *incorrect* EBSP to exercise the decoder's EBSP scanner, not mangle's
 | 8 | Crash triage | Dedup / disclosure | Operational | ~180 | MEDIUM |
 | 9 | slice-qp / transform-skip | QP arithmetic | Integer overflow | ~80 | MEDIUM |
 | 10 | nal-emulation-bytes | EBSP scanning | Parse confusion | ~70 | LOWER |
+| 11 | pps-deblocking | PPS deblocking/loop-filter | OOB table lookup | ~110 | ✅ DONE |
 
 ---
 
@@ -386,7 +422,7 @@ are entirely untouched:
 6. EMSP / EBSP byte-level malformation
 7. HRD parameters in VUI
 8. Scaling lists (SPS/PPS)
-9. Deblocking filter parameters in PPS/slice header
+9. Deblocking filter parameters in PPS/slice header — ✅ PPS portion covered (item #11)
 10. HEVC range extensions (RExt) flags
 
 Items 1–6 above correspond directly to items 1–10 in the ranked list.

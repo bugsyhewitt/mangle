@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mangle.bitstream import ebsp_to_rbsp, split_nal_units
+from mangle.bitstream import BitWriter, ebsp_to_rbsp, split_nal_units
 from mangle.hevc import (
     SeiMessage,
     parse_pps,
@@ -12,8 +12,63 @@ from mangle.hevc import (
     parse_slice_header,
     parse_sps,
     splice_fixed_bits,
+    splice_se_field,
     splice_ue_field,
 )
+
+
+def _build_pps_rbsp(
+    *,
+    tiles_enabled: int = 0,
+    loop_filter_across: int = 1,
+    ctl_present: int = 0,
+    override: int = 0,
+    disabled: int = 0,
+    beta: int = 0,
+    tc: int = 0,
+) -> bytes:
+    """Construct a minimal but spec-shaped PPS RBSP through the deblocking block.
+
+    Used to exercise the deblocking-region parse paths that the single-frame
+    intra seed (which carries deblocking_filter_control_present_flag == 0) cannot.
+    """
+    w = BitWriter()
+    w.write_ue(0)  # pps_pic_parameter_set_id
+    w.write_ue(0)  # pps_seq_parameter_set_id
+    w.write_bit(0)  # dependent_slice_segments_enabled_flag
+    w.write_bit(0)  # output_flag_present_flag
+    w.write_bits(0, 3)  # num_extra_slice_header_bits
+    w.write_bit(0)  # sign_data_hiding_enabled_flag
+    w.write_bit(0)  # cabac_init_present_flag
+    w.write_ue(0)  # num_ref_idx_l0_default_active_minus1
+    w.write_ue(0)  # num_ref_idx_l1_default_active_minus1
+    w.write_se(0)  # init_qp_minus26
+    w.write_bit(0)  # constrained_intra_pred_flag
+    w.write_bit(0)  # transform_skip_enabled_flag
+    w.write_bit(0)  # cu_qp_delta_enabled_flag
+    w.write_se(0)  # pps_cb_qp_offset
+    w.write_se(0)  # pps_cr_qp_offset
+    w.write_bit(0)  # pps_slice_chroma_qp_offsets_present_flag
+    w.write_bit(0)  # weighted_pred_flag
+    w.write_bit(0)  # weighted_bipred_flag
+    w.write_bit(0)  # transquant_bypass_enabled_flag
+    w.write_bit(tiles_enabled)  # tiles_enabled_flag
+    w.write_bit(0)  # entropy_coding_sync_enabled_flag
+    w.write_bit(loop_filter_across)  # pps_loop_filter_across_slices_enabled_flag
+    w.write_bit(ctl_present)  # deblocking_filter_control_present_flag
+    if ctl_present:
+        w.write_bit(override)  # deblocking_filter_override_enabled_flag
+        w.write_bit(disabled)  # pps_deblocking_filter_disabled_flag
+        if not disabled:
+            w.write_se(beta)  # pps_beta_offset_div2
+            w.write_se(tc)  # pps_tc_offset_div2
+    w.write_bit(0)  # pps_scaling_list_data_present_flag
+    w.write_bit(0)  # lists_modification_present_flag
+    w.write_ue(0)  # log2_parallel_merge_level_minus2
+    w.write_bit(0)  # slice_segment_header_extension_present_flag
+    w.write_bit(0)  # pps_extension_present_flag
+    w.write_bit(1)  # rbsp_stop_one_bit
+    return w.to_bytes()
 
 SEED = Path(__file__).parent / "fixtures" / "clean.h265"
 
@@ -153,6 +208,68 @@ class TestPpsParsing:
         span = pps.span("tiles_enabled_flag")
         flipped = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1 - span.value)
         assert parse_pps(flipped).tiles_enabled_flag == 1 - span.value
+
+
+class TestPpsDeblockingParsing:
+    def test_seed_reaches_loop_filter_and_control_flags(self):
+        # The single-frame intra seed has no tiles, so the parser reaches the
+        # loop-filter-across-slices flag and the deblocking control flag.
+        pps = parse_pps(_nal_rbsp(34))
+        assert pps.pps_loop_filter_across_slices_enabled_flag in (0, 1)
+        assert pps.deblocking_filter_control_present_flag in (0, 1)
+        assert pps.has_span("pps_loop_filter_across_slices_enabled_flag")
+        assert pps.has_span("deblocking_filter_control_present_flag")
+
+    def test_control_off_leaves_deeper_fields_unset(self):
+        rbsp = _build_pps_rbsp(ctl_present=0)
+        pps = parse_pps(rbsp)
+        assert pps.deblocking_filter_control_present_flag == 0
+        assert pps.pps_deblocking_filter_disabled_flag is None
+        assert pps.pps_beta_offset_div2 is None
+        assert pps.pps_tc_offset_div2 is None
+        assert not pps.has_span("pps_beta_offset_div2")
+
+    def test_control_on_parses_beta_and_tc(self):
+        rbsp = _build_pps_rbsp(ctl_present=1, disabled=0, beta=3, tc=-2)
+        pps = parse_pps(rbsp)
+        assert pps.deblocking_filter_control_present_flag == 1
+        assert pps.deblocking_filter_override_enabled_flag == 0
+        assert pps.pps_deblocking_filter_disabled_flag == 0
+        assert pps.pps_beta_offset_div2 == 3
+        assert pps.pps_tc_offset_div2 == -2
+
+    def test_disabled_flag_suppresses_offsets(self):
+        rbsp = _build_pps_rbsp(ctl_present=1, disabled=1)
+        pps = parse_pps(rbsp)
+        assert pps.pps_deblocking_filter_disabled_flag == 1
+        assert pps.pps_beta_offset_div2 is None
+        assert not pps.has_span("pps_beta_offset_div2")
+
+    def test_tiles_enabled_bails_before_deblocking(self):
+        # Tile geometry is variable-length and out of scope; the parser must not
+        # mis-read it as the deblocking region.
+        rbsp = _build_pps_rbsp(tiles_enabled=1)
+        pps = parse_pps(rbsp)
+        assert pps.tiles_enabled_flag == 1
+        assert pps.pps_loop_filter_across_slices_enabled_flag is None
+        assert not pps.has_span("pps_loop_filter_across_slices_enabled_flag")
+
+    def test_splice_loop_filter_flag(self):
+        rbsp = _build_pps_rbsp(loop_filter_across=1)
+        pps = parse_pps(rbsp)
+        span = pps.span("pps_loop_filter_across_slices_enabled_flag")
+        flipped = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 0)
+        assert parse_pps(flipped).pps_loop_filter_across_slices_enabled_flag == 0
+
+    def test_splice_se_beta_offset_out_of_range(self):
+        rbsp = _build_pps_rbsp(ctl_present=1, beta=0, tc=0)
+        pps = parse_pps(rbsp)
+        span = pps.span("pps_beta_offset_div2")
+        new_rbsp = splice_se_field(rbsp, span, -64)
+        reparsed = parse_pps(new_rbsp)
+        assert reparsed.pps_beta_offset_div2 == -64
+        # tc must be preserved by the splice.
+        assert reparsed.pps_tc_offset_div2 == 0
 
 
 class TestSliceParsing:
