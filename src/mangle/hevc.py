@@ -410,6 +410,11 @@ class PicParameterSet:
     tiles_enabled_flag: int
     entropy_coding_sync_enabled_flag: int
     spans: list[FieldSpan] = field(default_factory=list)
+    # QP / transform-skip region (always reached for an untiled-or-tiled PPS, as
+    # these fields precede the tile-config flags). ``init_qp_minus26`` is se(v),
+    # spec range [-26, 25]; ``transform_skip_enabled_flag`` is u(1).
+    init_qp_minus26: int | None = None
+    transform_skip_enabled_flag: int | None = None
     # Deblocking-filter region (None if the parser did not reach it).
     pps_loop_filter_across_slices_enabled_flag: int | None = None
     deblocking_filter_control_present_flag: int | None = None
@@ -452,9 +457,22 @@ def parse_pps(rbsp: bytes) -> PicParameterSet:
     reader.read_bit()  # cabac_init_present_flag
     reader.read_ue()  # num_ref_idx_l0_default_active_minus1
     reader.read_ue()  # num_ref_idx_l1_default_active_minus1
-    reader.read_se()  # init_qp_minus26
+
+    init_qp_off = reader.bit_position
+    init_qp = reader.read_se()  # init_qp_minus26
+    init_qp_span = FieldSpan(
+        "init_qp_minus26", init_qp_off, reader.bit_position - init_qp_off, init_qp
+    )
+    spans.append(init_qp_span)
+
     reader.read_bit()  # constrained_intra_pred_flag
-    reader.read_bit()  # transform_skip_enabled_flag
+
+    ts_off = reader.bit_position
+    transform_skip = reader.read_bit()  # transform_skip_enabled_flag
+    spans.append(
+        FieldSpan("transform_skip_enabled_flag", ts_off, 1, transform_skip)
+    )
+
     cu_qp_delta = reader.read_bit()  # cu_qp_delta_enabled_flag
     if cu_qp_delta:
         reader.read_ue()  # diff_cu_qp_delta_depth
@@ -481,6 +499,8 @@ def parse_pps(rbsp: bytes) -> PicParameterSet:
         tiles_enabled_flag=tiles_enabled,
         entropy_coding_sync_enabled_flag=entropy_sync,
         spans=spans,
+        init_qp_minus26=init_qp,
+        transform_skip_enabled_flag=transform_skip,
     )
 
     # Second stage: advance to the deblocking-filter control region. Any parse

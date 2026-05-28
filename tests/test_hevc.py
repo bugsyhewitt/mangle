@@ -26,6 +26,8 @@ def _build_pps_rbsp(
     disabled: int = 0,
     beta: int = 0,
     tc: int = 0,
+    init_qp: int = 0,
+    transform_skip: int = 0,
 ) -> bytes:
     """Construct a minimal but spec-shaped PPS RBSP through the deblocking block.
 
@@ -42,9 +44,9 @@ def _build_pps_rbsp(
     w.write_bit(0)  # cabac_init_present_flag
     w.write_ue(0)  # num_ref_idx_l0_default_active_minus1
     w.write_ue(0)  # num_ref_idx_l1_default_active_minus1
-    w.write_se(0)  # init_qp_minus26
+    w.write_se(init_qp)  # init_qp_minus26
     w.write_bit(0)  # constrained_intra_pred_flag
-    w.write_bit(0)  # transform_skip_enabled_flag
+    w.write_bit(transform_skip)  # transform_skip_enabled_flag
     w.write_bit(0)  # cu_qp_delta_enabled_flag
     w.write_se(0)  # pps_cb_qp_offset
     w.write_se(0)  # pps_cr_qp_offset
@@ -304,6 +306,58 @@ class TestPpsDeblockingParsing:
         assert reparsed.pps_beta_offset_div2 == -64
         # tc must be preserved by the splice.
         assert reparsed.pps_tc_offset_div2 == 0
+
+
+class TestPpsQpParsing:
+    def test_seed_records_qp_and_transform_skip(self):
+        # The single-frame intra seed parses through the QP / transform-skip
+        # region (those fields precede the tile-config flags).
+        pps = parse_pps(_nal_rbsp(34))
+        assert pps.init_qp_minus26 is not None
+        assert pps.transform_skip_enabled_flag in (0, 1)
+        assert pps.has_span("init_qp_minus26")
+        assert pps.has_span("transform_skip_enabled_flag")
+
+    def test_init_qp_value_round_trips(self):
+        rbsp = _build_pps_rbsp(init_qp=7, transform_skip=0)
+        pps = parse_pps(rbsp)
+        assert pps.init_qp_minus26 == 7
+        assert pps.transform_skip_enabled_flag == 0
+
+    def test_negative_init_qp_round_trips(self):
+        rbsp = _build_pps_rbsp(init_qp=-12, transform_skip=1)
+        pps = parse_pps(rbsp)
+        assert pps.init_qp_minus26 == -12
+        assert pps.transform_skip_enabled_flag == 1
+
+    def test_transform_skip_span_is_one_bit(self):
+        rbsp = _build_pps_rbsp(transform_skip=1)
+        pps = parse_pps(rbsp)
+        span = pps.span("transform_skip_enabled_flag")
+        assert span.bit_length == 1
+        assert span.value == 1
+
+    def test_splice_init_qp_out_of_range_preserves_tail(self):
+        # Rewriting init_qp to a far out-of-range se(v) must not disturb the
+        # deblocking fields that follow.
+        rbsp = _build_pps_rbsp(init_qp=0, ctl_present=1, beta=3, tc=-2)
+        pps = parse_pps(rbsp)
+        span = pps.span("init_qp_minus26")
+        new_rbsp = splice_se_field(rbsp, span, 52)
+        reparsed = parse_pps(new_rbsp)
+        assert reparsed.init_qp_minus26 == 52
+        assert reparsed.pps_beta_offset_div2 == 3
+        assert reparsed.pps_tc_offset_div2 == -2
+
+    def test_splice_transform_skip_flip_preserves_tail(self):
+        rbsp = _build_pps_rbsp(transform_skip=0, ctl_present=1, beta=1, tc=1)
+        pps = parse_pps(rbsp)
+        span = pps.span("transform_skip_enabled_flag")
+        flipped = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1)
+        reparsed = parse_pps(flipped)
+        assert reparsed.transform_skip_enabled_flag == 1
+        assert reparsed.init_qp_minus26 == 0
+        assert reparsed.pps_beta_offset_div2 == 1
 
 
 class TestSliceParsing:

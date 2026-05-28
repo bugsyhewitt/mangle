@@ -210,6 +210,80 @@ def pps_deblocking(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     )
 
 
+@register("pps-slice-qp")
+def pps_slice_qp(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Corrupt the PPS quantization / transform-skip control fields.
+
+    The PPS carries the picture-level quantization baseline and the transform-skip
+    enable that downstream slice QP arithmetic and coefficient-array sizing both
+    depend on (H.265 §7.4.3.3):
+
+      * ``init_qp_minus26`` (se(v)) — picture QP baseline; spec range is
+        [-(26 + 6*bit_depth_offset), 25], i.e. [-26, 25] for 8-bit. Decoders that
+        pre-allocate a quantization coefficient table sized by ``maxQP - minQP + 1``
+        and clamp ``init_qp`` incorrectly can produce a zero or negative allocation
+        size, or index a dequant scaling table out of bounds.
+      * ``transform_skip_enabled_flag`` (u(1)) — gates transform-skip coding.
+        Flipping it to 1 without the matching SPS range-extension flags
+        (``transform_skip_rotation_enabled_flag`` etc.) creates an inconsistency
+        that exercises range-extension handling paths.
+
+    One of two mutations is chosen per invocation:
+
+      1. **out-of-range init_qp_minus26** — rewrite the se(v) field to ±52, well
+         outside the spec range [-26, 25], driving the picture QP baseline past the
+         valid [0, 51] derived-QP window.
+      2. **flip transform_skip_enabled_flag** — toggle the u(1) flag, exercising
+         the transform-skip / range-extension consistency check.
+
+    Both fields precede the tile-config flags, so they are always reachable for any
+    PPS that parses at all — this mutator never has to fall back. QP-related
+    mutations are historically productive for integer-overflow bugs in dequant
+    array sizing.
+    """
+    out = _clone(nals)
+    idx = _first(out, 34)  # PPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    pps = parse_pps(rbsp)
+
+    if not pps.has_span("init_qp_minus26") or not pps.has_span(
+        "transform_skip_enabled_flag"
+    ):
+        raise ValueError(
+            "PPS did not parse to the QP / transform-skip region (truncated PPS)"
+        )
+
+    choice = rng.choice(["init_qp", "transform_skip"])
+
+    if choice == "init_qp":
+        span = pps.span("init_qp_minus26")
+        # Spec range is [-26, 25]; pick a far out-of-range magnitude.
+        new_value = rng.choice([-52, -64, 52, 64])
+        new_rbsp = splice_se_field(rbsp, span, new_value)
+        detail = (
+            f"init_qp_minus26: {span.value} -> {new_value} "
+            f"(out of spec range [-26, 25])"
+        )
+    else:  # transform_skip
+        span = pps.span("transform_skip_enabled_flag")
+        new_value = 1 - span.value
+        new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+        detail = (
+            f"transform_skip_enabled_flag: {span.value} -> {new_value} "
+            f"(no matching SPS range-extension flags)"
+        )
+
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="pps-slice-qp",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=detail,
+    )
+
+
 @register("slice-header-ref-pic-list")
 def slice_header_ref_pic_list(
     nals: list[NalUnit], rng: random.Random
