@@ -325,7 +325,25 @@ coverage requires ~30 additional lines.
 
 ---
 
-## 10. Emulation-prevention byte stress mutator
+## 10. Emulation-prevention byte stress mutator — ✅ IMPLEMENTED (2026-05-28)
+
+**Status:** Shipped. A new `nal-emulation-bytes` mutator was added to `builtin.py`.
+Unlike every other mangle mutator it operates on the raw on-wire EBSP bytes of a
+chosen NAL rather than on a parsed field — `assemble_nal_units` concatenates each
+NAL's `ebsp` verbatim (it does not re-run `rbsp_to_ebsp`), so a deliberately
+malformed EBSP reaches the decoder exactly as written, exercising the decoder's
+emulation-prevention scanner rather than mangle's. A helper
+`_find_emulation_byte_offsets` locates genuine emulation-prevention bytes (mirroring
+the `ebsp_to_rbsp` rule). The mutator picks one of three corruptions per invocation,
+adapting the menu to the chosen NAL: **insert** a phantom `0x000003` triplet at a
+payload byte boundary; **drop** a real emulation-prevention byte (exposing raw
+`0x0000` + following byte, which can leave a phantom `0x000001` start code); or
+**flood** the payload head with 64–300 consecutive `0x000003` triplets, reproducing
+the CVE-2022-32939 high-density pattern. The 2-byte NAL header and all NAL framing
+(start codes) are always preserved. Tests in `tests/test_mutators.py`
+(`TestNalEmulationBytesMutator`, 11 cases) cover registration, reproducibility,
+framing integrity, single-NAL containment, each of the three branches, full branch
+reachability, and the no-existing-emulation-byte skip-drop invariant.
 
 **What:** A dedicated `nal-emulation-bytes` mutator that deliberately inserts or
 removes RBSP emulation-prevention bytes (0x000003 sequences) at the bitstream level
@@ -403,7 +421,7 @@ already reached the tile-config flags just before it, so the extension was low-c
 | 7 | AFL harness | Coverage feedback | Throughput | ~200 | MEDIUM |
 | 8 | Crash triage | Dedup / disclosure | Operational | ~180 | MEDIUM |
 | 9 | pps-slice-qp | QP arithmetic / transform-skip | Integer overflow | ~80 | ✅ DONE |
-| 10 | nal-emulation-bytes | EBSP scanning | Parse confusion | ~70 | LOWER |
+| 10 | nal-emulation-bytes | EBSP scanning | Parse confusion | ~70 | ✅ DONE |
 | 11 | pps-deblocking | PPS deblocking/loop-filter | OOB table lookup | ~110 | ✅ DONE |
 
 ---
@@ -444,7 +462,7 @@ are entirely untouched:
 3. SEI NAL units (any payload type)
 4. Bit depth and chroma format SPS fields — ✅ covered (item #5)
 5. QP fields in PPS — ✅ covered (item #9)
-6. EMSP / EBSP byte-level malformation
+6. EMSP / EBSP byte-level malformation — ✅ covered (item #10)
 7. HRD parameters in VUI
 8. Scaling lists (SPS/PPS)
 9. Deblocking filter parameters in PPS/slice header — ✅ PPS portion covered (item #11)

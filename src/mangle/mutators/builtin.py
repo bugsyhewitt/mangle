@@ -870,6 +870,133 @@ def sps_bit_depth(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     )
 
 
+def _find_emulation_byte_offsets(ebsp: bytes) -> list[int]:
+    """Return offsets of emulation-prevention bytes (the 0x03) within an EBSP.
+
+    An emulation-prevention byte is the 0x03 in a ``0x00 0x00 0x03`` sequence
+    whose following byte is in {0x00, 0x01, 0x02, 0x03} (or end-of-NAL). This is
+    the exact rule mirrored from :func:`ebsp_to_rbsp`, so the two stay in lockstep.
+    """
+    offsets: list[int] = []
+    i = 0
+    n = len(ebsp)
+    while i < n:
+        if (
+            i + 2 < n
+            and ebsp[i] == 0
+            and ebsp[i + 1] == 0
+            and ebsp[i + 2] == 3
+            and (i + 3 >= n or ebsp[i + 3] <= 3)
+        ):
+            offsets.append(i + 2)  # the 0x03 itself
+            i += 3
+        else:
+            i += 1
+    return offsets
+
+
+@register("nal-emulation-bytes")
+def nal_emulation_bytes(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Stress the decoder's EBSP-to-RBSP (emulation-prevention) scanner.
+
+    HEVC carries NAL payloads as EBSP (Encapsulated Byte Sequence Payload): to
+    keep a start code (``0x00 0x00 0x01``) from appearing inside payload data,
+    the encoder inserts an *emulation-prevention byte* (``0x03``) after any
+    ``0x00 0x00`` that would otherwise be followed by a byte in
+    {0x00, 0x01, 0x02, 0x03}. Every conformant decoder must strip those 0x03
+    bytes back out before parsing — and that scanner is a known extreme-value
+    attack surface: CVE-2022-32939 (h26forge, iOS kernel, 0-click arbitrary
+    write) was triggered by an HEVC NAL carrying an out-of-spec density of
+    emulation-prevention bytes.
+
+    Unlike every other mangle mutator, this one operates on the raw on-wire
+    *EBSP* bytes directly rather than on a parsed field. ``assemble_nal_units``
+    concatenates each NAL's ``ebsp`` verbatim (it does *not* re-run
+    ``rbsp_to_ebsp``), so a deliberately malformed EBSP we splice here reaches the
+    decoder exactly as written — exercising the decoder's scanner, not mangle's.
+    NAL framing (start codes between units) is left untouched.
+
+    One of three corruptions is chosen per invocation, restricted to whichever
+    are applicable to the picked NAL:
+
+      1. **insert a phantom emulation sequence** — splice a fresh
+         ``0x00 0x00 0x03`` triplet at a byte boundary inside the payload. A
+         compliant decoder removes the 0x03 and recovers ``0x00 0x00``; a buggy
+         scanner that miscounts the run, or fails to re-scan after removal,
+         desynchronises every field after the insertion point.
+      2. **drop an existing emulation-prevention byte** — remove the 0x03 from a
+         genuine ``0x00 0x00 0x03`` sequence, leaving the raw ``0x00 0x00`` +
+         following byte exposed. Decoders that do not re-scan after their first
+         pass will misread the now-shorter payload (and a ``0x00 0x00 0x01``
+         left behind reads as a phantom start code).
+      3. **emulation-byte flood** — inject many ``0x00 0x00 0x03`` triplets in a
+         row near the NAL header, reproducing the CVE-2022-32939 high-density
+         pattern that overran a fixed-size scratch buffer in the EBSP scanner.
+
+    A NAL with no existing emulation-prevention byte cannot offer mutation (2);
+    the menu adapts accordingly. The 2-byte NAL header is always preserved so the
+    unit keeps its identity.
+    """
+    out = _clone(nals)
+    original_stream = assemble_nal_units(nals)
+
+    # Pick a non-trivial NAL to corrupt: prefer one with payload past the header.
+    candidate_indices = [i for i, n in enumerate(out) if len(n.ebsp) > 2]
+    if not candidate_indices:
+        raise ValueError("no NAL with payload bytes to corrupt")
+    idx = rng.choice(candidate_indices)
+    nal = out[idx]
+    header = nal.ebsp[:2]
+    payload = nal.ebsp[2:]
+
+    existing = _find_emulation_byte_offsets(payload)
+
+    choices = ["insert", "flood"]
+    if existing:
+        choices.append("drop")
+    choice = rng.choice(choices)
+
+    if choice == "drop":
+        # Remove a real emulation-prevention byte, exposing raw 0x00 0x00 0xXX.
+        pos = rng.choice(existing)  # offset within payload of the 0x03
+        new_payload = payload[:pos] + payload[pos + 1 :]
+        exposed = payload[pos + 1] if pos + 1 < len(payload) else None
+        detail = (
+            f"dropped emulation-prevention byte at payload offset {pos} "
+            f"(NAL #{idx}); exposes raw 0x0000"
+            + (f"{exposed:02x}" if exposed is not None else "")
+        )
+
+    elif choice == "flood":
+        # High-density emulation flood right after the header (CVE-2022-32939).
+        count = rng.choice([64, 128, 256, 300])
+        flood = b"\x00\x00\x03" * count
+        new_payload = flood + payload
+        detail = (
+            f"injected {count} consecutive 0x000003 emulation triplets "
+            f"({count * 3} bytes) at NAL #{idx} payload head "
+            f"(CVE-2022-32939 high-density pattern)"
+        )
+
+    else:  # insert
+        # Splice one phantom 0x00 0x00 0x03 at a payload byte boundary.
+        pos = rng.randrange(0, len(payload) + 1)
+        new_payload = payload[:pos] + b"\x00\x00\x03" + payload[pos:]
+        detail = (
+            f"inserted phantom 0x000003 emulation sequence at payload offset "
+            f"{pos} (NAL #{idx})"
+        )
+
+    out[idx] = NalUnit(nal.start_code_len, nal.offset, header + new_payload)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="nal-emulation-bytes",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=detail,
+    )
+
+
 def load_stream(data: bytes) -> list[NalUnit]:
     """Convenience: split a raw Annex-B stream into NAL units."""
     return split_nal_units(data)
