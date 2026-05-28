@@ -4,6 +4,7 @@ Subcommands:
   mutate  - apply one structured mutation to a seed and write the mutant
   fuzz    - run many mutations against a decoder and record outcomes
   corpus  - generate a diverse minimal seed corpus from one seed file
+  triage  - cluster and deduplicate the crashes from a fuzz run
   mutators - list available mutator types
 """
 
@@ -17,6 +18,7 @@ from . import __version__
 from .corpus import build_corpus
 from .engine import fuzz_file, mutate_file
 from .mutators import list_mutators
+from .triage import triage
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -113,6 +115,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_corpus.set_defaults(func=_cmd_corpus)
 
+    # triage
+    p_triage = sub.add_parser(
+        "triage",
+        help="cluster and deduplicate the crashes from a fuzz run",
+        description=(
+            "Post-process a fuzz output directory: read results.jsonl and the "
+            "crashes/ artifacts, cluster crashes by a stable signature "
+            "(ASAN/UBSAN top stack frames when present, else a normalised "
+            "stderr hash) keyed on (signature, decoder, mutator), and write "
+            "triage.jsonl plus a unique-crashes/ directory holding the most "
+            "minimal representative of each cluster. Fully deterministic; makes "
+            "no changes to the fuzzing pipeline."
+        ),
+    )
+    p_triage.add_argument(
+        "--output-dir",
+        required=True,
+        help="a fuzz output directory containing results.jsonl and crashes/",
+    )
+    p_triage.add_argument(
+        "--decoder",
+        default="ffmpeg",
+        choices=["ffmpeg", "libde265"],
+        help="label for the campaign's decoder (part of the cluster key)",
+    )
+    p_triage.add_argument(
+        "--frame-depth",
+        type=int,
+        default=3,
+        help="number of top sanitizer stack frames used as the signature",
+    )
+    p_triage.set_defaults(func=_cmd_triage)
+
     # mutators
     p_list = sub.add_parser("mutators", help="list available mutator types")
     p_list.set_defaults(func=_cmd_list_mutators)
@@ -165,6 +200,28 @@ def _cmd_corpus(args: argparse.Namespace) -> int:
         for e in skipped:
             print(f"  {e.descriptor} ({e.strategy}): {e.skipped} — {e.detail}")
     print(f"manifest written to {args.output_dir}/manifest.json")
+    return 0
+
+
+def _cmd_triage(args: argparse.Namespace) -> int:
+    clusters = triage(
+        output_dir=args.output_dir,
+        decoder=args.decoder,
+        frame_depth=args.frame_depth,
+    )
+    total_members = sum(c.count for c in clusters)
+    print(
+        f"clustered {total_members} crash artifact(s) into "
+        f"{len(clusters)} unique bug(s)"
+    )
+    for c in clusters:
+        sig = c.signature if c.signature_kind == "asan" else f"stderr:{c.signature}"
+        print(
+            f"  cluster {c.cluster_id}: {c.count}x [{c.mutator}] "
+            f"{c.signature_kind} {sig}"
+        )
+    print(f"triage written to {args.output_dir}/triage.jsonl")
+    print(f"unique PoCs in {args.output_dir}/unique-crashes/")
     return 0
 
 

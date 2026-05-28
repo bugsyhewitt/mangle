@@ -262,7 +262,26 @@ with AFL++'s coverage feedback loop.
 
 ---
 
-## 8. Crash triage and deduplication engine
+## 8. Crash triage and deduplication engine — ✅ IMPLEMENTED (2026-05-28)
+
+**Status:** Shipped. New module `triage.py` plus a `mangle triage` subcommand. It
+is a pure post-processing pass over a fuzz `output-dir`: it reads `results.jsonl`
+(for the per-crash iteration/mutator metadata) and `crashes/<hash>.txt` (decoder
+stderr) and clusters crashes by a stable signature. When the decoder was built
+with ASAN/UBSAN, `signature_for()` extracts the top `frame_depth` (default 3)
+stack-frame *function names* via `extract_frames()` (addresses and line numbers
+are deliberately excluded so the signature is build- and input-stable). When no
+sanitizer trace is present it falls back to a hash of normalised stderr (hex
+addresses, integers, and `.h265`/`.hevc` paths scrubbed). The cluster key is the
+triple `(signature, decoder, mutator)`; each cluster keeps its smallest mutant as
+the representative (most-minimal PoC, deterministically tie-broken). Outputs
+`triage.jsonl` (one cluster per line) and a `unique-crashes/` directory holding
+each cluster representative's `<hash>.h265` + `<hash>.txt`. Zero changes to the
+mutation/fuzzing pipeline; fully deterministic. Tests in `tests/test_triage.py`
+(24 cases) cover frame extraction, both signature kinds, number-insensitive
+clustering, the mutator/decoder key, representative minimisation, sort order,
+clean-iteration filtering, the missing-results error, determinism, the output
+schema, PoC-byte fidelity, and the CLI.
 
 **What:** Add a `mangle triage` subcommand that reads a `results.jsonl` and the
 `crashes/` directory, clusters crashes by:
@@ -419,7 +438,7 @@ already reached the tile-config flags just before it, so the extension was low-c
 | 5 | sps-chroma-format / sps-bit-depth | Sample buffer sizing | Buffer underflow | ~100 | ✅ DONE |
 | 6 | Differential oracle | Cross-decoder divergence | Silent corruption | ~120 | MEDIUM |
 | 7 | AFL harness | Coverage feedback | Throughput | ~200 | MEDIUM |
-| 8 | Crash triage | Dedup / disclosure | Operational | ~180 | MEDIUM |
+| 8 | Crash triage | Dedup / disclosure | Operational | ~180 | ✅ DONE |
 | 9 | pps-slice-qp | QP arithmetic / transform-skip | Integer overflow | ~80 | ✅ DONE |
 | 10 | nal-emulation-bytes | EBSP scanning | Parse confusion | ~70 | ✅ DONE |
 | 11 | pps-deblocking | PPS deblocking/loop-filter | OOB table lookup | ~110 | ✅ DONE |
