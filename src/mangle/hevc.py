@@ -352,13 +352,39 @@ def parse_sps(rbsp: bytes) -> SeqParameterSet:
 
 @dataclass
 class PicParameterSet:
-    """A minimally-parsed HEVC PPS exposing tile-config field spans."""
+    """A minimally-parsed HEVC PPS exposing tile-config and deblocking spans.
+
+    In addition to the v0.1 tile-config spans, the parser advances past the
+    (optional) tile-geometry block to the deblocking-filter control region
+    (H.265 §7.3.2.3) so the deblocking mutator can locate and rewrite it. The
+    fields needed for deblocking mutation are recorded when reached:
+
+      * ``pps_loop_filter_across_slices_enabled_flag`` — u(1) loop-filter scope
+        flag; flipping it changes cross-slice filtering behaviour.
+      * ``deblocking_filter_control_present_flag`` — u(1) gate for the override /
+        disable / beta-tc offset syntax that follows.
+      * ``deblocking_filter_override_enabled_flag``,
+        ``pps_deblocking_filter_disabled_flag`` — u(1) each, present only when the
+        control flag is set.
+      * ``pps_beta_offset_div2`` / ``pps_tc_offset_div2`` — se(v), valid range
+        [-6, 6]; present only when control is set and disable is off.
+
+    Any field not reached (e.g. tiles enabled → variable geometry, or a truncated
+    PPS) is simply absent from ``spans`` and its attribute left ``None``.
+    """
 
     pps_pic_parameter_set_id: int
     pps_seq_parameter_set_id: int
     tiles_enabled_flag: int
     entropy_coding_sync_enabled_flag: int
     spans: list[FieldSpan] = field(default_factory=list)
+    # Deblocking-filter region (None if the parser did not reach it).
+    pps_loop_filter_across_slices_enabled_flag: int | None = None
+    deblocking_filter_control_present_flag: int | None = None
+    deblocking_filter_override_enabled_flag: int | None = None
+    pps_deblocking_filter_disabled_flag: int | None = None
+    pps_beta_offset_div2: int | None = None
+    pps_tc_offset_div2: int | None = None
 
     def span(self, name: str) -> FieldSpan:
         for s in self.spans:
@@ -366,11 +392,21 @@ class PicParameterSet:
                 return s
         raise KeyError(name)
 
+    def has_span(self, name: str) -> bool:
+        return any(s.name == name for s in self.spans)
+
 
 def parse_pps(rbsp: bytes) -> PicParameterSet:
-    """Parse a PPS RBSP up to and including tiles_enabled_flag.
+    """Parse a PPS RBSP through to the deblocking-filter control region.
 
     ``rbsp`` is the PPS payload without the NAL header, emulation bytes removed.
+
+    The first stage (always succeeds for a valid PPS) records the tile-config
+    spans v0.1 relies on. The second stage advances past the optional tile
+    geometry to the deblocking-filter control fields (H.265 §7.3.2.3). If tiles
+    are enabled — the geometry is variable and not modelled — or the PPS is
+    truncated, the deblocking fields are left ``None`` and only the tile-config
+    view is returned.
     """
     reader = BitReader(rbsp)
     spans: list[FieldSpan] = []
@@ -407,13 +443,99 @@ def parse_pps(rbsp: bytes) -> PicParameterSet:
         FieldSpan("entropy_coding_sync_enabled_flag", esync_off, 1, entropy_sync)
     )
 
-    return PicParameterSet(
+    pps = PicParameterSet(
         pps_pic_parameter_set_id=pps_id,
         pps_seq_parameter_set_id=sps_id,
         tiles_enabled_flag=tiles_enabled,
         entropy_coding_sync_enabled_flag=entropy_sync,
         spans=spans,
     )
+
+    # Second stage: advance to the deblocking-filter control region. Any parse
+    # error here leaves the deblocking fields unset but keeps the tile view.
+    try:
+        if tiles_enabled:
+            # Tile geometry (num_tile_columns_minus1 etc.) is variable-length and
+            # not modelled; bail cleanly, leaving deblocking fields unset.
+            raise ValueError("tiles enabled; deblocking region not modelled")
+
+        lf_off = reader.bit_position
+        lf_across = reader.read_bit()  # pps_loop_filter_across_slices_enabled_flag
+        pps.pps_loop_filter_across_slices_enabled_flag = lf_across
+        pps.spans.append(
+            FieldSpan("pps_loop_filter_across_slices_enabled_flag", lf_off, 1, lf_across)
+        )
+
+        ctl_off = reader.bit_position
+        ctl_present = reader.read_bit()  # deblocking_filter_control_present_flag
+        pps.deblocking_filter_control_present_flag = ctl_present
+        pps.spans.append(
+            FieldSpan("deblocking_filter_control_present_flag", ctl_off, 1, ctl_present)
+        )
+
+        if ctl_present:
+            ovr_off = reader.bit_position
+            override = reader.read_bit()  # deblocking_filter_override_enabled_flag
+            pps.deblocking_filter_override_enabled_flag = override
+            pps.spans.append(
+                FieldSpan("deblocking_filter_override_enabled_flag", ovr_off, 1, override)
+            )
+
+            dis_off = reader.bit_position
+            disabled = reader.read_bit()  # pps_deblocking_filter_disabled_flag
+            pps.pps_deblocking_filter_disabled_flag = disabled
+            pps.spans.append(
+                FieldSpan("pps_deblocking_filter_disabled_flag", dis_off, 1, disabled)
+            )
+
+            if not disabled:
+                beta_off = reader.bit_position
+                beta = reader.read_se()  # pps_beta_offset_div2
+                pps.pps_beta_offset_div2 = beta
+                pps.spans.append(
+                    FieldSpan(
+                        "pps_beta_offset_div2",
+                        beta_off,
+                        reader.bit_position - beta_off,
+                        beta,
+                    )
+                )
+
+                tc_off = reader.bit_position
+                tc = reader.read_se()  # pps_tc_offset_div2
+                pps.pps_tc_offset_div2 = tc
+                pps.spans.append(
+                    FieldSpan(
+                        "pps_tc_offset_div2",
+                        tc_off,
+                        reader.bit_position - tc_off,
+                        tc,
+                    )
+                )
+    except (EOFError, ValueError):
+        # Leave whatever deblocking fields we filled; tile view stands.
+        pass
+
+    return pps
+
+
+def splice_se_field(rbsp: bytes, span: FieldSpan, new_value: int) -> bytes:
+    """Return a new RBSP with the se(v) field at ``span`` replaced by new_value.
+
+    The surrounding bits are preserved exactly; only the field's bit span is
+    re-encoded, so total length may change if the signed Exp-Golomb code length
+    differs.
+    """
+    reader = BitReader(rbsp)
+    writer = BitWriter()
+    for _ in range(span.bit_offset):
+        writer.write_bit(reader.read_bit())
+    reader.read_bits(span.bit_length)  # discard the old field
+    writer.write_se(new_value)
+    total_bits = len(rbsp) * 8
+    while reader.bit_position < total_bits:
+        writer.write_bit(reader.read_bit())
+    return writer.to_bytes()
 
 
 @dataclass

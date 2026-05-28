@@ -126,6 +126,7 @@ mangle mutators
 | `rps-overflow` | SPS short-term RPS | Sets `num_negative_pics` / `num_positive_pics` above `sps_max_dec_pic_buffering_minus1[0]` to overflow decoder DPB index arrays |
 | `rps-lt-poc-ambiguity` | SPS long-term RPS | Crafts two long-term reference entries sharing one `poc_lsb_lt`, triggering the ambiguous-POC-LSB condition |
 | `vps-layer-count` | VPS | Corrupts `vps_max_layers_minus1` / `vps_max_sub_layers_minus1` / `vps_temporal_id_nesting_flag` to overflow per-layer array bounds in hardware and software decoders |
+| `pps-deblocking` | PPS | Corrupts the deblocking / loop-filter control fields — pushes `pps_beta_offset_div2` / `pps_tc_offset_div2` out of the spec range `[-6, 6]`, flips `pps_deblocking_filter_disabled_flag`, or flips `pps_loop_filter_across_slices_enabled_flag` |
 
 All mutators keep the stream a parseable Annex-B bitstream while pushing it out of
 semantic spec-compliance — the input class that exercises decoder edge cases.
@@ -168,6 +169,25 @@ long-term reference resolution:
   Motivation: the **TWINFUZZ** paper (NDSS 2025) showed hardware-acceleration
   stacks are disproportionately vulnerable to spec violations in the
   parameter-set layer. No prior mangle mutator touched the VPS at all.
+
+### PPS deblocking / loop-filter mutator
+
+- **`pps-deblocking`** targets the deblocking-filter control region of the PPS
+  (H.265 §7.3.2.3) — the per-picture loop-filter syntax that feeds the same
+  `set_derived_values()` derive path behind **CVE-2026-33164** (libde265
+  `<1.0.17`). The parser advances past the (optional, untiled) entropy/loop-filter
+  flags to reach the control block; tiled PPSes carry variable-length geometry and
+  are deliberately skipped. One mutation is chosen per invocation from those the
+  seed PPS actually exposes:
+  - **Out-of-range beta/tc offset**: rewrites `pps_beta_offset_div2` or
+    `pps_tc_offset_div2` (se(v), spec range `[-6, 6]`) to a far out-of-range
+    magnitude (±32/±64), pushing filter-strength table lookups past their bounds.
+  - **Disable-flag flip**: toggles `pps_deblocking_filter_disabled_flag`, making
+    the PPS claim the filter is on/off inconsistently with the offsets that follow.
+  - **Loop-filter-scope flip**: toggles
+    `pps_loop_filter_across_slices_enabled_flag`, exercising the slice-boundary
+    filter path. This field is reachable in any untiled PPS, so it is the
+    conservative fallback when the deeper control block is absent.
 
 ---
 

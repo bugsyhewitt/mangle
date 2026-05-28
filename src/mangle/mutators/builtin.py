@@ -31,6 +31,7 @@ from ..hevc import (
     parse_vps,
     splice_fixed_bits,
     splice_replace_region,
+    splice_se_field,
     splice_ue_field,
 )
 from .registry import MutationResult, count_changed_bytes, register
@@ -121,6 +122,91 @@ def pps_tile_config(nals: list[NalUnit], rng: random.Random) -> MutationResult:
         mutator="pps-tile-config",
         bytes_changed=count_changed_bytes(original_stream, mutated_stream),
         detail=f"{target}: {span.value} -> {new_value}",
+    )
+
+
+@register("pps-deblocking")
+def pps_deblocking(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Corrupt the PPS deblocking-filter / loop-filter control fields.
+
+    The PPS deblocking-filter control region (H.265 §7.3.2.3) gates per-picture
+    loop-filter behaviour and carries two signed offsets with a tight spec range.
+    Decoders that trust these fields without re-clamping can index filter
+    strength tables out of bounds or skip a filter pass the slice header still
+    references. CVE-2026-33164 (libde265 <1.0.17) crashed in
+    ``set_derived_values()`` on a malformed PPS — the deblocking control fields
+    sit in that same derive path.
+
+    One of three mutations is chosen per invocation, falling back to an
+    always-available one when the seed PPS does not reach the deeper fields:
+
+      1. **out-of-range beta/tc offset** — rewrite ``pps_beta_offset_div2`` or
+         ``pps_tc_offset_div2`` (se(v), spec range [-6, 6]) to a far out-of-range
+         magnitude (±64), pushing filter-strength table lookups past their bounds.
+      2. **flip pps_deblocking_filter_disabled_flag** — toggle the disable flag,
+         making the PPS claim the filter is on/off inconsistently with the
+         beta/tc offsets that follow (or are now expected to follow).
+      3. **flip pps_loop_filter_across_slices_enabled_flag** — toggle the
+         cross-slice loop-filter scope flag, exercising the slice-boundary filter
+         path. This field is reached whenever the PPS has no tiles, so it is the
+         conservative fallback.
+
+    Only PPS streams without tiles enabled are mutated here — tile geometry is
+    variable-length and out of the structured-mutation scope; if no deblocking
+    span is reachable the mutator raises so the engine can pick another mutator.
+    """
+    out = _clone(nals)
+    idx = _first(out, 34)  # PPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    pps = parse_pps(rbsp)
+
+    if not pps.has_span("pps_loop_filter_across_slices_enabled_flag"):
+        raise ValueError(
+            "PPS did not parse to the deblocking region (tiles enabled or truncated)"
+        )
+
+    # Build the menu of available mutations based on which spans were reached.
+    choices: list[str] = ["loop_filter_across_slices"]
+    if pps.has_span("pps_deblocking_filter_disabled_flag"):
+        choices.append("disabled_flag")
+    if pps.has_span("pps_beta_offset_div2") and pps.has_span("pps_tc_offset_div2"):
+        choices.append("beta_tc_offset")
+
+    choice = rng.choice(choices)
+
+    if choice == "beta_tc_offset":
+        target = rng.choice(["pps_beta_offset_div2", "pps_tc_offset_div2"])
+        span = pps.span(target)
+        # Spec range is [-6, 6]; pick a far out-of-range magnitude.
+        new_value = rng.choice([-64, -32, 32, 64, span.value + 32, span.value - 32])
+        new_rbsp = splice_se_field(rbsp, span, new_value)
+        detail = (
+            f"{target}: {span.value} -> {new_value} "
+            f"(out of spec range [-6, 6])"
+        )
+
+    elif choice == "disabled_flag":
+        span = pps.span("pps_deblocking_filter_disabled_flag")
+        new_value = 1 - span.value
+        new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+        detail = f"pps_deblocking_filter_disabled_flag: {span.value} -> {new_value}"
+
+    else:  # loop_filter_across_slices
+        span = pps.span("pps_loop_filter_across_slices_enabled_flag")
+        new_value = 1 - span.value
+        new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+        detail = (
+            f"pps_loop_filter_across_slices_enabled_flag: {span.value} -> {new_value}"
+        )
+
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="pps-deblocking",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=detail,
     )
 
 
