@@ -483,7 +483,9 @@ are entirely untouched:
 5. QP fields in PPS — ✅ covered (item #9)
 6. EMSP / EBSP byte-level malformation — ✅ covered (item #10)
 7. HRD parameters in VUI
-8. Scaling lists (SPS/PPS)
+8. Scaling lists (SPS/PPS) — ✅ SPS `scaling_list_enabled_flag` (and
+   `pcm_enabled_flag`) inconsistency covered by the `sps-feature-flags` mutator
+   (the variable-length `scaling_list_data()` body is still not synthesised)
 9. Deblocking filter parameters in PPS/slice header — ✅ PPS portion covered (item #11)
 10. HEVC range extensions (RExt) flags
 
