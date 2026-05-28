@@ -166,9 +166,13 @@ mangle mutators
 | `sps-chroma-format` | SPS | Rewrites `chroma_format_idc` to a reserved value (4) or forces 4:4:4 (3) without a reserved `separate_colour_plane_flag` bit, desynchronising the sample format |
 | `sps-bit-depth` | SPS | Pushes `bit_depth_luma_minus8` / `bit_depth_chroma_minus8` above the spec ceiling of 8 (>16-bit samples) to stress sample-buffer sizing |
 | `pps-slice-qp` | PPS | Pushes `init_qp_minus26` out of the spec range `[-26, 25]`, or flips `transform_skip_enabled_flag` without the matching SPS range-extension flags |
+| `nal-emulation-bytes` | NAL EBSP (raw bytes) | Inserts a phantom `0x000003` emulation sequence, drops a real emulation-prevention byte, or floods the payload head with `0x000003` triplets to stress the decoder's EBSP-to-RBSP scanner |
 
-All mutators keep the stream a parseable Annex-B bitstream while pushing it out of
-semantic spec-compliance — the input class that exercises decoder edge cases.
+All structured mutators keep the stream a parseable Annex-B bitstream while pushing
+it out of semantic spec-compliance — the input class that exercises decoder edge
+cases. The one exception is `nal-emulation-bytes`, which deliberately malforms the
+on-wire byte encoding (see below) to target the decoder's emulation-prevention
+scanner directly.
 
 ### Reference Picture Set (RPS) mutators
 
@@ -264,6 +268,35 @@ throughout a decoder:
   - **`transform_skip_enabled_flag` flip**: toggles the u(1) flag. Enabling it
     without the matching SPS range-extension flags (`transform_skip_rotation_enabled_flag`
     etc.) creates an inconsistency that exercises range-extension handling paths.
+
+### Emulation-prevention byte stress mutator
+
+- **`nal-emulation-bytes`** is the one mutator that operates on the raw on-wire
+  *EBSP* bytes of a NAL rather than on a parsed field. HEVC carries NAL payloads
+  as EBSP: to stop a start code (`0x000001`) appearing inside payload data, the
+  encoder inserts an *emulation-prevention byte* (`0x03`) after any `0x0000` that
+  would otherwise be followed by a byte in `{0x00, 0x01, 0x02, 0x03}`. Every
+  conformant decoder must strip those `0x03` bytes back out before parsing, and
+  that scanner is a known extreme-value attack surface — **CVE-2022-32939**
+  (h26forge; iOS kernel; 0-click arbitrary write) was triggered by an HEVC NAL
+  carrying an out-of-spec density of emulation-prevention bytes. One of three
+  corruptions is chosen per invocation (the menu adapts to the picked NAL):
+  - **Insert a phantom emulation sequence**: splices a fresh `0x00 0x00 0x03`
+    triplet at a byte boundary inside the payload. A compliant decoder removes the
+    `0x03` and recovers `0x0000`; a scanner that miscounts the run or fails to
+    re-scan desynchronises every field after the insertion point.
+  - **Drop an existing emulation-prevention byte**: removes the `0x03` from a
+    genuine `0x000003` sequence, leaving the raw `0x0000` + following byte exposed
+    (a `0x000001` left behind reads as a phantom start code). Decoders that do not
+    re-scan after their first pass misread the now-shorter payload.
+  - **Emulation-byte flood**: injects 64–300 consecutive `0x000003` triplets at
+    the payload head, reproducing the high-density CVE-2022-32939 pattern that
+    overran a fixed-size scratch buffer in an EBSP scanner.
+
+  `nal-emulation-bytes` exercises the *decoder's* EBSP scanner, not mangle's: the
+  bitstream assembler concatenates each NAL's bytes verbatim (it does not re-run
+  emulation-prevention insertion), so the malformed encoding reaches the decoder
+  exactly as written. NAL framing — the start codes between units — is preserved.
 
 ---
 

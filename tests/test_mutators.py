@@ -806,3 +806,138 @@ class TestPpsSliceQpMutator:
     def test_result_name(self):
         result = get_mutator("pps-slice-qp")(_seed_nals(), random.Random(0))
         assert result.mutator == "pps-slice-qp"
+
+
+EMULATION_MUTATORS = {"nal-emulation-bytes"}
+
+
+class TestNalEmulationBytesMutator:
+    def test_registered(self):
+        assert EMULATION_MUTATORS.issubset(set(list_mutators()))
+
+    def test_changes_bytes_on_seed(self):
+        original = SEED.read_bytes()
+        result = get_mutator("nal-emulation-bytes")(_seed_nals(), random.Random(0))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated != original
+        assert result.bytes_changed > 0
+        assert result.detail
+
+    def test_result_name(self):
+        result = get_mutator("nal-emulation-bytes")(_seed_nals(), random.Random(0))
+        assert result.mutator == "nal-emulation-bytes"
+
+    def test_reproducible(self):
+        r1 = get_mutator("nal-emulation-bytes")(_seed_nals(), random.Random(42))
+        r2 = get_mutator("nal-emulation-bytes")(_seed_nals(), random.Random(42))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.bytes_changed == r2.bytes_changed
+        assert r1.detail == r2.detail
+
+    def test_framing_intact(self):
+        # The stream must still split into the same number of NAL units: the
+        # mutator works inside one NAL's payload and never touches start codes.
+        for seed in range(20):
+            result = get_mutator("nal-emulation-bytes")(_seed_nals(), random.Random(seed))
+            mutated = assemble_nal_units(result.nals)
+            assert mutated[:4] == START_CODE_LONG or mutated[:3] == START_CODE_SHORT
+            assert len(split_nal_units(mutated)) == len(_seed_nals())
+
+    def test_only_one_nal_changes(self):
+        # Exactly one NAL's bytes differ; all others are byte-identical, and the
+        # 2-byte NAL header of the mutated unit is preserved.
+        for seed in range(20):
+            original = _seed_nals()
+            result = get_mutator("nal-emulation-bytes")(_seed_nals(), random.Random(seed))
+            changed = [
+                i
+                for i, (o, m) in enumerate(zip(original, result.nals))
+                if o.ebsp != m.ebsp
+            ]
+            assert len(changed) == 1, f"seed {seed} changed {len(changed)} NALs"
+            i = changed[0]
+            assert original[i].ebsp[:2] == result.nals[i].ebsp[:2], "header altered"
+
+    def test_insert_branch_adds_emulation_sequence(self):
+        # An "insert" mutation splices a fresh 0x00 0x00 0x03 triplet into one
+        # NAL's payload: the payload grows by exactly 3 bytes and the triplet is
+        # present at the recorded offset.
+        for seed in range(60):
+            original = _seed_nals()
+            result = get_mutator("nal-emulation-bytes")(original, random.Random(seed))
+            if not result.detail.startswith("inserted phantom"):
+                continue
+            changed = next(
+                i for i, (o, m) in enumerate(zip(original, result.nals))
+                if o.ebsp != m.ebsp
+            )
+            orig_payload = original[changed].ebsp[2:]
+            new_payload = result.nals[changed].ebsp[2:]
+            assert len(new_payload) == len(orig_payload) + 3
+            assert b"\x00\x00\x03" in new_payload
+            return
+        raise AssertionError("no seed exercised the insert branch")
+
+    def test_drop_branch_removes_real_emulation_byte(self):
+        # A "drop" mutation removes a genuine emulation-prevention byte: the
+        # mutated NAL is exactly one byte shorter than the original.
+        for seed in range(60):
+            original = _seed_nals()
+            result = get_mutator("nal-emulation-bytes")(original, random.Random(seed))
+            if not result.detail.startswith("dropped emulation"):
+                continue
+            changed = next(
+                i for i, (o, m) in enumerate(zip(original, result.nals))
+                if o.ebsp != m.ebsp
+            )
+            assert len(result.nals[changed].ebsp) == len(original[changed].ebsp) - 1
+            return
+        raise AssertionError("no seed exercised the drop branch")
+
+    def test_flood_branch_injects_high_density_pattern(self):
+        # A "flood" mutation injects >=64 consecutive 0x000003 triplets,
+        # reproducing the CVE-2022-32939 high-density EBSP pattern.
+        for seed in range(60):
+            original = _seed_nals()
+            result = get_mutator("nal-emulation-bytes")(original, random.Random(seed))
+            if "0x000003 emulation triplets" not in result.detail:
+                continue
+            changed = next(
+                i for i, (o, m) in enumerate(zip(original, result.nals))
+                if o.ebsp != m.ebsp
+            )
+            payload = result.nals[changed].ebsp[2:]
+            # The payload head is a long run of 0x00 0x00 0x03 triplets.
+            assert payload[:3] == b"\x00\x00\x03"
+            # Count the leading triplet run.
+            triplets = 0
+            while payload[triplets * 3 : triplets * 3 + 3] == b"\x00\x00\x03":
+                triplets += 1
+            assert triplets >= 64, f"flood produced only {triplets} triplets"
+            return
+        raise AssertionError("no seed exercised the flood branch")
+
+    def test_all_branches_reachable(self):
+        branches = set()
+        for seed in range(80):
+            result = get_mutator("nal-emulation-bytes")(_seed_nals(), random.Random(seed))
+            if result.detail.startswith("inserted phantom"):
+                branches.add("insert")
+            elif result.detail.startswith("dropped emulation"):
+                branches.add("drop")
+            elif "emulation triplets" in result.detail:
+                branches.add("flood")
+        assert branches == {"insert", "drop", "flood"}, f"only hit {branches}"
+
+    def test_no_existing_emulation_byte_skips_drop(self):
+        # A single NAL whose payload contains no emulation-prevention byte must
+        # never produce a "drop" mutation (only insert / flood are valid).
+        clean = NalUnit(
+            start_code_len=4,
+            offset=0,
+            ebsp=bytes([0x40, 0x01]) + bytes(range(4, 40)),  # no 0x000003 anywhere
+        )
+        nals = [clean]
+        for seed in range(40):
+            result = get_mutator("nal-emulation-bytes")(nals, random.Random(seed))
+            assert not result.detail.startswith("dropped emulation")
