@@ -291,7 +291,19 @@ that is the gold standard for dedup.
 
 ---
 
-## 9. Slice QP and transform-skip mutators
+## 9. Slice QP and transform-skip mutators — ✅ IMPLEMENTED (2026-05-28)
+
+**Status:** Shipped. `parse_pps` in `hevc.py` now promotes the previously
+read-and-discarded `init_qp_minus26` (se(v)) and `transform_skip_enabled_flag`
+(u(1)) to tracked spans — both sit before the tile-config flags, so they are
+reachable for any PPS that parses. One mutator, `pps-slice-qp`, was added to
+`builtin.py`; it picks one of two branches per invocation: push `init_qp_minus26`
+to ±52/±64 (out of the spec range [-26, 25]) via the existing `splice_se_field`
+helper, or flip `transform_skip_enabled_flag`. Tests in `tests/test_hevc.py`
+(`TestPpsQpParsing`) cover the new spans, signed/unsigned round-trips, and
+tail-preservation across an se(v) length-shift; tests in `tests/test_mutators.py`
+(`TestPpsSliceQpMutator`) cover both branches, the out-of-range invariant, the
+flag flip, PPS-only containment, reproducibility, and Annex-B framing integrity.
 
 **What:** Parse deeper into the PPS to reach:
 - `init_qp_minus26` (se(v)) — mutate to ±52 (spec range is [-26, 25]); decoders
@@ -390,7 +402,7 @@ already reached the tile-config flags just before it, so the extension was low-c
 | 6 | Differential oracle | Cross-decoder divergence | Silent corruption | ~120 | MEDIUM |
 | 7 | AFL harness | Coverage feedback | Throughput | ~200 | MEDIUM |
 | 8 | Crash triage | Dedup / disclosure | Operational | ~180 | MEDIUM |
-| 9 | slice-qp / transform-skip | QP arithmetic | Integer overflow | ~80 | MEDIUM |
+| 9 | pps-slice-qp | QP arithmetic / transform-skip | Integer overflow | ~80 | ✅ DONE |
 | 10 | nal-emulation-bytes | EBSP scanning | Parse confusion | ~70 | LOWER |
 | 11 | pps-deblocking | PPS deblocking/loop-filter | OOB table lookup | ~110 | ✅ DONE |
 
@@ -431,7 +443,7 @@ are entirely untouched:
 2. RPS block in SPS and slice header
 3. SEI NAL units (any payload type)
 4. Bit depth and chroma format SPS fields — ✅ covered (item #5)
-5. QP fields in PPS
+5. QP fields in PPS — ✅ covered (item #9)
 6. EMSP / EBSP byte-level malformation
 7. HRD parameters in VUI
 8. Scaling lists (SPS/PPS)

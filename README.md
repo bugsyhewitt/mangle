@@ -129,6 +129,7 @@ mangle mutators
 | `pps-deblocking` | PPS | Corrupts the deblocking / loop-filter control fields — pushes `pps_beta_offset_div2` / `pps_tc_offset_div2` out of the spec range `[-6, 6]`, flips `pps_deblocking_filter_disabled_flag`, or flips `pps_loop_filter_across_slices_enabled_flag` |
 | `sps-chroma-format` | SPS | Rewrites `chroma_format_idc` to a reserved value (4) or forces 4:4:4 (3) without a reserved `separate_colour_plane_flag` bit, desynchronising the sample format |
 | `sps-bit-depth` | SPS | Pushes `bit_depth_luma_minus8` / `bit_depth_chroma_minus8` above the spec ceiling of 8 (>16-bit samples) to stress sample-buffer sizing |
+| `pps-slice-qp` | PPS | Pushes `init_qp_minus26` out of the spec range `[-26, 25]`, or flips `transform_skip_enabled_flag` without the matching SPS range-extension flags |
 
 All mutators keep the stream a parseable Annex-B bitstream while pushing it out of
 semantic spec-compliance — the input class that exercises decoder edge cases.
@@ -212,6 +213,21 @@ throughout a decoder:
   by the raw value) over-allocate, mis-shift, or wrap a size computation; many
   hardware HEVC decoders branch 8-bit and 10-bit paths into separate firmware,
   and a bit depth they do not recognise forces a guess or a fault.
+
+### Slice-QP / transform-skip PPS mutator
+
+- **`pps-slice-qp`** targets the picture-level quantization and transform-skip
+  controls in the PPS (H.265 §7.4.3.3), which precede the tile-config flags and so
+  are reachable for any PPS that parses at all. One of two corruptions is chosen
+  per invocation:
+  - **Out-of-range `init_qp_minus26`**: rewrites the se(v) picture-QP baseline to
+    ±52, well outside the spec range `[-26, 25]`. Decoders that pre-allocate a
+    dequant coefficient table sized by `maxQP - minQP + 1` and clamp the baseline
+    incorrectly can compute a zero or negative allocation size, or index a scaling
+    table out of bounds — a productive integer-overflow class.
+  - **`transform_skip_enabled_flag` flip**: toggles the u(1) flag. Enabling it
+    without the matching SPS range-extension flags (`transform_skip_rotation_enabled_flag`
+    etc.) creates an inconsistency that exercises range-extension handling paths.
 
 ---
 

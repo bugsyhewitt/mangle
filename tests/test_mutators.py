@@ -671,3 +671,138 @@ class TestSpsBitDepth:
     def test_result_name(self):
         result = get_mutator("sps-bit-depth")(_seed_nals(), random.Random(0))
         assert result.mutator == "sps-bit-depth"
+
+
+# --- Item 9: slice-QP / transform-skip PPS mutator ------------------------
+
+QP_MUTATORS = {"pps-slice-qp"}
+
+
+def _build_qp_pps_rbsp(*, init_qp: int = 0, transform_skip: int = 0) -> bytes:
+    """A minimal untiled PPS RBSP reaching the QP / transform-skip region."""
+    from mangle.bitstream import BitWriter
+
+    w = BitWriter()
+    w.write_ue(0)  # pps_pic_parameter_set_id
+    w.write_ue(0)  # pps_seq_parameter_set_id
+    w.write_bit(0)  # dependent_slice_segments_enabled_flag
+    w.write_bit(0)  # output_flag_present_flag
+    w.write_bits(0, 3)  # num_extra_slice_header_bits
+    w.write_bit(0)  # sign_data_hiding_enabled_flag
+    w.write_bit(0)  # cabac_init_present_flag
+    w.write_ue(0)  # num_ref_idx_l0_default_active_minus1
+    w.write_ue(0)  # num_ref_idx_l1_default_active_minus1
+    w.write_se(init_qp)  # init_qp_minus26
+    w.write_bit(0)  # constrained_intra_pred_flag
+    w.write_bit(transform_skip)  # transform_skip_enabled_flag
+    w.write_bit(0)  # cu_qp_delta_enabled_flag
+    w.write_se(0)  # pps_cb_qp_offset
+    w.write_se(0)  # pps_cr_qp_offset
+    w.write_bit(0)  # pps_slice_chroma_qp_offsets_present_flag
+    w.write_bit(0)  # weighted_pred_flag
+    w.write_bit(0)  # weighted_bipred_flag
+    w.write_bit(0)  # transquant_bypass_enabled_flag
+    w.write_bit(0)  # tiles_enabled_flag
+    w.write_bit(0)  # entropy_coding_sync_enabled_flag
+    w.write_bit(1)  # pps_loop_filter_across_slices_enabled_flag
+    w.write_bit(0)  # deblocking_filter_control_present_flag
+    w.write_bit(0)  # pps_scaling_list_data_present_flag
+    w.write_bit(0)  # lists_modification_present_flag
+    w.write_ue(0)  # log2_parallel_merge_level_minus2
+    w.write_bit(0)  # slice_segment_header_extension_present_flag
+    w.write_bit(0)  # pps_extension_present_flag
+    w.write_bit(1)  # rbsp_stop_one_bit
+    return w.to_bytes()
+
+
+def _qp_stream(**kwargs) -> list[NalUnit]:
+    """A VPS+SPS+PPS stream whose PPS reaches the QP / transform-skip region."""
+    seed = _seed_nals()
+    sps = next(n for n in seed if n.nal_unit_type == 33)
+    pps_header = bytes([(34 << 1), 0x01])
+    pps_nal = NalUnit(4, 0, pps_header + rbsp_to_ebsp(_build_qp_pps_rbsp(**kwargs)))
+    vps_header = bytes([(32 << 1), 0x01])
+    return [
+        NalUnit(4, 0, vps_header + b"\x80"),
+        NalUnit(4, 0, sps.ebsp),
+        pps_nal,
+    ]
+
+
+def _reparse_pps(result_nals: list[NalUnit]):
+    mutated = assemble_nal_units(result_nals)
+    pps_nal = next(n for n in split_nal_units(mutated) if n.nal_unit_type == 34)
+    return parse_pps(ebsp_to_rbsp(pps_nal.ebsp[2:]))
+
+
+class TestPpsSliceQpMutator:
+    def test_registered(self):
+        assert QP_MUTATORS.issubset(set(list_mutators()))
+
+    def test_changes_bytes_on_seed(self):
+        original = SEED.read_bytes()
+        result = get_mutator("pps-slice-qp")(_seed_nals(), random.Random(0))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated != original
+        assert result.bytes_changed > 0
+        assert result.detail
+
+    def test_reproducible(self):
+        r1 = get_mutator("pps-slice-qp")(_seed_nals(), random.Random(42))
+        r2 = get_mutator("pps-slice-qp")(_seed_nals(), random.Random(42))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.detail == r2.detail
+
+    def test_framing_intact(self):
+        result = get_mutator("pps-slice-qp")(_seed_nals(), random.Random(0))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated[:4] == START_CODE_LONG or mutated[:3] == START_CODE_SHORT
+        assert len(split_nal_units(mutated)) == len(_seed_nals())
+
+    def test_only_pps_nal_changes(self):
+        original = _seed_nals()
+        result = get_mutator("pps-slice-qp")(_seed_nals(), random.Random(0))
+        for orig, mut in zip(original, result.nals):
+            if orig.nal_unit_type == 34:
+                continue
+            assert orig.ebsp == mut.ebsp, "pps-slice-qp modified a non-PPS NAL"
+
+    def test_init_qp_goes_out_of_range(self):
+        # Some seed exercises the init_qp branch and pushes it outside [-26, 25].
+        nals = _qp_stream(init_qp=0, transform_skip=0)
+        for seed in range(40):
+            result = get_mutator("pps-slice-qp")(nals, random.Random(seed))
+            if "init_qp_minus26" in result.detail:
+                pps = _reparse_pps(result.nals)
+                assert pps.init_qp_minus26 is not None
+                assert not (-26 <= pps.init_qp_minus26 <= 25), (
+                    f"init_qp {pps.init_qp_minus26} still within spec range"
+                )
+                return
+        raise AssertionError("no seed exercised the init_qp branch")
+
+    def test_transform_skip_flip(self):
+        # Some seed exercises the transform_skip branch and flips the bit.
+        nals = _qp_stream(init_qp=0, transform_skip=0)
+        for seed in range(40):
+            result = get_mutator("pps-slice-qp")(nals, random.Random(seed))
+            if "transform_skip_enabled_flag" in result.detail:
+                pps = _reparse_pps(result.nals)
+                assert pps.transform_skip_enabled_flag == 1
+                return
+        raise AssertionError("no seed exercised the transform_skip branch")
+
+    def test_both_branches_reachable(self):
+        nals = _qp_stream()
+        branches = set()
+        for seed in range(40):
+            result = get_mutator("pps-slice-qp")(nals, random.Random(seed))
+            if "init_qp_minus26" in result.detail:
+                branches.add("init_qp")
+            if "transform_skip_enabled_flag" in result.detail:
+                branches.add("transform_skip")
+        assert branches == {"init_qp", "transform_skip"}, f"only hit {branches}"
+
+    def test_result_name(self):
+        result = get_mutator("pps-slice-qp")(_seed_nals(), random.Random(0))
+        assert result.mutator == "pps-slice-qp"
