@@ -143,6 +143,43 @@ seed on a single-frame input) is **skipped and recorded in the manifest** rather
 than faked — `manifest.json` lists every emitted seed and every skip with its
 reason code.
 
+### Triage and deduplicate crashes
+
+```bash
+mangle triage \
+  --output-dir /tmp/fuzz-out
+```
+
+At scale a single decoder bug fires from many distinct mutants, so the
+`crashes/` directory holds far more artifacts than unique bugs. `mangle triage`
+is a pure post-processing pass over a fuzz output directory — it reads
+`results.jsonl` and the `crashes/<hash>.txt` stderr files and clusters crashes
+by a stable **signature**:
+
+- **ASAN / UBSAN stack frames** — when the decoder was built with a sanitizer,
+  its stderr embeds a symbolised backtrace. The top frames (`--frame-depth`,
+  default 3) are the gold-standard fingerprint: two inputs whose top frames match
+  are the same bug. Function names only — addresses and line numbers (which shift
+  between builds and inputs) are deliberately excluded.
+- **Normalised-stderr fallback** — for a plain (non-sanitizer) build, the stderr
+  is normalised (lower-cased, with hex addresses, integers, and `.h265`/`.hevc`
+  paths scrubbed) and hashed, so two messages differing only in incidental
+  numbers cluster together.
+
+The cluster key is the triple `(signature, decoder, mutator)`. Each cluster keeps
+its **most minimal** member as the representative (smallest mutant file, ties
+broken deterministically). Outputs:
+
+- `/tmp/fuzz-out/triage.jsonl` — one JSON line per cluster: cluster id, signature
+  kind, signature, decoder, mutator, member count, representative hash, the
+  representative's top stack frames, and all member hashes.
+- `/tmp/fuzz-out/unique-crashes/<hash>.h265` + `<hash>.txt` — the representative
+  PoC of each cluster, copied verbatim and ready for disclosure.
+
+The `--decoder` label is recorded in the cluster key (so a combined triage of two
+campaigns keeps per-decoder buckets distinct). Triage makes **no changes** to the
+fuzzing pipeline and is fully deterministic.
+
 ### List the available mutators
 
 ```bash
