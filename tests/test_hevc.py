@@ -279,6 +279,40 @@ class TestSpsFeatureFlagParsing:
         assert not reparsed.has_span("pcm_enabled_flag")
 
 
+class TestSpsVuiHrdParsing:
+    def test_vui_gate_flags_parsed(self):
+        sps = parse_sps(_nal_rbsp(33))
+        # The bundled seed declares a VUI block with timing info present and the
+        # HRD sub-block absent — exactly the target the sps-vui-hrd mutator needs.
+        assert sps.vui_parameters_present_flag == 1
+        assert sps.vui_timing_info_present_flag == 1
+        assert sps.vui_hrd_parameters_present_flag == 0
+
+    def test_vui_gate_spans_present_and_ordered(self):
+        sps = parse_sps(_nal_rbsp(33))
+        assert sps.has_span("vui_parameters_present_flag")
+        assert sps.has_span("vui_timing_info_present_flag")
+        assert sps.has_span("vui_hrd_parameters_present_flag")
+        vui = sps.span("vui_parameters_present_flag")
+        timing = sps.span("vui_timing_info_present_flag")
+        hrd = sps.span("vui_hrd_parameters_present_flag")
+        for s in (vui, timing, hrd):
+            assert s.bit_length == 1
+        # Nesting order: vui < timing < hrd, and all sit after the RPS region.
+        assert vui.bit_offset < timing.bit_offset < hrd.bit_offset
+        assert vui.bit_offset > sps.span("num_short_term_ref_pic_sets").bit_offset
+
+    def test_splice_hrd_gate_round_trips(self):
+        rbsp = _nal_rbsp(33)
+        sps = parse_sps(rbsp)
+        span = sps.span("vui_hrd_parameters_present_flag")
+        new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1)
+        reparsed = parse_sps(new_rbsp)
+        assert reparsed.vui_hrd_parameters_present_flag == 1
+        # A single u(1) flip never shifts the bitstream length.
+        assert len(new_rbsp) == len(rbsp)
+
+
 class TestPpsParsing:
     def test_tiles_flag_present(self):
         pps = parse_pps(_nal_rbsp(34))

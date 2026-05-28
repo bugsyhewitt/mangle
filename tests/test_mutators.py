@@ -1136,3 +1136,200 @@ def _truncated_pre_flag_stream() -> list[NalUnit]:
         sps_nal,
         NalUnit(4, 0, bytes([(34 << 1), 0x01]) + b"\x80"),
     ]
+
+
+VUI_HRD_MUTATORS = {"sps-vui-hrd"}
+
+
+def _build_vui_sps_rbsp(
+    *,
+    vui_present: int = 1,
+    timing_present: int = 1,
+    hrd_present: int = 0,
+) -> bytes:
+    """A minimal SPS RBSP that parses through the VUI / HRD gate region.
+
+    Builds the same prefix as :func:`_build_feature_flag_sps_rbsp` (both feature
+    flags off, no RPS) and then emits the two post-RPS feature flags followed by a
+    configurable VUI block. The early VUI sub-blocks are all written "absent" so
+    the parser reaches the timing-info and HRD gates deterministically.
+    """
+    from mangle.bitstream import BitWriter
+
+    w = BitWriter()
+    w.write_bits(0, 4)  # sps_video_parameter_set_id
+    w.write_bits(0, 3)  # sps_max_sub_layers_minus1 = 0
+    w.write_bit(0)      # sps_temporal_id_nesting_flag
+    w.write_bits(0, 8)   # profile_tier_level
+    w.write_bits(0, 32)
+    w.write_bits(0, 48)
+    w.write_bits(0, 8)
+    w.write_ue(0)        # sps_seq_parameter_set_id
+    w.write_ue(1)        # chroma_format_idc (4:2:0)
+    w.write_ue(64)       # pic_width_in_luma_samples
+    w.write_ue(64)       # pic_height_in_luma_samples
+    w.write_bit(0)       # conformance_window_flag
+    w.write_ue(0)        # bit_depth_luma_minus8
+    w.write_ue(0)        # bit_depth_chroma_minus8
+    w.write_ue(4)        # log2_max_pic_order_cnt_lsb_minus4
+    w.write_bit(0)       # sps_sub_layer_ordering_info_present_flag
+    w.write_ue(0)        # sps_max_dec_pic_buffering_minus1[0]
+    w.write_ue(0)        # sps_max_num_reorder_pics[0]
+    w.write_ue(0)        # sps_max_latency_increase_plus1[0]
+    w.write_ue(0)        # log2_min_luma_coding_block_size_minus3
+    w.write_ue(0)        # log2_diff_max_min_luma_coding_block_size
+    w.write_ue(0)        # log2_min_luma_transform_block_size_minus2
+    w.write_ue(0)        # log2_diff_max_min_luma_transform_block_size
+    w.write_ue(0)        # max_transform_hierarchy_depth_inter
+    w.write_ue(0)        # max_transform_hierarchy_depth_intra
+    w.write_bit(0)       # scaling_list_enabled_flag
+    w.write_bit(0)       # amp_enabled_flag
+    w.write_bit(0)       # sample_adaptive_offset_enabled_flag
+    w.write_bit(0)       # pcm_enabled_flag
+    w.write_ue(0)        # num_short_term_ref_pic_sets = 0
+    w.write_bit(0)       # long_term_ref_pics_present_flag = 0
+    w.write_bit(0)       # sps_temporal_mvp_enabled_flag
+    w.write_bit(0)       # strong_intra_smoothing_enabled_flag
+    w.write_bit(vui_present)  # vui_parameters_present_flag
+    if vui_present:
+        w.write_bit(0)   # aspect_ratio_info_present_flag
+        w.write_bit(0)   # overscan_info_present_flag
+        w.write_bit(0)   # video_signal_type_present_flag
+        w.write_bit(0)   # chroma_loc_info_present_flag
+        w.write_bit(0)   # neutral_chroma_indication_flag
+        w.write_bit(0)   # field_seq_flag
+        w.write_bit(0)   # frame_field_info_present_flag
+        w.write_bit(0)   # default_display_window_flag
+        w.write_bit(timing_present)  # vui_timing_info_present_flag
+        if timing_present:
+            w.write_bits(1, 32)  # vui_num_units_in_tick
+            w.write_bits(1, 32)  # vui_time_scale
+            w.write_bit(0)       # vui_poc_proportional_to_timing_flag
+            w.write_bit(hrd_present)  # vui_hrd_parameters_present_flag
+            # hrd_parameters() body omitted; parser stops at the gate.
+    w.write_bit(1)       # rbsp_stop_one_bit
+    return w.to_bytes()
+
+
+def _vui_stream(**kwargs) -> list[NalUnit]:
+    sps_rbsp = _build_vui_sps_rbsp(**kwargs)
+    sps_nal = NalUnit(4, 0, bytes([(33 << 1), 0x01]) + rbsp_to_ebsp(sps_rbsp))
+    vps_nal = NalUnit(4, 0, bytes([(32 << 1), 0x01]) + b"\x80")
+    pps_nal = NalUnit(4, 0, bytes([(34 << 1), 0x01]) + b"\x80")
+    return [vps_nal, sps_nal, pps_nal]
+
+
+class TestSpsVuiHrdRegistered:
+    def test_present(self):
+        assert VUI_HRD_MUTATORS.issubset(set(list_mutators()))
+
+    def test_reproducible(self):
+        r1 = get_mutator("sps-vui-hrd")(_seed_nals(), random.Random(7))
+        r2 = get_mutator("sps-vui-hrd")(_seed_nals(), random.Random(7))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.detail == r2.detail
+
+    def test_result_name(self):
+        result = get_mutator("sps-vui-hrd")(_seed_nals(), random.Random(0))
+        assert result.mutator == "sps-vui-hrd"
+
+
+class TestSpsVuiHrdParsing:
+    def test_parser_records_all_three_gate_spans(self):
+        sps = parse_sps(_build_vui_sps_rbsp(hrd_present=0))
+        assert sps.has_span("vui_parameters_present_flag")
+        assert sps.has_span("vui_timing_info_present_flag")
+        assert sps.has_span("vui_hrd_parameters_present_flag")
+        assert sps.vui_parameters_present_flag == 1
+        assert sps.vui_timing_info_present_flag == 1
+        assert sps.vui_hrd_parameters_present_flag == 0
+
+    def test_clean_fixture_reaches_hrd_gate(self):
+        # The bundled seed must parse through to the HRD gate (off), which is what
+        # makes it a valid target for this mutator.
+        sps_nal = next(n for n in _seed_nals() if n.nal_unit_type == 33)
+        sps = parse_sps(ebsp_to_rbsp(sps_nal.ebsp[2:]))
+        assert sps.vui_parameters_present_flag == 1
+        assert sps.vui_hrd_parameters_present_flag == 0
+
+    def test_no_vui_records_only_outer_gate(self):
+        # When VUI is absent the parser records only the outer gate (value 0) and
+        # leaves the inner gates unset.
+        sps = parse_sps(_build_vui_sps_rbsp(vui_present=0))
+        assert sps.has_span("vui_parameters_present_flag")
+        assert sps.vui_parameters_present_flag == 0
+        assert not sps.has_span("vui_timing_info_present_flag")
+        assert not sps.has_span("vui_hrd_parameters_present_flag")
+        assert sps.vui_timing_info_present_flag is None
+
+    def test_no_timing_records_only_two_gates(self):
+        sps = parse_sps(_build_vui_sps_rbsp(timing_present=0))
+        assert sps.vui_parameters_present_flag == 1
+        assert sps.vui_timing_info_present_flag == 0
+        assert not sps.has_span("vui_hrd_parameters_present_flag")
+
+
+class TestSpsVuiHrdMutator:
+    def test_changes_only_sps(self):
+        original = _seed_nals()
+        result = get_mutator("sps-vui-hrd")(_seed_nals(), random.Random(0))
+        for orig, mut in zip(original, result.nals):
+            if orig.nal_unit_type == 33:
+                continue
+            assert orig.ebsp == mut.ebsp, "non-SPS NAL modified"
+
+    def test_gate_is_flipped_on(self):
+        for s in range(24):
+            result = get_mutator("sps-vui-hrd")(_seed_nals(), random.Random(s))
+            sps = _reparse_sps(result.nals)
+            target = result.detail.split(":")[0]
+            assert sps.span(target).value == 1, (target, s)
+
+    def test_single_bit_change_preserves_length(self):
+        original = assemble_nal_units(_seed_nals())
+        result = get_mutator("sps-vui-hrd")(_seed_nals(), random.Random(3))
+        mutated = assemble_nal_units(result.nals)
+        assert len(mutated) == len(original)
+        assert result.bytes_changed >= 1
+
+    def test_framing_integrity(self):
+        result = get_mutator("sps-vui-hrd")(_seed_nals(), random.Random(1))
+        mutated = assemble_nal_units(result.nals)
+        assert len(split_nal_units(mutated)) == len(_seed_nals())
+
+    def test_prefers_hrd_gate_when_off(self):
+        # The clean fixture has the HRD gate off and both outer gates on, so the
+        # HRD gate is the only off candidate and must always be chosen.
+        for s in range(24):
+            result = get_mutator("sps-vui-hrd")(_seed_nals(), random.Random(s))
+            assert "vui_hrd_parameters_present_flag" in result.detail
+
+    def test_all_three_gates_reachable_across_seeds(self):
+        # A synthetic SPS with every gate off (no VUI) exposes the outer gate; a
+        # stream with VUI+timing on but HRD off exposes the HRD gate; a stream with
+        # VUI on but timing off exposes the timing gate. Each yields its lone
+        # off-candidate, exercising all three branches.
+        no_vui = _vui_stream(vui_present=0)
+        for s in range(8):
+            r = get_mutator("sps-vui-hrd")(no_vui, random.Random(s))
+            assert "vui_parameters_present_flag" in r.detail
+
+        no_timing = _vui_stream(timing_present=0)
+        for s in range(8):
+            r = get_mutator("sps-vui-hrd")(no_timing, random.Random(s))
+            assert "vui_timing_info_present_flag" in r.detail
+
+        hrd_off = _vui_stream(hrd_present=0)
+        for s in range(8):
+            r = get_mutator("sps-vui-hrd")(hrd_off, random.Random(s))
+            assert "vui_hrd_parameters_present_flag" in r.detail
+
+    def test_raises_when_no_off_gate_available(self):
+        # All reachable gates on → no inconsistency to create → mutator bails.
+        all_on = _vui_stream(vui_present=1, timing_present=1, hrd_present=1)
+        try:
+            get_mutator("sps-vui-hrd")(all_on, random.Random(0))
+        except ValueError as exc:
+            assert "vui" in str(exc).lower() or "hrd" in str(exc).lower()
+        else:
+            raise AssertionError("expected ValueError when no off-gate reachable")

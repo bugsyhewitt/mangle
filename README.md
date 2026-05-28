@@ -205,6 +205,7 @@ mangle mutators
 | `pps-slice-qp` | PPS | Pushes `init_qp_minus26` out of the spec range `[-26, 25]`, or flips `transform_skip_enabled_flag` without the matching SPS range-extension flags |
 | `nal-emulation-bytes` | NAL EBSP (raw bytes) | Inserts a phantom `0x000003` emulation sequence, drops a real emulation-prevention byte, or floods the payload head with `0x000003` triplets to stress the decoder's EBSP-to-RBSP scanner |
 | `sps-feature-flags` | SPS | Flips `scaling_list_enabled_flag` or `pcm_enabled_flag` on without supplying the variable-length data block it gates, desynchronising the rest of the SPS |
+| `sps-vui-hrd` | SPS VUI | Flips a VUI / HRD gate flag (`vui_hrd_parameters_present_flag`, `vui_timing_info_present_flag`, or `vui_parameters_present_flag`) on without supplying the sub-block it gates, forcing the decoder to read CPB/HRD fields out of unrelated downstream bits |
 
 All structured mutators keep the stream a parseable Annex-B bitstream while pushing
 it out of semantic spec-compliance — the input class that exercises decoder edge
@@ -329,6 +330,33 @@ throughout a decoder:
   as malformed framing. Only flags the seed currently has *off* are offered; if
   neither reachable flag is off (or the SPS truncates before the flag region) the
   mutator raises so the engine picks another.
+
+### SPS VUI / HRD gate mutator
+
+- **`sps-vui-hrd`** targets the Video Usability Information block at the tail of the
+  SPS (H.265 §E.2.1) — gap-analysis item #7 ("HRD parameters in VUI"), a previously
+  untouched SPS attack surface. The VUI block is reached by parsing past the
+  reference-picture-set region and the two trailing feature flags
+  (`sps_temporal_mvp_enabled_flag`, `strong_intra_smoothing_enabled_flag`). Inside
+  it, three nested single-bit gates each guard a variable-length sub-block; the
+  mutator flips one (currently *off*) gate *on* without supplying the sub-block it
+  gates, the cleaner "claims data that isn't there" direction:
+  - **`vui_hrd_parameters_present_flag`** (preferred when reachable): forcing it on
+    makes the decoder expect an `hrd_parameters()` structure that the bitstream never
+    reserved, reading CPB/HRD register fields (`cpb_cnt_minus1`,
+    `initial_cpb_removal_delay`) out of unrelated downstream bits. HRD arithmetic is
+    the field class behind CVE-2022-22675.
+  - **`vui_timing_info_present_flag`**: gates 64 bits of timing info
+    (`num_units_in_tick`, `time_scale`) plus the HRD gate; flipping it on consumes
+    those from the wrong bits.
+  - **`vui_parameters_present_flag`**: the outermost gate; flipping it on forces the
+    whole `vui_parameters()` walk over absent data.
+
+  Every target is a single u(1) bit, so the splice never shifts the bitstream length
+  — only one gate bit changes and the downstream desync is purely semantic. Only
+  gates the seed currently has *off* are offered; if every reachable gate is already
+  on (or the SPS truncates before the VUI) the mutator raises so the engine picks
+  another.
 
 ### Emulation-prevention byte stress mutator
 

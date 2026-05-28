@@ -936,6 +936,79 @@ def sps_feature_flags(nals: list[NalUnit], rng: random.Random) -> MutationResult
     )
 
 
+@register("sps-vui-hrd")
+def sps_vui_hrd(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Flip an SPS VUI / HRD gate flag to desynchronise the VUI block.
+
+    The SPS optionally carries a ``vui_parameters()`` block (H.265 §E.2.1) whose
+    timing and HRD sub-blocks are each gated by a single u(1) flag. This mutator
+    addresses gap-analysis item #7 ("HRD parameters in VUI") — a previously
+    untouched SPS attack surface — by flipping one of three nested gate flags:
+
+      * ``vui_hrd_parameters_present_flag`` — when flipped 0 -> 1, the decoder
+        expects an ``hrd_parameters()`` structure the bitstream never reserved,
+        reading CPB/HRD register fields out of unrelated downstream bits. HRD
+        arithmetic (``cpb_cnt_minus1``, ``initial_cpb_removal_delay``) is the field
+        class behind CVE-2022-22675, so forcing the decoder onto this path with no
+        real data exercises exactly those length/bounds checks.
+      * ``vui_timing_info_present_flag`` — gates 64 bits of timing info plus the
+        HRD gate; flipping it on makes the decoder consume ``num_units_in_tick`` /
+        ``time_scale`` from the wrong bits.
+      * ``vui_parameters_present_flag`` — the outermost gate; flipping it on
+        forces the whole ``vui_parameters()`` walk over absent data.
+
+    Only gates the seed currently has *off* are offered: flipping a gate on is the
+    "claims data that isn't there" direction that desynchronises the tail, which is
+    the input class that exercises the VUI/HRD parser without being rejected as
+    broken framing. If the SPS did not parse to any off gate (e.g. all reachable
+    gates are already on, or the SPS is too truncated to reach the VUI), the
+    mutator raises so the engine picks another.
+
+    [Worker decision: gate-flip splice keeps the SPS byte-stable]
+    Every target is a single u(1) bit, so the splice never shifts the stream's
+    bit-length — only the one gate bit changes and the downstream desync is purely
+    semantic.
+    """
+    out = _clone(nals)
+    idx = _first(out, 33)  # SPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    sps = parse_sps(rbsp)
+
+    # Innermost-first so the most-targeted HRD gate is preferred when reachable.
+    gate_names = (
+        "vui_hrd_parameters_present_flag",
+        "vui_timing_info_present_flag",
+        "vui_parameters_present_flag",
+    )
+    candidates = [
+        name
+        for name in gate_names
+        if sps.has_span(name) and sps.span(name).value == 0
+    ]
+    if not candidates:
+        raise ValueError(
+            "SPS did not parse to a VUI/HRD gate flag that is currently off; "
+            "cannot mutate VUI/HRD gates"
+        )
+
+    target = rng.choice(candidates)
+    span = sps.span(target)
+    new_value = 1  # turn the gate on; the sub-block it expects is absent
+    new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="sps-vui-hrd",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=(
+            f"{target}: 0 -> 1 (VUI gate enabled without its dependent sub-block; "
+            f"downstream VUI/HRD desync)"
+        ),
+    )
+
+
 def _find_emulation_byte_offsets(ebsp: bytes) -> list[int]:
     """Return offsets of emulation-prevention bytes (the 0x03) within an EBSP.
 

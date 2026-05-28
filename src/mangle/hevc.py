@@ -122,6 +122,17 @@ class SeqParameterSet:
     long_term_ref_pics_present_flag: int | None = None
     short_term_rps: list[ShortTermRps] = field(default_factory=list)
     long_term_ref_pics: list[LongTermRefPic] = field(default_factory=list)
+    # VUI / HRD gate flags (H.265 §7.3.2.2.1, §E.2.1). Each is a single u(1) bit
+    # gating a variable-length sub-block; None means the parser did not reach it.
+    #   * vui_parameters_present_flag — gates the whole vui_parameters() block.
+    #   * vui_timing_info_present_flag — gates the timing-info + HRD sub-block.
+    #   * vui_hrd_parameters_present_flag — gates the hrd_parameters() block.
+    # Recording their spans lets a mutator flip a gate on without supplying the
+    # dependent data, desynchronising the rest of the SPS and exercising the
+    # decoder's VUI/HRD parsing paths.
+    vui_parameters_present_flag: int | None = None
+    vui_timing_info_present_flag: int | None = None
+    vui_hrd_parameters_present_flag: int | None = None
 
     def span(self, name: str) -> FieldSpan:
         for s in self.spans:
@@ -156,6 +167,86 @@ def _parse_short_term_rps(reader: BitReader, st_rps_idx: int) -> ShortTermRps:
         rps.delta_poc_s1_minus1.append(reader.read_ue())
         rps.used_by_curr_pic_s1_flag.append(reader.read_bit())
     return rps
+
+
+def _parse_vui_region(
+    reader: BitReader, sps: SeqParameterSet, max_sub_layers_minus1: int
+) -> None:
+    """Advance through the VUI block (H.265 §E.2.1), recording HRD gate spans.
+
+    Called from ``parse_sps`` once the reader is positioned at
+    ``vui_parameters_present_flag`` (i.e. just after
+    ``strong_intra_smoothing_enabled_flag``). Records:
+
+      * ``vui_parameters_present_flag`` — always (it is a single bit).
+      * ``vui_timing_info_present_flag`` — when VUI is present and the reader
+        reaches it (this requires walking the early VUI sub-blocks).
+      * ``vui_hrd_parameters_present_flag`` — when timing info is present and the
+        reader reaches the HRD gate.
+
+    This is a *gate-only* walk: it does not model the variable-length
+    ``hrd_parameters()`` body that follows ``vui_hrd_parameters_present_flag``,
+    so it stops after recording that flag. Any unmodelled syntax simply raises
+    and the caller leaves whatever spans were recorded intact.
+    """
+    vui_off = reader.bit_position
+    vui_present = reader.read_bit()  # vui_parameters_present_flag
+    sps.vui_parameters_present_flag = vui_present
+    sps.spans.append(
+        FieldSpan("vui_parameters_present_flag", vui_off, 1, vui_present)
+    )
+    if not vui_present:
+        return
+
+    # vui_parameters() (H.265 §E.2.1), walked to the timing-info gate.
+    if reader.read_bit():  # aspect_ratio_info_present_flag
+        aspect_ratio_idc = reader.read_bits(8)
+        if aspect_ratio_idc == 255:  # EXTENDED_SAR
+            reader.read_bits(16)  # sar_width
+            reader.read_bits(16)  # sar_height
+    if reader.read_bit():  # overscan_info_present_flag
+        reader.read_bit()  # overscan_appropriate_flag
+    if reader.read_bit():  # video_signal_type_present_flag
+        reader.read_bits(3)  # video_format
+        reader.read_bit()  # video_full_range_flag
+        if reader.read_bit():  # colour_description_present_flag
+            reader.read_bits(8)  # colour_primaries
+            reader.read_bits(8)  # transfer_characteristics
+            reader.read_bits(8)  # matrix_coeffs
+    if reader.read_bit():  # chroma_loc_info_present_flag
+        reader.read_ue()  # chroma_sample_loc_type_top_field
+        reader.read_ue()  # chroma_sample_loc_type_bottom_field
+    reader.read_bit()  # neutral_chroma_indication_flag
+    reader.read_bit()  # field_seq_flag
+    reader.read_bit()  # frame_field_info_present_flag
+    if reader.read_bit():  # default_display_window_flag
+        reader.read_ue()  # def_disp_win_left_offset
+        reader.read_ue()  # def_disp_win_right_offset
+        reader.read_ue()  # def_disp_win_top_offset
+        reader.read_ue()  # def_disp_win_bottom_offset
+
+    timing_off = reader.bit_position
+    timing_present = reader.read_bit()  # vui_timing_info_present_flag
+    sps.vui_timing_info_present_flag = timing_present
+    sps.spans.append(
+        FieldSpan("vui_timing_info_present_flag", timing_off, 1, timing_present)
+    )
+    if not timing_present:
+        return
+
+    reader.read_bits(32)  # vui_num_units_in_tick
+    reader.read_bits(32)  # vui_time_scale
+    if reader.read_bit():  # vui_poc_proportional_to_timing_flag
+        reader.read_ue()  # vui_num_ticks_poc_diff_one_minus1
+
+    hrd_off = reader.bit_position
+    hrd_present = reader.read_bit()  # vui_hrd_parameters_present_flag
+    sps.vui_hrd_parameters_present_flag = hrd_present
+    sps.spans.append(
+        FieldSpan("vui_hrd_parameters_present_flag", hrd_off, 1, hrd_present)
+    )
+    # The hrd_parameters() body that follows is variable-length and not modelled;
+    # stop here. The gate span is recorded so a mutator can flip it.
 
 
 @dataclass
@@ -395,6 +486,12 @@ def parse_sps(rbsp: bytes) -> SeqParameterSet:
                 poc_lsb = reader.read_bits(poc_bits)  # lt_ref_pic_poc_lsb_sps
                 used = reader.read_bit()  # used_by_curr_pic_lt_sps_flag
                 sps.long_term_ref_pics.append(LongTermRefPic(poc_lsb, used))
+
+        # Two trailing single-bit feature flags precede the VUI block.
+        reader.read_bit()  # sps_temporal_mvp_enabled_flag
+        reader.read_bit()  # strong_intra_smoothing_enabled_flag
+
+        _parse_vui_region(reader, sps, max_sub_layers_minus1)
     except (EOFError, ValueError):
         # Leave whatever RPS fields we managed to fill; dimension view stands.
         pass

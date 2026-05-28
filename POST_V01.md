@@ -482,7 +482,14 @@ are entirely untouched:
 4. Bit depth and chroma format SPS fields — ✅ covered (item #5)
 5. QP fields in PPS — ✅ covered (item #9)
 6. EMSP / EBSP byte-level malformation — ✅ covered (item #10)
-7. HRD parameters in VUI
+7. HRD parameters in VUI — ✅ covered. `parse_sps` now walks past the RPS region
+   and the two trailing feature flags into the SPS `vui_parameters()` block
+   (H.265 §E.2.1), recording the three nested gate flags
+   `vui_parameters_present_flag`, `vui_timing_info_present_flag`, and
+   `vui_hrd_parameters_present_flag`. The `sps-vui-hrd` mutator flips one off-gate
+   on without supplying the sub-block it gates (preferring the HRD gate), forcing
+   the decoder to read CPB/HRD fields out of unrelated downstream bits. The
+   variable-length `hrd_parameters()` body itself is still not synthesised.
 8. Scaling lists (SPS/PPS) — ✅ SPS `scaling_list_enabled_flag` (and
    `pcm_enabled_flag`) inconsistency covered by the `sps-feature-flags` mutator
    (the variable-length `scaling_list_data()` body is still not synthesised)
