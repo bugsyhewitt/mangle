@@ -3,6 +3,7 @@
 Subcommands:
   mutate  - apply one structured mutation to a seed and write the mutant
   fuzz    - run many mutations against a decoder and record outcomes
+  corpus  - generate a diverse minimal seed corpus from one seed file
   mutators - list available mutator types
 """
 
@@ -13,6 +14,7 @@ import sys
 from collections import Counter
 
 from . import __version__
+from .corpus import build_corpus
 from .engine import fuzz_file, mutate_file
 from .mutators import list_mutators
 
@@ -91,6 +93,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_fuzz.set_defaults(func=_cmd_fuzz)
 
+    # corpus
+    p_corpus = sub.add_parser(
+        "corpus",
+        help="generate a diverse minimal seed corpus from one seed file",
+        description=(
+            "Derive a diverse, compact seed corpus from one seed H.265 file. "
+            "Emits seeds covering distinct SPS dimension classes, chroma formats, "
+            "incomplete parameter sets (VPS/SPS/PPS-only), and a non-IRAP-first "
+            "NAL ordering, plus a manifest.json describing every emitted and "
+            "skipped seed. Fully deterministic — no RNG."
+        ),
+    )
+    p_corpus.add_argument("--seed", required=True, help="path to the seed H.265 file")
+    p_corpus.add_argument(
+        "--output-dir",
+        required=True,
+        help="directory for the generated seed files and manifest.json",
+    )
+    p_corpus.set_defaults(func=_cmd_corpus)
+
     # mutators
     p_list = sub.add_parser("mutators", help="list available mutator types")
     p_list.set_defaults(func=_cmd_list_mutators)
@@ -127,6 +149,22 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
     print(f"results written to {args.output_dir}/results.jsonl")
     if crashes:
         print(f"{len(crashes)} crash artifact(s) in {args.output_dir}/crashes/")
+    return 0
+
+
+def _cmd_corpus(args: argparse.Namespace) -> int:
+    entries = build_corpus(args.seed, args.output_dir)
+    emitted = [e for e in entries if e.skipped is None]
+    skipped = [e for e in entries if e.skipped is not None]
+    by_strategy: Counter[str] = Counter(e.strategy for e in emitted)
+    print(f"generated {len(emitted)} seed(s) in {args.output_dir}")
+    for strategy in sorted(by_strategy):
+        print(f"  {strategy}: {by_strategy[strategy]}")
+    if skipped:
+        print(f"skipped {len(skipped)} seed class(es):")
+        for e in skipped:
+            print(f"  {e.descriptor} ({e.strategy}): {e.skipped} — {e.detail}")
+    print(f"manifest written to {args.output_dir}/manifest.json")
     return 0
 
 

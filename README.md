@@ -107,6 +107,42 @@ This runs 100 mutate+decode cycles in parallel and writes:
 - `/tmp/fuzz-out/crashes/<hash>.h265` — the mutant for any crash (segfault or
   non-zero decoder exit), alongside `<hash>.txt` containing the decoder's stderr.
 
+### Build a seed corpus
+
+```bash
+mangle corpus \
+  --seed tests/fixtures/clean.h265 \
+  --output-dir /tmp/corpus
+```
+
+Coverage-guided and manual fuzzing campaigns benefit from a diverse, compact
+seed set rather than a single starting point. `mangle corpus` derives a spread
+of distinct, still-well-framed seeds from one input file and writes them as
+`<index>-<descriptor>.h265` plus a `manifest.json`. The generated classes are:
+
+- **Dimension boundaries** — the full grid of widths × heights from
+  `{1, 2, 16, 64, 256, 4096, 65535}`, each spliced into the seed's SPS
+  (`pic_width/height_in_luma_samples`), covering tiny, typical, large, and
+  overflow-prone buffer-sizing paths.
+- **Chroma formats** — `chroma_format_idc` rewritten to each of
+  `{0=monochrome, 1=4:2:0, 2=4:2:2}` the seed does not already use, without
+  realigning the following bits (the inconsistent-format case is the
+  `sps-chroma-format` *mutator's* job, not the corpus builder's).
+- **Incomplete parameter sets** — VPS-only, SPS-only, and PPS-only single-NAL
+  streams, exercising the "missing parameter set" code paths.
+- **NAL ordering** — a non-IRAP slice moved ahead of the first IRAP, exercising
+  the "no prior IRAP / missing reference" paths (emitted only when the seed
+  actually contains a reorderable IRAP + non-IRAP VCL pair).
+
+The builder never hand-rolls a parameter set: it reuses the same bitstream
+assembly and SPS splice machinery the mutators use, so every emitted seed shares
+the input's valid framing and only the targeted field differs. Output is fully
+deterministic (no RNG). Any seed class that cannot be produced from a given input
+(e.g. a chroma rewrite on an SPS that does not parse that far, or the ordering
+seed on a single-frame input) is **skipped and recorded in the manifest** rather
+than faked — `manifest.json` lists every emitted seed and every skip with its
+reason code.
+
 ### List the available mutators
 
 ```bash
