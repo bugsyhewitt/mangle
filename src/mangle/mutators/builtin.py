@@ -685,6 +685,117 @@ def sei_buffering_overflow(nals: list[NalUnit], rng: random.Random) -> MutationR
     )
 
 
+@register("sps-chroma-format")
+def sps_chroma_format(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Mutate ``chroma_format_idc`` to an inconsistent or reserved value.
+
+    ``chroma_format_idc`` (ue(v), H.265 §7.3.2.2.1) selects the sample format:
+    0 = monochrome, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4. The value also gates the
+    presence of ``separate_colour_plane_flag`` (present only when idc == 3) and
+    drives chroma sample-buffer sizing throughout the decoder. Two corruptions
+    are chosen per invocation:
+
+      1. **reserved value** — set ``chroma_format_idc`` to 4, which is reserved
+         (the valid range is [0, 3]). Decoders that index a chroma-subsampling
+         lookup table by the raw value walk one entry past the table.
+      2. **4:4:4 / separate-plane inconsistency** — set ``chroma_format_idc`` to 3
+         (4:4:4). When the seed's idc was *not* 3, the decoder will now expect a
+         ``separate_colour_plane_flag`` bit that the bitstream never reserved,
+         desynchronising every field that follows — the inconsistency class behind
+         width/height/format mismatch CVEs (e.g. CVE-2022-3266).
+
+    The chroma field is always reachable (it sits before the dimensions), so this
+    mutator never has to fall back. CVE-2022-3266 (Firefox) was triggered by a
+    width/height mismatch between container and SPS; chroma-format inconsistency
+    is the analogous sample-format path, and many hardware HEVC decoders branch
+    4:2:0 / 4:2:2 / 4:4:4 into separate firmware paths.
+    """
+    out = _clone(nals)
+    idx = _first(out, 33)  # SPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    sps = parse_sps(rbsp)
+
+    span = sps.span("chroma_format_idc")
+
+    # Offer the "reserved 4" mutation always; offer the "force 4:4:4" mutation
+    # only when it actually creates an inconsistency (seed idc != 3).
+    choices = ["reserved"]
+    if span.value != 3:
+        choices.append("force_444")
+    choice = rng.choice(choices)
+
+    if choice == "force_444":
+        new_value = 3
+        detail = (
+            f"chroma_format_idc: {span.value} -> 3 (4:4:4 without a reserved "
+            f"separate_colour_plane_flag bit; downstream desync)"
+        )
+    else:
+        new_value = 4
+        detail = f"chroma_format_idc: {span.value} -> 4 (reserved; valid range [0, 3])"
+
+    new_rbsp = splice_ue_field(rbsp, span, new_value)
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="sps-chroma-format",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=detail,
+    )
+
+
+@register("sps-bit-depth")
+def sps_bit_depth(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Push the SPS luma/chroma bit-depth fields past their spec range.
+
+    ``bit_depth_luma_minus8`` and ``bit_depth_chroma_minus8`` (ue(v),
+    H.265 §7.3.2.2.1) carry the coded sample bit depth minus 8. The HEVC spec
+    constrains both to [0, 8] (i.e. 8- to 16-bit samples). A decoder that
+    allocates sample buffers as ``(bit_depth + 1)`` bytes (or shifts by the raw
+    value) from an out-of-range field will over-allocate, mis-shift, or wrap a
+    size computation. Many hardware HEVC decoders implement 8-bit and 10-bit
+    paths in separate firmware branches; a bit depth they do not recognise forces
+    the hardware to guess or fault.
+
+    One of the two fields is picked and rewritten to a value well above 8 (the
+    spec ceiling), exercising the sample-buffer-sizing path. This mutator requires
+    the SPS to have parsed through the bit-depth region; if it did not (truncated
+    or scaling-list SPS reached before bit depth), it raises so the engine can
+    pick another mutator.
+    """
+    out = _clone(nals)
+    idx = _first(out, 33)  # SPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    sps = parse_sps(rbsp)
+
+    if not sps.has_span("bit_depth_luma_minus8") or not sps.has_span(
+        "bit_depth_chroma_minus8"
+    ):
+        raise ValueError(
+            "SPS did not parse to the bit-depth region; cannot mutate bit depth"
+        )
+
+    target = rng.choice(["bit_depth_luma_minus8", "bit_depth_chroma_minus8"])
+    span = sps.span(target)
+    # Spec range is [0, 8]; pick a value well past the ceiling.
+    new_value = rng.choice([9, 16, 24, 56, 248])
+    new_rbsp = splice_ue_field(rbsp, span, new_value)
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="sps-bit-depth",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=(
+            f"{target}: {span.value} -> {new_value} "
+            f"(>8; spec range [0, 8], i.e. >16-bit samples)"
+        ),
+    )
+
+
 def load_stream(data: bytes) -> list[NalUnit]:
     """Convenience: split a raw Annex-B stream into NAL units."""
     return split_nal_units(data)

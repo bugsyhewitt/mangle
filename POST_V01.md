@@ -167,7 +167,20 @@ single point in the space.
 
 ---
 
-## 5. Chroma format and bit-depth SPS mutators
+## 5. Chroma format and bit-depth SPS mutators — ✅ IMPLEMENTED (2026-05-28)
+
+**Status:** Shipped. `parse_sps` in `hevc.py` now records `separate_colour_plane_flag`
+and adds tracked spans for `bit_depth_luma_minus8` and `bit_depth_chroma_minus8`
+(the two ue(v) fields that immediately follow the conformance window). Two
+mutators were added to `builtin.py`: `sps-chroma-format` (rewrites
+`chroma_format_idc` to the reserved value 4, or forces 4:4:4 = 3 without a
+reserved `separate_colour_plane_flag` bit when the seed is not already 4:4:4) and
+`sps-bit-depth` (pushes either bit-depth field past the spec ceiling of 8). Tests
+in `tests/test_hevc.py` (`TestSpsChromaBitDepthParsing`) cover the new spans and a
+bit-depth splice round-trip; tests in `tests/test_mutators.py`
+(`TestSpsChromaFormat`, `TestSpsBitDepth`) cover both chroma branches, the
+out-of-range bit-depth invariant, SPS-only containment, reproducibility, and the
+clean bail when an SPS does not parse to the bit-depth region.
 
 **What:** Extend the SPS mutator family with two new targeted mutators:
 
@@ -373,7 +386,7 @@ already reached the tile-config flags just before it, so the extension was low-c
 | 2 | vps-layer-count | VPS layer/sublayer arrays | Array index OOB | ~90 | HIGH |
 | 3 | sei-hrd-timing | SEI HRD / timing payloads | Integer overflow | ~160 | HIGH |
 | 4 | corpus builder | Seed diversity | Coverage breadth | ~140 | HIGH |
-| 5 | sps-chroma-format / sps-bit-depth | Sample buffer sizing | Buffer underflow | ~100 | MEDIUM |
+| 5 | sps-chroma-format / sps-bit-depth | Sample buffer sizing | Buffer underflow | ~100 | ✅ DONE |
 | 6 | Differential oracle | Cross-decoder divergence | Silent corruption | ~120 | MEDIUM |
 | 7 | AFL harness | Coverage feedback | Throughput | ~200 | MEDIUM |
 | 8 | Crash triage | Dedup / disclosure | Operational | ~180 | MEDIUM |
@@ -417,7 +430,7 @@ are entirely untouched:
 1. VPS (all fields)
 2. RPS block in SPS and slice header
 3. SEI NAL units (any payload type)
-4. Bit depth and chroma format SPS fields
+4. Bit depth and chroma format SPS fields — ✅ covered (item #5)
 5. QP fields in PPS
 6. EMSP / EBSP byte-level malformation
 7. HRD parameters in VUI
