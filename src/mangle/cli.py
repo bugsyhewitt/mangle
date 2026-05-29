@@ -11,6 +11,7 @@ Subcommands:
   replay  - re-derive any fuzz iteration's mutant from the campaign metadata
   coverage - report which mutators a campaign exercised (structural coverage)
   heatmap - report fuzzing pressure and reward by bitstream region
+  afl-mutate - stdin/stdout mutator wrapper for AFL++ harness integration
   mutators - list available mutator types
 """
 
@@ -21,6 +22,7 @@ import sys
 from collections import Counter
 
 from . import __version__
+from .afl import mutate_stdin_to_stdout
 from .corpus import build_corpus
 from .corpus_trim import trim_corpus_dir
 from .coverage import write_coverage
@@ -474,6 +476,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_heatmap.set_defaults(func=_cmd_heatmap)
 
+    # afl-mutate
+    p_afl = sub.add_parser(
+        "afl-mutate",
+        help="apply one mutation to a seed file, write the mutant to stdout",
+        description=(
+            "stdin/stdout adapter for AFL++ harness integration (POST_V01 item "
+            "#7). Reads the seed bytes from --seed (the AFL '@@' convention — "
+            "AFL replaces @@ with the candidate path before invoking) and "
+            "writes the mutated bytes to stdout, with no other output on "
+            "stdout. The byte count is reported on stderr. Designed to be "
+            "called from a contrib/afl-harness/ persistent-mode driver, an "
+            "afl-fuzz custom-mutator wrapper, or any out-of-process tool that "
+            "wants mangle's grammar-aware mutators with byte-in/byte-out "
+            "plumbing. Deterministic for (seed, mutator, --seed-rng)."
+        ),
+    )
+    p_afl.add_argument("--seed", required=True, help="path to the seed H.265 file")
+    p_afl.add_argument(
+        "--mutator",
+        required=True,
+        choices=list_mutators(),
+        help="mutator to apply",
+    )
+    p_afl.add_argument(
+        "--seed-rng",
+        type=int,
+        default=0,
+        help="RNG seed for the mutation (default 0; same seed -> same mutant)",
+    )
+    p_afl.set_defaults(func=_cmd_afl_mutate)
+
     # mutators
     p_list = sub.add_parser("mutators", help="list available mutator types")
     p_list.set_defaults(func=_cmd_list_mutators)
@@ -764,6 +797,17 @@ def _cmd_heatmap(args: argparse.Namespace) -> int:
             f"({r.crash_share * 100:.0f}% reward){bug_note} [{breakdown}]"
         )
     print(f"heat-map written to {args.output_dir}/heatmap.json")
+    return 0
+
+
+def _cmd_afl_mutate(args: argparse.Namespace) -> int:
+    n = mutate_stdin_to_stdout(args.seed, args.mutator, args.seed_rng)
+    # All progress/diagnostic output goes to stderr so stdout stays
+    # byte-clean for the downstream decoder / AFL harness.
+    print(
+        f"afl-mutate: applied {args.mutator}; wrote {n} bytes to stdout",
+        file=sys.stderr,
+    )
     return 0
 
 
