@@ -595,6 +595,63 @@ slice-skip / NAL-bound check that several decoders implement without a guard.
 
 ---
 
+## 15. PPS ref-pic-list modification gate mutator — ✅ IMPLEMENTED (2026-05-29)
+
+**Status:** Shipped. `parse_pps` in `hevc.py` now promotes the previously
+read-and-discarded `lists_modification_present_flag` (H.265 §7.3.2.1) to a tracked
+single-bit span. It sits in the PPS third stage immediately after
+`pps_scaling_list_data_present_flag` and just before
+`log2_parallel_merge_level_minus2` — reached for any untiled, non-truncated PPS
+whose scaling-list gate is off (the same walk `pps-slice-header-extension` and the
+`pps-extension-flags` gates use). One mutator, `pps-lists-modification`, was added
+to `builtin.py`; it flips the gate off→on in the PPS without any slice actually
+being structured around list modification, so the decoder must read a
+`ref_pic_list_modification()` sub-block (H.265 §7.3.6.2) — `list_entry_l0[]` /
+`list_entry_l1[]` reorder indices, each a `Ceil(Log2(NumPicTotalCurr))`-bit u(v) —
+out of bits that hold the real inter slice-header fields, then index the reference
+picture lists with the values it reads. `list_entry_lX[i]` indices that exceed
+`NumPicTotalCurr` are a classic out-of-bounds reference-list access. It raises when
+the PPS did not parse to the gate or the gate is already on, so the engine picks
+another. Tests in `tests/test_hevc.py` (`TestPpsListsModificationGateParsing`, 8
+cases) cover the seed span, its single-bit width, its position between the
+scaling-list and slice-header-extension gates, the recorded-when-on case, the
+scaling-list-on and tiles-on skip cases, and the length-preserving splice round-trip
+(asserting the neighbouring slice-header gate is untouched); tests in
+`tests/test_mutators.py` (`TestPpsListsModificationRegistered` +
+`TestPpsListsModificationMutator`, 13 cases) cover registration, reproducibility,
+the gate flip, the detail string, PPS-only containment, length preservation, the
+neighbouring-gate-untouched invariant, framing integrity, double-application raise,
+the gate-already-on raise, the scaling-list-on raise, and the tiled-PPS raise.
+
+**What:** Flip `lists_modification_present_flag` (H.265 §7.3.2.1) on in the PPS
+without any slice carrying the per-slice-header `ref_pic_list_modification()`
+sub-block it gates. It is the second PPS gate whose dependent sub-block is in the
+*slice header* (after `slice_segment_header_extension_present_flag`), landing the
+desync in the reference-picture-list reordering path.
+
+**Why now:** The suggested next slice candidates from R17 — `slice_pic_order_cnt_lsb`
+and `num_ref_idx_active_override_flag` — are **not reachable** with mangle's
+self-contained per-NAL slice parser: both sit past `slice_pic_parameter_set_id`
+(where `parse_slice_header` deliberately stops) and require SPS/PPS cross-context
+(`num_extra_slice_header_bits`, `slice_type`, `separate_colour_plane_flag`, the
+`log2_max_pic_order_cnt_lsb` width, the slice RPS) to even locate. `pps-lists-
+modification` is the *reachable* analogue: it flips the PPS gate that *enables* the
+slice-header ref-pic-list reorder block rather than parsing into the slice header to
+reach the reorder fields. It is the natural next gate in the PPS third-stage walk —
+the parser already reached and discarded it, sitting between the two gates already
+covered by `pps-extension-flags` and `pps-slice-header-extension`.
+
+**Implementation notes:**
+
+- `parse_pps` third stage already read `lists_modification_present_flag` and
+  discarded it; promoting it to a span is ~6 lines plus the dataclass field.
+- The mutator is a 1-bit `splice_fixed_bits` on the located gate span
+  (length-preserving), matching the established gate-flag mutators.
+
+**Estimated LOC:** ~75 (parser extension ~8 + mutator ~60 + dataclass field).
+
+---
+
 ## Summary table
 
 | # | Name | Attack surface | New CVE class | Cost (LOC) | Priority |
@@ -613,6 +670,7 @@ slice-skip / NAL-bound check that several decoders implement without a guard.
 | 12 | slice-no-output-prior-pics | Slice-header DPB no-output | DPB flush/output desync | ~75 | ✅ DONE |
 | 13 | vps-timing-info | VPS timing / HRD gate | HRD-timing desync | ~90 | ✅ DONE |
 | 14 | pps-slice-header-extension | PPS→slice-header extension gate | Slice-header skip OOB read | ~80 | ✅ DONE |
+| 15 | pps-lists-modification | PPS→slice-header ref-pic-list reorder gate | Ref-list index OOB read | ~75 | ✅ DONE |
 
 ---
 
@@ -704,8 +762,19 @@ are entirely untouched:
     mutator (item #14): `parse_pps` promotes the gate (previously read and
     discarded) to a tracked span and the mutator flips it off→on without the slices
     carrying the dependent extension block, desyncing every slice header's
-    `slice_segment_header_extension_length` read. The deeper slice-header fields that
-    need SPS/PPS context (`slice_segment_address`, the slice-level RPS,
-    `dependent_slice_segment_flag`) remain unmodelled.
+    `slice_segment_header_extension_length` read. The PPS-side gate that controls the
+    slice-header *ref-pic-list reordering* path — `lists_modification_present_flag`
+    (H.265 §7.3.2.1) — is now also covered by the `pps-lists-modification` mutator
+    (item #15): the parser promotes that gate (also previously read and discarded) to
+    a tracked span and the mutator flips it off→on without any slice carrying
+    `ref_pic_list_modification()`, desyncing every inter slice header's
+    `list_entry_lX` reorder-index read. This is the reachable analogue of the
+    R17-suggested slice candidates `slice_pic_order_cnt_lsb` /
+    `num_ref_idx_active_override_flag`, which are **not reachable** with the
+    self-contained per-NAL slice parser (they sit past `slice_pic_parameter_set_id`,
+    where `parse_slice_header` stops, and need SPS/PPS cross-context to locate). The
+    deeper slice-header fields that need SPS/PPS context (`slice_segment_address`,
+    the slice-level RPS, `dependent_slice_segment_flag`, `slice_pic_order_cnt_lsb`,
+    `num_ref_idx_active_override_flag`) remain unmodelled.
 
 Items 1–6 above correspond directly to items 1–10 in the ranked list.

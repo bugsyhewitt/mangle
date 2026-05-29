@@ -674,6 +674,17 @@ class PicParameterSet:
     target of the ``pps-slice-header-extension`` mutator. Recorded only when the
     parser reaches it (untiled, non-truncated PPS with the scaling-list gate off).
 
+    Immediately after the scaling-list gate (and just before
+    ``log2_parallel_merge_level_minus2``) the parser also records
+    ``lists_modification_present_flag`` (H.265 §7.3.2.1). That single u(1) flag, when
+    1, makes a slice segment header that uses inter prediction carry a
+    ``ref_pic_list_modification()`` sub-block (H.265 §7.3.6.2) — a set of
+    ``list_entry_l0[]`` / ``list_entry_l1[]`` indices, each u(v) wide, that reorder
+    the reference picture lists. It is the second PPS gate whose dependent sub-block
+    lives in the *slice header* (the ref-pic-list reordering path), and is the target
+    of the ``pps-lists-modification`` mutator. Recorded only when the parser reaches
+    it (untiled, non-truncated PPS with the scaling-list gate off).
+
     Any field not reached (e.g. tiles enabled → variable geometry, or a truncated
     PPS) is simply absent from ``spans`` and its attribute left ``None``.
     """
@@ -697,6 +708,9 @@ class PicParameterSet:
     pps_tc_offset_div2: int | None = None
     # PPS extension gate flags (None if the parser did not reach them).
     pps_scaling_list_data_present_flag: int | None = None
+    # Ref-pic-list modification gate (None if the parser did not reach it). A PPS
+    # u(1) flag that gates a per-slice-header ref_pic_list_modification() sub-block.
+    lists_modification_present_flag: int | None = None
     # Slice-header extension gate (None if the parser did not reach it). A PPS
     # u(1) flag that gates a per-slice-header extension sub-block.
     slice_segment_header_extension_present_flag: int | None = None
@@ -865,7 +879,13 @@ def parse_pps(rbsp: bytes) -> PicParameterSet:
                 # walk past the body to reach pps_extension_present_flag. Stop.
                 return pps
 
-            reader.read_bit()  # lists_modification_present_flag
+            lm_off = reader.bit_position
+            lm_present = reader.read_bit()  # lists_modification_present_flag
+            pps.lists_modification_present_flag = lm_present
+            pps.spans.append(
+                FieldSpan("lists_modification_present_flag", lm_off, 1, lm_present)
+            )
+
             reader.read_ue()  # log2_parallel_merge_level_minus2
 
             shext_off = reader.bit_position

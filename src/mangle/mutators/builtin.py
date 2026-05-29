@@ -368,6 +368,92 @@ def pps_slice_header_extension(
     )
 
 
+@register("pps-lists-modification")
+def pps_lists_modification(
+    nals: list[NalUnit], rng: random.Random
+) -> MutationResult:
+    """Flip the PPS ``lists_modification_present_flag`` gate on.
+
+    ``lists_modification_present_flag`` (H.265 §7.3.2.1) sits immediately after
+    ``pps_scaling_list_data_present_flag`` and just before
+    ``log2_parallel_merge_level_minus2`` in the PPS. When it is 1, the spec allows a
+    slice segment header that uses inter prediction (P/B slices) to carry a
+    ``ref_pic_list_modification()`` sub-block (H.265 §7.3.6.2): a
+    ``ref_pic_list_modification_flag_l0`` (and, for B slices, ``..._l1``) followed,
+    when set, by ``num_ref_idx_lX_active_minus1 + 1`` entries of ``list_entry_lX[i]``
+    — each a ``Ceil(Log2(NumPicTotalCurr))``-bit u(v) index that *reorders* the
+    reference picture list.
+
+    This is the PPS gate whose dependent sub-block lives in the slice-header
+    reference-picture-list reordering path — the second such bridge after
+    ``pps-slice-header-extension`` (the slice-header extension gate). It is the
+    *reachable* analogue of the slice-side ref-pic-list reorder fields
+    (``num_ref_idx_active_override_flag``, ``list_entry_l0``) that mangle's
+    self-contained per-NAL slice parser cannot reach without SPS/PPS cross-context:
+    rather than parse deep into the slice header (which needs ``num_extra_slice_
+    header_bits``, ``slice_type``, the slice RPS and active ref-idx counts to locate
+    the reorder block), it flips the PPS gate that *enables* that block. Flipping it
+    from 0 to 1 without any slice actually being structured around list modification
+    desynchronises how the decoder interprets every inter slice header that
+    references this PPS: it must now read the ``ref_pic_list_modification()`` syntax
+    out of bits that hold the real slice-header fields, then index the reference
+    lists with the indices it reads. ``list_entry_lX[i]`` indices that exceed
+    ``NumPicTotalCurr`` are a classic out-of-bounds reference-list access — the same
+    DPB / reference-management surface the CVE-2026-33164 derive path
+    (``set_derived_values()``) and ffmpeg's ``hevcdec.c`` ref-list construction run
+    through.
+
+    This is the "claims data that isn't there" gate-on desync used by the other
+    gate-flag mutators (``sps-vui-hrd``, ``sps-rext-flags``, ``pps-extension-flags``,
+    ``pps-slice-header-extension``, ``vps-timing-info``), landing the desync in the
+    ref-pic-list reorder path of the slice header rather than in a parameter set.
+
+    The gate is reached only for an untiled, non-truncated PPS whose scaling-list
+    gate is off (the parser cannot walk past a present ``scaling_list_data()`` body).
+    The mutator only fires when the seed currently has the gate *off*; if the PPS did
+    not parse to the gate, or the gate is already on, it raises so the engine picks
+    another mutator.
+
+    [Worker decision: gate-flip splice keeps the PPS byte-stable]
+    The target is a single u(1) bit, so the splice never shifts the stream's
+    bit-length — only the one gate bit changes and the downstream desync is purely
+    semantic, matching the established gate-flag mutators.
+    """
+    out = _clone(nals)
+    idx = _first(out, 34)  # PPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    pps = parse_pps(rbsp)
+
+    if not pps.has_span("lists_modification_present_flag"):
+        raise ValueError(
+            "PPS did not parse to lists_modification_present_flag (tiles enabled, "
+            "scaling-list gate on, or truncated PPS); cannot mutate the "
+            "ref-pic-list modification gate"
+        )
+    span = pps.span("lists_modification_present_flag")
+    if span.value != 0:
+        raise ValueError(
+            "lists_modification_present_flag is already set; the gate-on desync "
+            "needs an off gate"
+        )
+
+    new_value = 1  # turn the gate on; no slice carries ref_pic_list_modification()
+    new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="pps-lists-modification",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=(
+            "lists_modification_present_flag: 0 -> 1 (PPS gate enabled without any "
+            "slice carrying ref_pic_list_modification(); every inter slice header "
+            "desyncs reading list_entry_lX reorder indices)"
+        ),
+    )
+
+
 @register("pps-slice-qp")
 def pps_slice_qp(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     """Corrupt the PPS quantization / transform-skip control fields.
