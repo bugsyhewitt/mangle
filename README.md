@@ -208,6 +208,7 @@ mangle mutators
 | `sps-vui-hrd` | SPS VUI | Flips a VUI / HRD gate flag (`vui_hrd_parameters_present_flag`, `vui_timing_info_present_flag`, or `vui_parameters_present_flag`) on without supplying the sub-block it gates, forcing the decoder to read CPB/HRD fields out of unrelated downstream bits |
 | `sps-rext-flags` | SPS extension | Flips an SPS extension gate (`sps_range_extension_flag`, preferred, or `sps_extension_present_flag`) on without supplying the `sps_range_extension()` body, forcing the decoder onto its HEVC Range-Extension parse path with no valid extension parameter set behind it |
 | `pps-extension-flags` | PPS extension | Flips a PPS extension gate (`pps_extension_present_flag`, preferred, or `pps_scaling_list_data_present_flag`) on without supplying the dependent `scaling_list_data()` / profile-extension body, forcing the decoder to read scaling-list coefficients or extension flags out of the PPS trailing bits |
+| `slice-no-output-prior-pics` | Slice header (IRAP) | Flips `no_output_of_prior_pics_flag` in an IRAP slice header, inverting the decoder's decision to discard the DPB without outputting its pictures when a new coded-video-sequence begins |
 
 All structured mutators keep the stream a parseable Annex-B bitstream while pushing
 it out of semantic spec-compliance — the input class that exercises decoder edge
@@ -413,6 +414,29 @@ throughout a decoder:
   extension-present gate is unreachable once the scaling-list gate is already on (its
   variable-length body is not walked). If no off gate is reachable the mutator raises
   so the engine picks another.
+
+### Slice-header DPB no-output mutator
+
+- **`slice-no-output-prior-pics`** is the first mutator to target a *slice-header*
+  gate rather than a parameter set, addressing the slice-side of the systematic
+  bitstream walk. `no_output_of_prior_pics_flag` (H.265 §7.3.6.1) is a single bit
+  present only on IRAP slices (NAL types `[16, 23]` — BLA / IDR / CRA). When an IRAP
+  begins a new coded-video-sequence the flag tells the decoder whether to *discard*
+  the pictures already buffered in the DPB **without outputting them**. Flipping it
+  inverts that decision:
+  - `0 -> 1` forces the decoder to drop a full DPB of valid, not-yet-output pictures —
+    exercising the early DPB-flush path with live buffers.
+  - `1 -> 0` forces the decoder to keep and attempt to output pictures whose POC and
+    reference state the new sequence has invalidated — exercising the DPB
+    bumping / output-reorder logic with stale entries.
+
+  Both directions drive the same DPB output / flush machinery (the `bumping` process,
+  and the derived DPB sizing set by `set_derived_values()`) that the CVE-2026-33164
+  crash family runs through. The flag is fully self-contained — it is located and
+  rewritten without any SPS/PPS context — and the 1-bit splice never changes the slice
+  length, so every other byte of the stream is preserved exactly. The parser promotes
+  the flag (previously read and discarded) to a tracked span only for IRAP slices; on
+  a stream with no IRAP slice the mutator raises so the engine picks another.
 
 ### Emulation-prevention byte stress mutator
 

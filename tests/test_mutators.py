@@ -14,7 +14,7 @@ from mangle.bitstream import (
     START_CODE_LONG,
     START_CODE_SHORT,
 )
-from mangle.hevc import parse_pps, parse_sei, parse_sps
+from mangle.hevc import parse_pps, parse_sei, parse_slice_header, parse_sps
 from mangle.mutators import get_mutator, list_mutators
 
 SEED = Path(__file__).parent / "fixtures" / "clean.h265"
@@ -1715,3 +1715,91 @@ class TestPpsExtensionFlagsMutator:
             pass
         else:
             raise AssertionError("expected ValueError for a tiled PPS")
+
+
+def _irap_slice_no_output(nals):
+    """Read the no_output_of_prior_pics_flag of the first IRAP slice in a stream."""
+    nal = next(n for n in nals if 16 <= n.nal_unit_type <= 23)
+    sh = parse_slice_header(ebsp_to_rbsp(nal.ebsp[2:]), nal.nal_unit_type)
+    return sh.no_output_of_prior_pics_flag
+
+
+class TestSliceNoOutputPriorPicsRegistered:
+    def test_present(self):
+        assert "slice-no-output-prior-pics" in list_mutators()
+
+    def test_result_name(self):
+        r = get_mutator("slice-no-output-prior-pics")(_seed_nals(), random.Random(0))
+        assert r.mutator == "slice-no-output-prior-pics"
+
+    def test_reproducible(self):
+        r1 = get_mutator("slice-no-output-prior-pics")(_seed_nals(), random.Random(42))
+        r2 = get_mutator("slice-no-output-prior-pics")(_seed_nals(), random.Random(42))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.detail == r2.detail
+
+
+class TestSliceNoOutputPriorPicsMutator:
+    def test_changes_bytes_on_seed(self):
+        original = SEED.read_bytes()
+        result = get_mutator("slice-no-output-prior-pics")(_seed_nals(), random.Random(1))
+        assert result.bytes_changed > 0
+        assert assemble_nal_units(result.nals) != original
+
+    def test_detail_is_nonempty(self):
+        result = get_mutator("slice-no-output-prior-pics")(_seed_nals(), random.Random(0))
+        assert result.detail
+        assert "no_output_of_prior_pics_flag" in result.detail
+
+    def test_flag_is_flipped(self):
+        original_flag = _irap_slice_no_output(_seed_nals())
+        result = get_mutator("slice-no-output-prior-pics")(_seed_nals(), random.Random(3))
+        mutated_flag = _irap_slice_no_output(result.nals)
+        assert mutated_flag == 1 - original_flag
+
+    def test_single_bit_change_preserves_length(self):
+        original = SEED.read_bytes()
+        result = get_mutator("slice-no-output-prior-pics")(_seed_nals(), random.Random(5))
+        mutated = assemble_nal_units(result.nals)
+        # A 1-bit flip never changes the stream length.
+        assert len(mutated) == len(original)
+
+    def test_changes_only_slice_nal(self):
+        original = _seed_nals()
+        result = get_mutator("slice-no-output-prior-pics")(_seed_nals(), random.Random(9))
+        for orig, mut in zip(original, result.nals):
+            if 16 <= orig.nal_unit_type <= 23:
+                continue  # IRAP slice may change
+            assert orig.ebsp == mut.ebsp, (
+                f"non-IRAP NAL type {orig.nal_unit_type} was modified"
+            )
+
+    def test_framing_integrity(self):
+        result = get_mutator("slice-no-output-prior-pics")(_seed_nals(), random.Random(7))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated[:4] == START_CODE_LONG or mutated[:3] == START_CODE_SHORT
+        assert len(split_nal_units(mutated)) == len(_seed_nals())
+
+    def test_idempotent_under_double_application(self):
+        # Flipping the flag twice restores the original stream.
+        once = get_mutator("slice-no-output-prior-pics")(_seed_nals(), random.Random(0))
+        twice = get_mutator("slice-no-output-prior-pics")(once.nals, random.Random(0))
+        assert assemble_nal_units(twice.nals) == SEED.read_bytes()
+
+    def test_raises_when_no_irap_slice(self):
+        # Build a stream whose only VCL slice is a non-IRAP type (TRAIL_R = 1).
+        nals = _seed_nals()
+        rebuilt = []
+        for n in nals:
+            if 16 <= n.nal_unit_type <= 23:
+                # Relabel the IRAP slice as TRAIL_R (type 1) via the header byte.
+                header0 = (n.ebsp[0] & 0x81) | (1 << 1)
+                rebuilt.append(NalUnit(n.start_code_len, n.offset, bytes([header0]) + n.ebsp[1:]))
+            else:
+                rebuilt.append(n)
+        try:
+            get_mutator("slice-no-output-prior-pics")(rebuilt, random.Random(0))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError when no IRAP slice is present")
