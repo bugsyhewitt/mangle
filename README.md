@@ -109,6 +109,35 @@ This runs 100 mutate+decode cycles in parallel and writes:
 - `/tmp/fuzz-out/crashes/<hash>.h265` — the mutant for any crash (segfault or
   non-zero decoder exit), alongside `<hash>.txt` containing the decoder's stderr.
 
+#### Wall-clock campaign budget (`--time-limit`)
+
+`--iterations` answers "how many inputs?"; `--time-limit` answers "for how
+long?". Real campaigns are usually time-boxed — *fuzz overnight*, *fuzz this
+PR for 10 minutes in CI* — not iteration-boxed, because per-decode time varies
+with timeouts, hangs, and decoder load. `--time-limit SECONDS` adds that budget:
+
+```bash
+mangle fuzz \
+  --seed tests/fixtures/clean.h265 \
+  --output-dir /tmp/fuzz-out \
+  --iterations 1000000 \
+  --time-limit 600        # fuzz for ten minutes, up to a 1M-iteration cap
+```
+
+When `--time-limit` is set, `--iterations` becomes an **upper bound**, not a
+target: the campaign stops dispatching new iterations as soon as the budget is
+spent, and whichever limit is reached first ends the run. The budget is a
+**soft** stop — iterations already in flight run to completion, so no in-progress
+decode is killed mid-stream. `results.jsonl` (and the adaptive `scheduler.json`
+`iterations` count) record exactly the iterations that actually ran.
+
+Each iteration that runs is still individually replayable — its mutator and
+per-iteration `seed_rng` are recorded just as in an iteration-only campaign, so
+[`mangle replay`](#replay-any-iterations-mutant) reconstructs any of them
+byte-for-byte. Only the iteration *count* of a time-budgeted run is wall-clock
+dependent. Omitting `--time-limit` preserves the exact iterations-only behaviour
+(and the byte-identical RNG stream) of earlier releases.
+
 #### Adaptive mutator prioritisation (`--strategy`)
 
 By default (`--strategy uniform`) every mutator is equally likely on every

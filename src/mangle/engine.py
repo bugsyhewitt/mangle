@@ -7,6 +7,8 @@ import hashlib
 import json
 import random
 import tempfile
+import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -161,6 +163,8 @@ async def fuzz_async(
     concurrency: int,
     strategy: str = "uniform",
     seed_from_crashes: str | Path | None = None,
+    time_limit: float | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> list[IterationResult]:
     """Run ``iterations`` mutate+decode cycles and record outcomes.
 
@@ -182,13 +186,27 @@ async def fuzz_async(
     ``strategy`` selects the mutator-scheduling policy:
 
     - ``"uniform"`` (default): every mutator is equally likely on every
-      iteration. All iterations are dispatched at once and run in parallel up to
-      ``concurrency``. With a single seed the RNG draw stream is unchanged from
-      v0.1, so a campaign's mutator/seed sequence is byte-identical to before.
+      iteration. With no ``time_limit`` all iterations are dispatched at once and
+      run in parallel up to ``concurrency``; with a single seed the RNG draw
+      stream is byte-identical to v0.1, so a campaign's mutator/seed sequence is
+      unchanged.
     - ``"adaptive"``: an outcome-feedback bandit biases selection toward mutators
       that have produced crashes/aborts. Iterations run in rounds of
       ``concurrency`` so each round's verdicts update the scheduler before the
       next round is selected. Still fully deterministic for a given ``seed_rng``.
+
+    ``time_limit`` (seconds) is an optional wall-clock budget for the whole
+    campaign. When set, ``--iterations`` becomes an upper bound: the campaign
+    stops dispatching new iterations as soon as the deadline passes, whichever
+    limit is reached first. Iterations already dispatched run to completion, so
+    the deadline is a soft stop (no in-flight decode is killed). When
+    ``time_limit`` is ``None`` (the default) the budget is unlimited and the
+    fast single-shot dispatch path — and the exact v0.1 RNG stream — is
+    preserved. A time-budgeted run is non-deterministic in its iteration *count*
+    (it depends on the wall clock), but every iteration that runs is still
+    individually replayable: its mutator and per-iteration ``seed_rng`` are
+    recorded in ``results.jsonl`` exactly as before. ``clock`` is the monotonic
+    time source (injectable for testing).
     """
     if seed_from_crashes is not None and seed_path is not None:
         raise ValueError(
@@ -197,6 +215,14 @@ async def fuzz_async(
         )
     if seed_from_crashes is None and seed_path is None:
         raise ValueError("fuzz requires --seed or --seed-from-crashes")
+    if time_limit is not None and time_limit <= 0:
+        raise ValueError(
+            f"--time-limit must be a positive number of seconds (got {time_limit})"
+        )
+    # Resolve the time source at call time (not at def time) so a test can patch
+    # ``engine.time.monotonic`` and have it take effect here.
+    if clock is None:
+        clock = time.monotonic
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -226,9 +252,18 @@ async def fuzz_async(
         # stream (mutator pick + iter seed) is unchanged.
         return seed_pool[i % len(seed_pool)]
 
-    if strategy == "uniform":
+    # A wall-clock budget converts ``iterations`` into an upper bound: dispatch
+    # stops once this deadline passes. ``None`` means no budget — the v0.1 path.
+    deadline = clock() + time_limit if time_limit is not None else None
+
+    def _budget_exhausted() -> bool:
+        return deadline is not None and clock() >= deadline
+
+    if strategy == "uniform" and time_limit is None:
         # Single-shot dispatch preserves the exact v0.1 RNG stream and the full
-        # parallelism of one big asyncio.gather.
+        # parallelism of one big asyncio.gather. Only taken when there is no
+        # time budget, so a plain ``--iterations`` campaign is byte-for-byte the
+        # same as earlier releases.
         tasks = []
         for i in range(iterations):
             mutator_name = scheduler.select(base_rng)
@@ -249,12 +284,18 @@ async def fuzz_async(
             )
         results = await asyncio.gather(*tasks)
     else:
-        # Round-based dispatch so each round's outcomes feed the scheduler before
-        # the next round is chosen. Round size is ``concurrency`` to keep the same
-        # parallelism budget as the uniform path.
+        # Round-based dispatch. Adaptive mode needs it so each round's outcomes
+        # feed the scheduler before the next round is chosen; the uniform +
+        # time_limit case needs it so the deadline can actually halt dispatch
+        # between rounds (a single giant gather could not be interrupted). Round
+        # size is ``concurrency`` to keep the same parallelism budget either way.
         results = []
         round_size = max(1, concurrency)
         for start in range(0, iterations, round_size):
+            # Stop launching new work once the wall-clock budget is spent. Already
+            # dispatched rounds have completed; in-flight decodes are never killed.
+            if _budget_exhausted():
+                break
             count = min(round_size, iterations - start)
             round_tasks = []
             picks = []
@@ -294,7 +335,9 @@ async def fuzz_async(
         scoreboard_path = out_dir / "scheduler.json"
         scoreboard = {
             "strategy": strategy,
-            "iterations": iterations,
+            # The actual iterations dispatched, which a --time-limit budget may
+            # cut below the requested upper bound.
+            "iterations": len(results),
             "arms": scheduler.stats(),
         }
         scoreboard_path.write_text(json.dumps(scoreboard, indent=2) + "\n")
@@ -313,6 +356,8 @@ def fuzz_file(
     concurrency: int = 4,
     strategy: str = "uniform",
     seed_from_crashes: str | Path | None = None,
+    time_limit: float | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> list[IterationResult]:
     """Synchronous wrapper around :func:`fuzz_async`."""
     return asyncio.run(
@@ -327,6 +372,8 @@ def fuzz_file(
             concurrency,
             strategy,
             seed_from_crashes,
+            time_limit,
+            clock,
         )
     )
 

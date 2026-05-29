@@ -90,7 +90,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir", required=True, help="directory for results.jsonl and crashes/"
     )
     p_fuzz.add_argument(
-        "--iterations", type=int, default=100, help="number of mutate+decode cycles"
+        "--iterations",
+        type=int,
+        default=100,
+        help=(
+            "number of mutate+decode cycles; with --time-limit this is an upper "
+            "bound (whichever limit is hit first ends the campaign)"
+        ),
+    )
+    p_fuzz.add_argument(
+        "--time-limit",
+        type=float,
+        default=None,
+        help=(
+            "wall-clock budget for the campaign in seconds (default: unlimited). "
+            "When set, dispatch stops as soon as the budget is spent — "
+            "--iterations becomes a cap, not a target. Each iteration that runs "
+            "is still individually replayable; only the iteration COUNT is "
+            "wall-clock dependent. Omitting it preserves the exact "
+            "iterations-only behaviour of earlier releases"
+        ),
     )
     p_fuzz.add_argument(
         "--decoder",
@@ -470,19 +489,28 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         concurrency=args.concurrency,
         strategy=args.strategy,
         seed_from_crashes=args.seed_from_crashes,
+        time_limit=args.time_limit,
     )
     counts = Counter(r.outcome for r in results)
     crashes = [r for r in results if r.crash_hash]
+    # When a --time-limit budget cut the campaign short, say so against the cap.
+    budget_note = ""
+    if args.time_limit is not None:
+        budget_note = (
+            f", time-limited to {args.time_limit:g}s "
+            f"(of up to {args.iterations} iteration cap)"
+        )
     if args.seed_from_crashes:
         n_seeds = len({r.base_seed for r in results if r.base_seed is not None})
         print(
             f"ran {len(results)} iterations against {args.decoder} "
             f"({args.strategy} scheduler), fed from {n_seeds} crash seed(s)"
+            f"{budget_note}"
         )
     else:
         print(
             f"ran {len(results)} iterations against {args.decoder} "
-            f"({args.strategy} scheduler)"
+            f"({args.strategy} scheduler){budget_note}"
         )
     for outcome in ("clean", "crash", "abort", "timeout", "hang"):
         if counts.get(outcome):
