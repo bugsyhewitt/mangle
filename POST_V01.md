@@ -652,6 +652,53 @@ covered by `pps-extension-flags` and `pps-slice-header-extension`.
 
 ---
 
+## 16. PPS deblocking-control gate mutator — ✅ IMPLEMENTED (2026-05-29)
+
+**Status:** Shipped. The PPS parser already recorded
+`deblocking_filter_control_present_flag` (H.265 §7.3.2.3) as a tracked single-bit
+span — it sits immediately after `pps_loop_filter_across_slices_enabled_flag` and
+is reached for any untiled, non-truncated PPS — but the existing `pps-deblocking`
+mutator only *reads* it to choose its menu of behind-the-gate mutations; it never
+flipped the gate bit itself. One mutator, `pps-deblocking-control-gate`, was added
+to `builtin.py`; it flips the gate off→on without the dependent
+override / disable / beta-tc-offset sub-block (H.265 §7.3.2.3) actually being
+present, so the decoder reads `deblocking_filter_override_enabled_flag`, the
+disable flag, and possibly two se(v) offsets out of the bits that really hold
+`pps_scaling_list_data_present_flag`, `lists_modification_present_flag`,
+`log2_parallel_merge_level_minus2`, and the slice-header / extension gates that
+follow — desyncing the entire PPS tail and deriving the deblocking-filter state
+from garbage. It raises when the PPS did not parse to the gate (tiled / truncated)
+or the gate is already on, so the engine picks another. Tests in
+`tests/test_mutators.py` (`TestPpsDeblockingControlGateRegistered` +
+`TestPpsDeblockingControlGateMutator`, 13 cases) cover registration,
+reproducibility, the gate flip, the detail string, PPS-only containment, length
+preservation, the neighbouring-loop-filter-flag-untouched invariant, framing
+integrity, double-application raise, the gate-already-on raise (with a synthesised
+control-on PPS), and the tiled-PPS raise.
+
+**What:** Flip `deblocking_filter_control_present_flag` (H.265 §7.3.2.3) on in the
+PPS without the override / disable / beta-tc-offset sub-block it gates. This is the
+deblocking-region analogue of the established "claims data that isn't there"
+gate-on desync (`pps-extension-flags`, `pps-slice-header-extension`,
+`pps-lists-modification`, `sps-vui-hrd`, `sps-rext-flags`, `vps-timing-info`).
+
+**Why now / assessment of the R18 candidates:** R18 suggested
+`deblocking_filter_control_present_flag` and `deblocking_filter_override_enabled_flag`
+as the next PPS gap. `deblocking_filter_override_enabled_flag` is **not reachable**
+on the bundled seed: it lives *inside* the `if (deblocking_filter_control_present_flag)`
+block (H.265 §7.3.2.3), and the seed's control gate is off, so the override flag is
+absent from the bitstream and has no span to flip. The control-present gate **is**
+the reachable field — recorded for any untiled PPS, with the seed's value at 0 — and
+flipping it on is the one deblocking-region mutation no existing mutator performs
+(`pps-deblocking` only touches the fields *behind* an already-on gate). It is also
+directly in the CVE-2026-33164 derive path (`set_derived_values()` on a malformed
+PPS). So the implemented choice is the control-present gate.
+
+**Estimated LOC:** ~85 (mutator ~70 + tests; no parser change — the gate span was
+already recorded by the item #11 parser extension).
+
+---
+
 ## Summary table
 
 | # | Name | Attack surface | New CVE class | Cost (LOC) | Priority |
@@ -671,6 +718,7 @@ covered by `pps-extension-flags` and `pps-slice-header-extension`.
 | 13 | vps-timing-info | VPS timing / HRD gate | HRD-timing desync | ~90 | ✅ DONE |
 | 14 | pps-slice-header-extension | PPS→slice-header extension gate | Slice-header skip OOB read | ~80 | ✅ DONE |
 | 15 | pps-lists-modification | PPS→slice-header ref-pic-list reorder gate | Ref-list index OOB read | ~75 | ✅ DONE |
+| 16 | pps-deblocking-control-gate | PPS deblocking-control gate inconsistency | PPS-tail desync / derive-path crash | ~85 | ✅ DONE |
 
 ---
 
@@ -738,7 +786,17 @@ are entirely untouched:
    body, forcing the decoder to read scaling-list coefficients out of the PPS
    trailing bits). The variable-length `scaling_list_data()` body itself is still
    not synthesised.
-9. Deblocking filter parameters in PPS/slice header — ✅ PPS portion covered (item #11)
+9. Deblocking filter parameters in PPS/slice header — ✅ PPS portion covered. The
+   beta/tc offsets, the disable flag, and the loop-filter scope flag (the fields
+   *behind* an already-on control gate) are covered by `pps-deblocking` (item #11);
+   the `deblocking_filter_control_present_flag` gate *itself* is now covered by
+   `pps-deblocking-control-gate` (item #16), which flips it off→on without the
+   dependent override / disable / offset sub-block, desyncing the PPS tail. The
+   `deblocking_filter_override_enabled_flag` is only present in the bitstream when
+   the control gate is on, so on the off-gate seed it is not a reachable target. The
+   slice-header deblocking-override path (`deblocking_filter_override_flag`,
+   `slice_beta_offset_div2`, `slice_tc_offset_div2`) needs SPS/PPS slice-context and
+   is not yet modelled.
 10. HEVC range extensions (RExt) flags — ✅ covered. `parse_sps` now walks *past*
     the VUI block (immediately when VUI is absent, or via the VUI tail's
     `bitstream_restriction_flag` block when VUI is present without an HRD sub-block)

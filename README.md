@@ -212,6 +212,7 @@ mangle mutators
 | `vps-timing-info` | VPS | Flips `vps_timing_info_present_flag` on without supplying the dependent `vps_timing_info` / `hrd_parameters()` sub-block, forcing the decoder to read `num_units_in_tick` / `time_scale` and an HRD walk out of the VPS trailing bits |
 | `pps-slice-header-extension` | PPS → slice header | Flips `slice_segment_header_extension_present_flag` on in the PPS without the slices carrying the dependent extension block, so every slice header desyncs reading a `slice_segment_header_extension_length` ue(v) out of unrelated bits |
 | `pps-lists-modification` | PPS → slice header | Flips `lists_modification_present_flag` on in the PPS without any slice carrying `ref_pic_list_modification()`, so every inter slice header desyncs reading `list_entry_lX` reference-list reorder indices — out-of-range entries are an out-of-bounds reference-list access |
+| `pps-deblocking-control-gate` | PPS | Flips `deblocking_filter_control_present_flag` on without the dependent override / disable / beta-tc-offset sub-block, so the decoder reads the deblocking fields out of the PPS tail (`pps_scaling_list_data_present_flag` and beyond) and desyncs every following gate |
 
 All structured mutators keep the stream a parseable Annex-B bitstream while pushing
 it out of semantic spec-compliance — the input class that exercises decoder edge
@@ -296,6 +297,26 @@ long-term reference resolution:
     `pps_loop_filter_across_slices_enabled_flag`, exercising the slice-boundary
     filter path. This field is reachable in any untiled PPS, so it is the
     conservative fallback when the deeper control block is absent.
+
+- **`pps-deblocking-control-gate`** is the companion to `pps-deblocking`: it
+  targets the deblocking-control *gate* itself — `deblocking_filter_control_present_flag`
+  (H.265 §7.3.2.3) — which `pps-deblocking` reads to choose its menu but never
+  flips. Reachable in any untiled PPS, the gate sits right after
+  `pps_loop_filter_across_slices_enabled_flag`. The mutator flips it from 0 to 1
+  without the dependent `deblocking_filter_override_enabled_flag` /
+  `pps_deblocking_filter_disabled_flag` / `pps_beta_offset_div2` /
+  `pps_tc_offset_div2` sub-block actually present, so the decoder reads those
+  fields out of the bits that really hold `pps_scaling_list_data_present_flag`,
+  `lists_modification_present_flag` and the gates that follow — desyncing the entire
+  PPS tail and deriving the deblocking state (the **CVE-2026-33164**
+  `set_derived_values()` derive path) from garbage. It is the deblocking-side
+  member of the gate-on desync family (`pps-extension-flags`,
+  `pps-slice-header-extension`, `pps-lists-modification`, `sps-vui-hrd`,
+  `sps-rext-flags`, `vps-timing-info`). It raises on a tiled / truncated PPS or one
+  whose control gate is already on, so the engine can pick another mutator. Note
+  `deblocking_filter_override_enabled_flag` is *not* a reachable target on an
+  off-gate seed: it exists in the bitstream only when the control gate is already
+  on, which is why the gate bit itself is the field this mutator targets.
 
 ### Chroma-format and bit-depth SPS mutators
 
