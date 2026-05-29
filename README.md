@@ -226,6 +226,47 @@ seed on a single-frame input) is **skipped and recorded in the manifest** rather
 than faked — `manifest.json` lists every emitted seed and every skip with its
 reason code.
 
+### Trim a corpus to one seed per behaviour
+
+```bash
+mangle corpus-trim \
+  --input-dir /tmp/corpus \
+  --output-dir /tmp/corpus-min
+```
+
+`mangle corpus` *builds* a diverse seed set and `mangle reduce` minimises a single
+*crash*; neither shrinks a whole *corpus*. A corpus accumulated over many
+campaigns (generated seeds, crash-derived seeds, samples from the wild) is almost
+always redundant — many files exercise the exact same decoder behaviour and only
+differ in incidental bytes. Carrying that redundancy slows every pass: each extra
+seed is an extra decode that buys no new behaviour. `mangle corpus-trim` is the
+`afl-cmin` step of the workflow — it keeps a **minimal subset** that preserves the
+corpus's full set of observed decoder behaviours and drops every redundant seed.
+
+It probes each seed through a decoder once and buckets seeds by their decode
+**behaviour**:
+
+- **crash / abort** — keyed by the same crash **signature** `mangle triage` uses
+  (ASAN/UBSAN top `--frame-depth` frames when a sanitizer build is present, else a
+  normalised-stderr hash). Two seeds that crash with the same fingerprint are the
+  same behaviour.
+- **clean** — all cleanly-decoding seeds collapse to one bucket (a corpus needs
+  only one representative well-framed seed).
+- **timeout / hang** — kept as their own buckets (a seed that wedges the decoder
+  is worth a representative).
+
+Within each bucket the **representative** is the smallest file (cheapest to
+re-decode, most minimal), tie-broken by name for determinism. Outputs:
+
+- the kept representatives are copied verbatim into `--output-dir`;
+- `/tmp/corpus-min/trim-manifest.json` records every input seed's verdict: its
+  byte size, decode outcome, behaviour key, whether it was kept, and (for a
+  dropped seed) which representative subsumed it.
+
+`corpus-trim` runs one decode per input seed and is fully deterministic (seeds are
+processed in sorted-name order and the probe is a pure function of the bytes).
+`--pattern` (default `*.h265`) controls which files count as seeds.
+
 ### Triage and deduplicate crashes
 
 ```bash
