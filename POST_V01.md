@@ -278,7 +278,27 @@ decoder invocations — adding a second decoder call per iteration is ~10% overh
 
 ---
 
-## 7. Coverage-instrumented harness (mangle-afl wrapper)
+## 7. Coverage-instrumented harness (mangle-afl wrapper) — ✅ IMPLEMENTED (2026-05-29)
+
+**Status:** Shipped. New `contrib/afl-harness/` directory with a reference
+persistent-mode `harness.c`, a `Makefile` (`make CC=afl-clang-fast` to build
+under AFL++, plain `gcc` for build-chain smoke tests), and a `README.md`
+documenting both integration paths. The load-bearing glue is a new
+`mangle.afl` module + `mangle afl-mutate` CLI subcommand: a byte-in /
+byte-out adapter that reads a seed file (the AFL `@@` convention) and
+writes the grammar-aware mutant to stdout with diagnostics on stderr —
+designed to be pumped by `harness.c` in the persistent-mode inner loop or
+called directly by any AFL++ custom-mutator wrapper. The honest
+architectural framing — mangle is black-box, so AFL++ owns the
+edge-coverage feedback loop while mangle owns the HEVC grammar — is
+documented in the module docstring, the contrib README, and the new README
+section. Tests in `tests/test_afl.py` (34 cases) cover the pure-function
+mutator, the stdin/stdout wrapper, the CLI subcommand (including the
+subprocess end-to-end form a real harness uses), every registered mutator
+through the CLI parser, and the structural integrity of the contrib
+directory (file presence, AFL macro declarations, mangle invocation,
+plain-gcc fallback, Makefile targets, `make -n` parse, README content for
+both integration paths).
 
 **What:** Add a thin `contrib/afl-harness/` directory with:
 - A `harness.c` that calls `mangle mutate` via the Python C API (or a compiled C
@@ -749,7 +769,7 @@ already recorded by the item #11 parser extension).
 | 4 | corpus builder | Seed diversity | Coverage breadth | ~140 | ✅ DONE |
 | 5 | sps-chroma-format / sps-bit-depth | Sample buffer sizing | Buffer underflow | ~100 | ✅ DONE |
 | 6 | Differential oracle | Cross-decoder divergence | Silent corruption | ~120 | ✅ DONE |
-| 7 | AFL harness | Coverage feedback | Throughput | ~200 | MEDIUM |
+| 7 | AFL harness | Coverage feedback | Throughput | ~200 | ✅ DONE |
 | 8 | Crash triage | Dedup / disclosure | Operational | ~180 | ✅ DONE |
 | 9 | pps-slice-qp | QP arithmetic / transform-skip | Integer overflow | ~80 | ✅ DONE |
 | 10 | nal-emulation-bytes | EBSP scanning | Parse confusion | ~70 | ✅ DONE |

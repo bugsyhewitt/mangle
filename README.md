@@ -603,6 +603,61 @@ per-region distinct-bug count, exactly as in `coverage` / `triage` / `reduce` /
 `corpus-trim`. A mutator whose name carries an unmapped prefix buckets under an
 `other` region rather than being dropped.
 
+### AFL++ coverage-guided fuzzing integration (`mangle afl-mutate`)
+
+`mangle`'s built-in `fuzz` loop is **black-box** — it only sees each
+decoder's pass/fail outcome (see `src/mangle/scheduler.py` and
+`src/mangle/coverage.py` for the design notes). The adaptive scheduler is
+the in-architecture answer to "coverage-guided mutation prioritisation" but
+it has no view of the decoder's execution traces; it cannot do *true*
+coverage-guided fuzzing.
+
+The honest path to real coverage-guided fuzzing is to bridge mangle's
+grammar-aware mutators into [AFL++](https://aflplus.plus/), which provides
+the edge-coverage feedback loop. Two integration paths are supported, both
+documented in [`contrib/afl-harness/README.md`](contrib/afl-harness/README.md):
+
+**Path 1 — corpus pre-processing (no harness build required).** Use `mangle
+corpus` and `mangle corpus-trim` to build a diverse, minimal HEVC seed
+corpus, then point `afl-fuzz` at it:
+
+```bash
+mangle corpus      --seed clean.h265 --output-dir seeds/
+mangle corpus-trim --input-dir seeds/ --output-dir seeds-trimmed/ --decoder ffmpeg
+afl-fuzz -i seeds-trimmed/ -o afl-out/ -- ffmpeg -v error -i @@ -f null -
+```
+
+Grammar-aware seed diversity is the single largest leverage point for
+mutational fuzzers (TWINFUZZ NDSS 2025, FuzzWise 2025).
+
+**Path 2 — persistent-mode harness (in-process, ~50× throughput).** Build
+the reference `harness.c` in `contrib/afl-harness/` with `afl-clang-fast`
+and let it call `mangle afl-mutate` in its inner loop:
+
+```bash
+make -C contrib/afl-harness CC=afl-clang-fast
+AFL_AUTORESUME=1 afl-fuzz \
+    -i seeds-trimmed/ \
+    -o afl-out/ \
+    -- ./contrib/afl-harness/mangle-afl-harness @@
+```
+
+The `afl-mutate` subcommand is the load-bearing glue — a stdin/stdout
+adapter around the grammar-aware mutator engine:
+
+```bash
+mangle afl-mutate \
+    --seed tests/fixtures/clean.h265 \
+    --mutator sps-dimensions \
+    --seed-rng 42 > mutant.h265
+```
+
+Reads the seed from `--seed` (the AFL `@@` convention — AFL replaces `@@`
+with the candidate path before invoking the harness), applies one mutator,
+writes the mutant bytes to **stdout** (no other output on stdout, so the
+output is safe to pipe straight into a decoder), and reports the byte count
+on **stderr**. Deterministic for `(seed, --mutator, --seed-rng)`.
+
 ### List the available mutators
 
 ```bash
