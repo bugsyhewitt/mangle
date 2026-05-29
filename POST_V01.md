@@ -228,7 +228,31 @@ These are short mutators building directly on already-parsed SPS fields.
 
 ---
 
-## 6. Differential decoder oracle (mangle diff subcommand)
+## 6. Differential decoder oracle (mangle diff subcommand) — ✅ IMPLEMENTED (2026-05-29)
+
+**Status:** Shipped. `DecodeResult` in `decoder.py` gained an optional `decoder`
+label field (populated by `run_decoder`); a `DivergenceResult` dataclass and a
+`run_decoder_pair()` function were added. `run_decoder_pair` runs one mutant
+through two decoders via the existing `run_decoder` path and classifies the pair
+with `_classify_divergence`: `crash-split` (exactly one decoder hit a
+crash/abort failure outcome while the other did not — the high-value TWINFUZZ
+signal), `signal-split` (both failed but with different outcomes, e.g. SIGSEGV
+vs SIGABRT), or `agree`. Timeout is deliberately excluded from the failure set,
+so clean-vs-timeout is not a divergence but crash-vs-timeout is. `engine.py`
+gained a `DiffResult` dataclass, an async `_run_diff_iteration` / `diff_async`,
+and a synchronous `diff_file` wrapper that writes `diff.jsonl` (one record per
+iteration) and, for each divergence, `divergences/<hash>.h265` plus a
+side-by-side `<hash>.txt` stderr report of both decoders. The `mangle diff`
+subcommand was added to `cli.py` (`--left-decoder` / `--right-decoder`, which
+must differ; the engine raises `ValueError` on identical decoders). Mutator
+selection is `--seed-rng`-seeded and reproducible. Tests in
+`tests/test_decoder.py` (`TestRunDecoderPair`, 7 cases + 2 decoder-label cases)
+cover agree/crash-split/signal-split classification and the timeout edge cases;
+tests in `tests/test_engine.py` (`TestDiffFile` + `TestDiffCli`, 6 cases) cover
+`diff.jsonl` schema, divergence-artifact writing, the side-by-side report, the
+identical-decoder rejection, reproducible mutator selection, and the CLI path.
+README documents the subcommand under "Differential decoder oracle". 15 new
+tests (350 → 365).
 
 **What:** Add a `mangle diff` subcommand that runs the same mutant through two
 decoders (e.g., ffmpeg and libde265) and reports whether they disagree on the
@@ -708,7 +732,7 @@ already recorded by the item #11 parser extension).
 | 3 | sei-buffering-overflow | SEI HRD / timing payloads | Integer overflow | ~160 | ✅ DONE |
 | 4 | corpus builder | Seed diversity | Coverage breadth | ~140 | ✅ DONE |
 | 5 | sps-chroma-format / sps-bit-depth | Sample buffer sizing | Buffer underflow | ~100 | ✅ DONE |
-| 6 | Differential oracle | Cross-decoder divergence | Silent corruption | ~120 | MEDIUM |
+| 6 | Differential oracle | Cross-decoder divergence | Silent corruption | ~120 | ✅ DONE |
 | 7 | AFL harness | Coverage feedback | Throughput | ~200 | MEDIUM |
 | 8 | Crash triage | Dedup / disclosure | Operational | ~180 | ✅ DONE |
 | 9 | pps-slice-qp | QP arithmetic / transform-skip | Integer overflow | ~80 | ✅ DONE |

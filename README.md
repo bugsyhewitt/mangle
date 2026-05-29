@@ -107,6 +107,52 @@ This runs 100 mutate+decode cycles in parallel and writes:
 - `/tmp/fuzz-out/crashes/<hash>.h265` — the mutant for any crash (segfault or
   non-zero decoder exit), alongside `<hash>.txt` containing the decoder's stderr.
 
+### Differential decoder oracle
+
+```bash
+mangle diff \
+  --seed tests/fixtures/clean.h265 \
+  --output-dir /tmp/diff-out \
+  --iterations 100 \
+  --left-decoder ffmpeg \
+  --right-decoder libde265 \
+  --timeout 5
+```
+
+A crash-only campaign (`mangle fuzz`) only catches inputs that make *one*
+decoder fall over. It is blind to the larger class of bugs where two decoders
+*disagree* on a malformed input — one crashes while the other silently accepts
+and decodes it. Those disagreements are exactly the silent spec violations that
+differential testing surfaces (TWINFUZZ, NDSS 2025): the silent-acceptor is
+often the more dangerous target, because it decodes attacker-controlled garbage
+without complaint.
+
+`mangle diff` feeds every mutant through **two** decoders and records each
+iteration's verdict. The two decoders must differ (`--left-decoder` ≠
+`--right-decoder`). A **divergence** is recorded when they disagree on the crash
+class:
+
+- **`crash-split`** — exactly one decoder crashed/aborted while the other did
+  not. The high-value signal: one decoder is vulnerable to an input the other
+  tolerates.
+- **`signal-split`** — both decoders failed, but with different outcomes (e.g.
+  one `crash` via SIGSEGV, one `abort` via SIGABRT). A weaker but still
+  actionable disagreement.
+
+A timeout is *not* treated as a crash-class failure, so a clean-vs-timeout pair
+does not count as a divergence (but crash-vs-timeout does). Outputs:
+
+- `/tmp/diff-out/diff.jsonl` — one JSON object per iteration: the mutator, both
+  decoders' outcomes and return codes, whether it diverged, and the divergence
+  kind.
+- `/tmp/diff-out/divergences/<hash>.h265` — the mutant for any divergence,
+  alongside `<hash>.txt` holding a side-by-side report of **both** decoders'
+  outcome, return code, and stderr, so the artifact alone explains why it was
+  kept.
+
+The mutator selection is seeded by `--seed-rng` and is fully reproducible.
+Divergence artifacts feed directly into `mangle triage` for clustering.
+
 ### Build a seed corpus
 
 ```bash

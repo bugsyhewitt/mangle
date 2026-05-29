@@ -34,6 +34,7 @@ class DecodeResult:
     outcome: Outcome
     returncode: int | None
     stderr: str
+    decoder: str | None = None
 
 
 # Signals that indicate a hard crash vs. an intentional abort.
@@ -91,7 +92,9 @@ def run_decoder(
         stderr = exc.stderr or b""
         if isinstance(stderr, str):
             stderr = stderr.encode()
-        return DecodeResult(Outcome.TIMEOUT, None, stderr.decode("utf-8", "replace"))
+        return DecodeResult(
+            Outcome.TIMEOUT, None, stderr.decode("utf-8", "replace"), decoder=decoder
+        )
     except FileNotFoundError as exc:
         raise RuntimeError(
             f"decoder '{decoder}' not found on PATH ({cmd[0]}). "
@@ -103,4 +106,69 @@ def run_decoder(
         stderr_text = stderr_bytes
     else:
         stderr_text = stderr_bytes.decode("utf-8", "replace")
-    return DecodeResult(classify(proc.returncode), proc.returncode, stderr_text)
+    return DecodeResult(
+        classify(proc.returncode), proc.returncode, stderr_text, decoder=decoder
+    )
+
+
+# Outcomes that count as a "crash-class" failure when comparing two decoders.
+# A divergence is reported when one decoder lands in this set and the other does
+# not (a crash/clean split), or when both crash with different signals.
+_FAILURE_OUTCOMES = {Outcome.CRASH, Outcome.ABORT}
+
+
+@dataclass
+class DivergenceResult:
+    """The result of running one mutant through two decoders.
+
+    ``diverged`` is True when the two decoders disagree on the *crash class* of
+    the input — the TWINFUZZ (NDSS 2025) signal: one decoder crashes/aborts while
+    the other decodes cleanly (or times out), exposing a silent spec violation
+    that a single-decoder crash-only campaign would miss.
+    """
+
+    diverged: bool
+    kind: str
+    left: DecodeResult
+    right: DecodeResult
+
+
+def _classify_divergence(left: DecodeResult, right: DecodeResult) -> tuple[bool, str]:
+    """Decide whether two DecodeResults represent a divergence.
+
+    Returns ``(diverged, kind)``. ``kind`` is a short, stable label:
+
+    - ``"agree"`` — both decoders agree on the crash class (no divergence).
+    - ``"crash-split"`` — exactly one decoder hit a failure outcome
+      (crash/abort) while the other did not. The highest-value signal: one
+      decoder is vulnerable to an input the other tolerates.
+    - ``"signal-split"`` — both decoders failed but with different outcomes
+      (e.g. one SIGSEGV crash, one SIGABRT). Weaker but still a divergence.
+    """
+    left_failed = left.outcome in _FAILURE_OUTCOMES
+    right_failed = right.outcome in _FAILURE_OUTCOMES
+
+    if left_failed != right_failed:
+        return True, "crash-split"
+    if left_failed and right_failed and left.outcome != right.outcome:
+        return True, "signal-split"
+    return False, "agree"
+
+
+def run_decoder_pair(
+    left_decoder: str,
+    right_decoder: str,
+    path: str,
+    timeout: float,
+    runner=subprocess.run,
+) -> DivergenceResult:
+    """Run one mutant through two decoders and report whether they disagree.
+
+    Each decoder is invoked independently via :func:`run_decoder`; the two
+    results are compared with :func:`_classify_divergence`. ``runner`` is
+    injectable so tests can drive the pair without ffmpeg/libde265 installed.
+    """
+    left = run_decoder(left_decoder, path, timeout, runner=runner)
+    right = run_decoder(right_decoder, path, timeout, runner=runner)
+    diverged, kind = _classify_divergence(left, right)
+    return DivergenceResult(diverged=diverged, kind=kind, left=left, right=right)
