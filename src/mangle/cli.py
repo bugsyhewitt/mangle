@@ -70,7 +70,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="run many mutations against a decoder and record outcomes",
         description="Run many mutations against a decoder and record outcomes.",
     )
-    p_fuzz.add_argument("--seed", required=True, help="path to the seed H.265 file")
+    fuzz_seed_src = p_fuzz.add_mutually_exclusive_group(required=True)
+    fuzz_seed_src.add_argument(
+        "--seed", help="path to the seed H.265 file (single-seed campaign)"
+    )
+    fuzz_seed_src.add_argument(
+        "--seed-from-crashes",
+        help=(
+            "directory of a PRIOR campaign's crash artifacts (its crashes/ "
+            "directory of *.h265 files). Each crash becomes a base seed for this "
+            "campaign — the fuzzing feedback loop: re-mutate a crashing input to "
+            "explore the decoder state around it. Iterations are spread across the "
+            "crash pool round-robin; mutually exclusive with --seed"
+        ),
+    )
     p_fuzz.add_argument(
         "--output-dir", required=True, help="directory for results.jsonl and crashes/"
     )
@@ -330,8 +343,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_replay.add_argument(
         "--seed",
-        required=True,
-        help="path to the ORIGINAL seed H.265 file the campaign fuzzed",
+        help=(
+            "path to the ORIGINAL seed H.265 file the campaign fuzzed "
+            "(single-seed campaigns)"
+        ),
+    )
+    p_replay.add_argument(
+        "--seed-dir",
+        help=(
+            "directory of base seeds for a --seed-from-crashes campaign (the prior "
+            "campaign's crashes/ directory); replay resolves each iteration's "
+            "recorded base seed from here"
+        ),
     )
     p_replay.add_argument(
         "--output-dir",
@@ -411,13 +434,21 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         mutators=args.mutators,
         concurrency=args.concurrency,
         strategy=args.strategy,
+        seed_from_crashes=args.seed_from_crashes,
     )
     counts = Counter(r.outcome for r in results)
     crashes = [r for r in results if r.crash_hash]
-    print(
-        f"ran {len(results)} iterations against {args.decoder} "
-        f"({args.strategy} scheduler)"
-    )
+    if args.seed_from_crashes:
+        n_seeds = len({r.base_seed for r in results if r.base_seed is not None})
+        print(
+            f"ran {len(results)} iterations against {args.decoder} "
+            f"({args.strategy} scheduler), fed from {n_seeds} crash seed(s)"
+        )
+    else:
+        print(
+            f"ran {len(results)} iterations against {args.decoder} "
+            f"({args.strategy} scheduler)"
+        )
     for outcome in ("clean", "crash", "abort", "timeout", "hang"):
         if counts.get(outcome):
             print(f"  {outcome}: {counts[outcome]}")
@@ -554,6 +585,7 @@ def _cmd_replay(args: argparse.Namespace) -> int:
         output_dir=args.output_dir,
         iteration=args.iteration,
         out_path=args.output,
+        seed_dir=args.seed_dir,
     )
     print(
         f"replayed iteration {result.iteration}: [{result.mutator}] "

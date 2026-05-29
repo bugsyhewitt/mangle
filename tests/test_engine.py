@@ -178,7 +178,8 @@ class TestAdaptiveFuzz:
         real_run_iteration = engine._run_iteration
 
         async def fake_run_iteration(
-            i, sd, mutator_name, iter_rng_seed, decoder, timeout, crashes_dir, sem
+            i, sd, mutator_name, iter_rng_seed, decoder, timeout, crashes_dir, sem,
+            base_seed=None,
         ):
             from mangle.engine import IterationResult
 
@@ -195,6 +196,7 @@ class TestAdaptiveFuzz:
                 bytes_changed=result.bytes_changed,
                 detail=result.detail,
                 crash_hash=("deadbeef" if crashed else None),
+                base_seed=base_seed,
             )
 
         monkeypatch.setattr(engine, "_run_iteration", fake_run_iteration)
@@ -213,6 +215,203 @@ class TestAdaptiveFuzz:
         un_share = sum(1 for r in uniform if r.mutator == crash_mutator) / 400
         # Adaptive must over-select the crasher relative to uniform.
         assert ad_share > un_share
+
+
+class TestSeedFromCrashes:
+    def test_rejects_seed_and_crashes_together(self, tmp_path):
+        import pytest
+
+        with pytest.raises(ValueError, match="exactly one base-input source"):
+            engine.fuzz_file(
+                SEED,
+                tmp_path / "out",
+                iterations=2,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_from_crashes=str(tmp_path / "crashes"),
+            )
+
+    def test_rejects_no_seed_source(self, tmp_path):
+        import pytest
+
+        with pytest.raises(ValueError, match="requires --seed or"):
+            engine.fuzz_file(
+                None,
+                tmp_path / "out",
+                iterations=2,
+                decoder="ffmpeg",
+                timeout=5.0,
+            )
+
+    def test_missing_crash_dir(self, tmp_path):
+        import pytest
+
+        with pytest.raises(FileNotFoundError, match="no such crash directory"):
+            engine.fuzz_file(
+                None,
+                tmp_path / "out",
+                iterations=2,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_from_crashes=str(tmp_path / "nope"),
+            )
+
+    def test_empty_crash_dir(self, tmp_path):
+        import pytest
+
+        crashes = tmp_path / "crashes"
+        crashes.mkdir()
+        with pytest.raises(ValueError, match="no .* crash artifacts"):
+            engine.fuzz_file(
+                None,
+                tmp_path / "out",
+                iterations=2,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_from_crashes=str(crashes),
+            )
+
+    def _make_crash_pool(self, tmp_path, n=3):
+        """Write n valid H.265 crash-artifact seeds from the fixture seed."""
+        crashes = tmp_path / "prior-crashes"
+        crashes.mkdir()
+        base = SEED.read_bytes()
+        names = []
+        for k in range(n):
+            # Each "crash seed" is a distinct deterministic mutant of the fixture
+            # so the pool has varied (but valid-framed) base inputs.
+            from mangle.engine import mutate_bytes
+            import random as _random
+
+            mutated, _ = mutate_bytes(base, "sps-dimensions", _random.Random(k))
+            name = f"{k:016x}.h265"
+            (crashes / name).write_bytes(mutated)
+            names.append(name)
+        # A non-h265 file must be ignored by the pool collector.
+        (crashes / "deadbeef.txt").write_text("stderr noise")
+        return crashes, sorted(names)
+
+    def test_records_base_seed_round_robin(self, tmp_path, monkeypatch):
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        crashes, names = self._make_crash_pool(tmp_path, n=3)
+        out_dir = tmp_path / "out"
+        results = engine.fuzz_file(
+            None,
+            out_dir,
+            iterations=9,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            seed_from_crashes=str(crashes),
+        )
+        # Every iteration records a base seed drawn from the pool, round-robin by
+        # iteration index (deterministic, independent of completion order).
+        base_seeds = [r.base_seed for r in results]
+        assert all(b in names for b in base_seeds)
+        assert base_seeds == [names[i % 3] for i in range(9)]
+        # results.jsonl carries base_seed for replayability.
+        first = json.loads(
+            (out_dir / "results.jsonl").read_text().strip().splitlines()[0]
+        )
+        assert first["base_seed"] in names
+
+    def test_single_seed_base_seed_is_none(self, tmp_path, monkeypatch):
+        # The v0.1 single-seed path records base_seed=None (backward compatible).
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        out_dir = tmp_path / "out"
+        results = engine.fuzz_file(
+            SEED, out_dir, iterations=5, decoder="ffmpeg", timeout=5.0, seed_rng=1
+        )
+        assert all(r.base_seed is None for r in results)
+
+    def test_single_seed_rng_stream_unchanged(self, tmp_path, monkeypatch):
+        # Criterion 7 guard: introducing the seed pool must NOT perturb the v0.1
+        # mutator/seed_rng stream for a single-seed campaign.
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        results = engine.fuzz_file(
+            SEED, tmp_path / "a", iterations=12, decoder="ffmpeg",
+            timeout=5.0, seed_rng=99,
+        )
+        # Re-run independently; identical mutator + seed_rng per iteration.
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        again = engine.fuzz_file(
+            SEED, tmp_path / "b", iterations=12, decoder="ffmpeg",
+            timeout=5.0, seed_rng=99,
+        )
+        assert [(r.mutator, r.seed_rng) for r in results] == [
+            (r.mutator, r.seed_rng) for r in again
+        ]
+
+    def test_crash_fed_campaign_is_reproducible(self, tmp_path, monkeypatch):
+        crashes, _ = self._make_crash_pool(tmp_path, n=2)
+
+        def content_outcome(decoder, path, timeout, runner=None):
+            data = Path(path).read_bytes()
+            if sum(data) % 3 == 0:
+                return DecodeResult(Outcome.CRASH, -signal.SIGSEGV, "boom")
+            return DecodeResult(Outcome.CLEAN, 0, "")
+
+        monkeypatch.setattr(engine, "run_decoder", content_outcome)
+        a = engine.fuzz_file(
+            None, tmp_path / "a", iterations=16, decoder="ffmpeg",
+            timeout=5.0, seed_rng=5, seed_from_crashes=str(crashes),
+        )
+        b = engine.fuzz_file(
+            None, tmp_path / "b", iterations=16, decoder="ffmpeg",
+            timeout=5.0, seed_rng=5, seed_from_crashes=str(crashes),
+        )
+        assert [(r.mutator, r.seed_rng, r.base_seed) for r in a] == [
+            (r.mutator, r.seed_rng, r.base_seed) for r in b
+        ]
+
+
+class TestSeedFromCrashesCli:
+    def test_cli_rejects_both_sources(self, tmp_path):
+        import pytest
+
+        with pytest.raises(SystemExit):
+            main(
+                [
+                    "fuzz",
+                    "--seed",
+                    str(SEED),
+                    "--seed-from-crashes",
+                    str(tmp_path),
+                    "--output-dir",
+                    str(tmp_path / "out"),
+                ]
+            )
+
+    def test_cli_requires_a_source(self, tmp_path):
+        import pytest
+
+        with pytest.raises(SystemExit):
+            main(["fuzz", "--output-dir", str(tmp_path / "out")])
+
+    def test_cli_runs_from_crashes(self, tmp_path, monkeypatch, capsys):
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        crashes = tmp_path / "crashes"
+        crashes.mkdir()
+        (crashes / "aa.h265").write_bytes(SEED.read_bytes())
+        (crashes / "bb.h265").write_bytes(SEED.read_bytes())
+        out_dir = tmp_path / "out"
+        rc = main(
+            [
+                "fuzz",
+                "--seed-from-crashes",
+                str(crashes),
+                "--output-dir",
+                str(out_dir),
+                "--iterations",
+                "6",
+                "--seed-rng",
+                "3",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "crash seed(s)" in out
+        assert (out_dir / "results.jsonl").exists()
 
 
 def _patch_pair(monkeypatch, pair_for):
