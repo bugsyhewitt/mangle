@@ -335,6 +335,19 @@ class VideoParameterSet:
     Parses the VPS RBSP (H.265 §7.3.2.1) through the first 16 bits of fixed-
     width fields that control per-layer loop bounds and temporal-nesting
     validation in both software and hardware decoders.
+
+    When the VPS parses cleanly past ``profile_tier_level``, the sub-layer DPB
+    ordering loop and the layer-set inclusion loop, the parser additionally
+    records the ``vps_timing_info_present_flag`` gate (H.265 §7.3.2.1). That
+    single u(1) flag gates the variable-length ``vps_timing_info`` sub-block —
+    ``vps_num_units_in_tick`` u(32), ``vps_time_scale`` u(32),
+    ``vps_poc_proportional_to_timing_flag``, an optional
+    ``vps_num_ticks_poc_diff_one_minus1`` ue(v), and a ``vps_num_hrd_parameters``
+    ue(v) loop of ``hrd_parameters()`` structures. It is the VPS analogue of the
+    SPS ``vui_timing_info_present_flag`` / HRD gates and the target of the
+    ``vps-timing-info`` mutator. ``vps_timing_info_present_flag`` is ``None`` when
+    the parser could not reach it (multi-layer / multi-sub-layer geometry it does
+    not model, or a truncated VPS).
     """
 
     vps_id: int
@@ -342,12 +355,18 @@ class VideoParameterSet:
     vps_max_sub_layers_minus1: int
     vps_temporal_id_nesting_flag: int
     spans: list[FieldSpan] = field(default_factory=list)
+    # VPS timing-info gate (None if the parser did not reach it). Single u(1) bit
+    # gating the variable-length vps_timing_info sub-block.
+    vps_timing_info_present_flag: int | None = None
 
     def span(self, name: str) -> FieldSpan:
         for s in self.spans:
             if s.name == name:
                 return s
         raise KeyError(name)
+
+    def has_span(self, name: str) -> bool:
+        return any(s.name == name for s in self.spans)
 
 
 def parse_vps(rbsp: bytes) -> VideoParameterSet:
@@ -387,13 +406,47 @@ def parse_vps(rbsp: bytes) -> VideoParameterSet:
         FieldSpan("vps_temporal_id_nesting_flag", nesting_off, 1, nesting_flag)
     )
 
-    return VideoParameterSet(
+    vps = VideoParameterSet(
         vps_id=vps_id,
         vps_max_layers_minus1=max_layers,
         vps_max_sub_layers_minus1=max_sub_layers,
         vps_temporal_id_nesting_flag=nesting_flag,
         spans=spans,
     )
+
+    # Second stage: walk past the fixed-width header, profile_tier_level, the
+    # sub-layer DPB ordering loop and the layer-set inclusion loop to reach the
+    # vps_timing_info_present_flag gate (H.265 §7.3.2.1). Any parse error here
+    # (e.g. geometry we do not model, or a truncated VPS) leaves the gate unset
+    # but keeps the layer/sublayer view; the field stays None.
+    try:
+        reader.read_bits(16)  # vps_reserved_0xffff_16bits
+        _parse_profile_tier_level(reader, max_sub_layers)
+
+        sub_layer_ordering = reader.read_bit()  # vps_sub_layer_ordering_info_present_flag
+        start = 0 if sub_layer_ordering else max_sub_layers
+        for _ in range(start, max_sub_layers + 1):
+            reader.read_ue()  # vps_max_dec_pic_buffering_minus1[i]
+            reader.read_ue()  # vps_max_num_reorder_pics[i]
+            reader.read_ue()  # vps_max_latency_increase_plus1[i]
+
+        max_layer_id = reader.read_bits(6)  # vps_max_layer_id
+        num_layer_sets = reader.read_ue()  # vps_num_layer_sets_minus1
+        for _ in range(1, num_layer_sets + 1):
+            for _ in range(0, max_layer_id + 1):
+                reader.read_bit()  # layer_id_included_flag[i][j]
+
+        timing_off = reader.bit_position
+        timing_present = reader.read_bit()  # vps_timing_info_present_flag
+        vps.vps_timing_info_present_flag = timing_present
+        vps.spans.append(
+            FieldSpan("vps_timing_info_present_flag", timing_off, 1, timing_present)
+        )
+    except (EOFError, ValueError):
+        # Leave the timing gate unset; the layer/sublayer view stands.
+        pass
+
+    return vps
 
 
 def parse_sps(rbsp: bytes) -> SeqParameterSet:
