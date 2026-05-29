@@ -103,7 +103,9 @@ This runs 100 mutate+decode cycles in parallel and writes:
 
 - `/tmp/fuzz-out/results.jsonl` — one JSON object per iteration recording the
   mutator used, the outcome (`clean` / `crash` / `timeout` / `abort` / `hang`),
-  the decoder return code, and the mutation detail.
+  the decoder return code, the mutation detail, and `base_seed` (the base input
+  the iteration mutated — `null` for a single-`--seed` campaign, or the crash
+  artifact's filename for a `--seed-from-crashes` campaign; see below).
 - `/tmp/fuzz-out/crashes/<hash>.h265` — the mutant for any crash (segfault or
   non-zero decoder exit), alongside `<hash>.txt` containing the decoder's stderr.
 
@@ -143,6 +145,38 @@ one extra artifact:
 
 Both strategies are fully deterministic for a given `--seed-rng` (the uniform
 path's mutator/seed RNG stream is byte-identical to earlier mangle releases).
+
+#### Crash feedback loop (`--seed-from-crashes`)
+
+The adaptive scheduler closes the loop on *which mutator* to spend budget on.
+`--seed-from-crashes` closes a second loop — *which base input* to mutate.
+Instead of fuzzing one `--seed`, point a new campaign at a previous campaign's
+`crashes/` directory and every crash artifact becomes a base seed for the new
+run:
+
+```bash
+# 1. an initial campaign produces /tmp/fuzz-out/crashes/
+mangle fuzz --seed tests/fixtures/clean.h265 --output-dir /tmp/fuzz-out --iterations 1000
+
+# 2. re-fuzz around those crashes — the feedback loop
+mangle fuzz \
+  --seed-from-crashes /tmp/fuzz-out/crashes \
+  --output-dir /tmp/fuzz-loop \
+  --iterations 2000
+```
+
+`--seed` and `--seed-from-crashes` are mutually exclusive — a campaign has
+exactly one base-input source. A crashing mutant is a *deeper* input than the
+original seed: it already drove the decoder off the spec-compliant path, so
+re-mutating it explores the decoder state immediately around a known fault
+(the classic AFL crash-corpus-reinjection step). The crash artifacts (`*.h265`)
+are gathered into a base-seed pool, sorted by filename for determinism, and
+iterations are assigned across the pool round-robin by iteration index. Each
+iteration records the `base_seed` it mutated in `results.jsonl`, so a
+crash-fed campaign stays exactly as replayable as a single-seed one — see
+[Replay any iteration's mutant](#replay-any-iterations-mutant) for the
+`--seed-dir` form replay uses to resolve those base seeds. Fully deterministic
+for a given `--seed-rng`.
 
 ### Differential decoder oracle
 
@@ -368,6 +402,24 @@ they crash/abort. The clean, timeout, and hang iterations are never saved. Repla
 reconstructs those from metadata alone, so you can recover a timeout/hang input
 the campaign discarded, or hand a colleague a one-line recipe (`--seed` +
 iteration number) instead of a binary blob.
+
+For a campaign fuzzed with `--seed-from-crashes`, each iteration mutated a
+*different* base input (a specific crash artifact from the prior campaign's
+pool), so there is no single `--seed` to re-apply. Replay records the base
+artifact's filename in each row's `base_seed` column; pass `--seed-dir` (the
+prior campaign's `crashes/` directory) instead of `--seed` and replay resolves
+the right base seed per iteration automatically:
+
+```bash
+mangle replay \
+  --seed-dir /tmp/fuzz-out/crashes \
+  --output-dir /tmp/fuzz-loop \
+  --iteration 73 \
+  --output /tmp/iter-73.h265
+```
+
+`--seed` and `--seed-dir` mirror the `fuzz` side: use `--seed` to replay a
+single-seed campaign, `--seed-dir` to replay a `--seed-from-crashes` one.
 
 When the iteration *was* a crash, replay cross-checks the re-derived bytes
 against the saved `crashes/<hash>.h265` artifact — a reproducibility / tamper

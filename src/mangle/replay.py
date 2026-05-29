@@ -46,6 +46,11 @@ class ReplayRecord:
     seed_rng: int
     outcome: str
     crash_hash: str | None
+    # The base seed the iteration mutated. ``None`` for a single-``--seed``
+    # campaign (mutate the file passed to replay's --seed). A basename for a
+    # ``--seed-from-crashes`` campaign — replay must resolve that file from a
+    # base-seed directory rather than from --seed.
+    base_seed: str | None = None
 
 
 @dataclass
@@ -89,6 +94,7 @@ def load_results(output_dir: str | Path) -> list[ReplayRecord]:
                     seed_rng=row["seed_rng"],
                     outcome=row["outcome"],
                     crash_hash=row.get("crash_hash"),
+                    base_seed=row.get("base_seed"),
                 )
             )
     return records
@@ -122,23 +128,60 @@ def replay_record(seed_data: bytes, record: ReplayRecord) -> bytes:
     return mutated
 
 
+def resolve_seed_bytes(
+    record: ReplayRecord,
+    seed_path: str | Path | None,
+    seed_dir: str | Path | None,
+) -> bytes:
+    """Read the base-seed bytes the recorded iteration mutated.
+
+    For a single-``--seed`` campaign (``record.base_seed is None``) the base is
+    the file at ``seed_path``. For a ``--seed-from-crashes`` campaign the base is
+    ``<seed_dir>/<record.base_seed>`` — the specific crash artifact that
+    iteration mutated, resolved from the prior campaign's seed directory.
+    """
+    if record.base_seed is not None:
+        if seed_dir is None:
+            raise ValueError(
+                f"iteration {record.iteration} was fuzzed from a crash seed "
+                f"('{record.base_seed}'); replay needs --seed-dir pointing at the "
+                "directory of base seeds (e.g. the prior campaign's crashes/)"
+            )
+        seed_file = Path(seed_dir) / record.base_seed
+        if not seed_file.exists():
+            raise FileNotFoundError(
+                f"base seed '{record.base_seed}' for iteration {record.iteration} "
+                f"not found in --seed-dir {seed_dir}"
+            )
+        return seed_file.read_bytes()
+    if seed_path is None:
+        raise ValueError(
+            f"iteration {record.iteration} is a single-seed iteration; replay "
+            "needs --seed pointing at the original seed file"
+        )
+    return Path(seed_path).read_bytes()
+
+
 def replay_iteration(
-    seed_path: str | Path,
+    seed_path: str | Path | None,
     output_dir: str | Path,
     iteration: int,
     out_path: str | Path,
+    seed_dir: str | Path | None = None,
 ) -> ReplayResult:
     """Reconstruct one iteration's mutant from the campaign metadata.
 
     Reads ``<output_dir>/results.jsonl`` to find ``iteration``, re-derives the
-    mutant from the original ``seed_path`` and the recorded ``(mutator,
-    seed_rng)``, and writes it to ``out_path``. When the iteration was a crash,
-    cross-checks the re-derived bytes against the saved ``crashes/`` artifact.
+    mutant from its recorded base seed and ``(mutator, seed_rng)``, and writes it
+    to ``out_path``. The base seed is the file at ``seed_path`` for a single-seed
+    campaign, or ``<seed_dir>/<base_seed>`` for a ``--seed-from-crashes``
+    campaign. When the iteration was a crash, cross-checks the re-derived bytes
+    against the saved ``crashes/`` artifact.
     """
-    seed_data = Path(seed_path).read_bytes()
     records = load_results(output_dir)
     record = find_record(records, iteration)
 
+    seed_data = resolve_seed_bytes(record, seed_path, seed_dir)
     mutated = replay_record(seed_data, record)
     mutant_sha256 = hashlib.sha256(mutated).hexdigest()
 

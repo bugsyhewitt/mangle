@@ -201,6 +201,98 @@ class TestVerificationGuard:
 
 
 # ---------------------------------------------------------------------------
+# replay of a --seed-from-crashes campaign (multi base-seed pool)
+# ---------------------------------------------------------------------------
+
+
+def _make_crash_pool(tmp_path, n=3):
+    """Write n valid H.265 base seeds (a prior campaign's crashes/ dir)."""
+    from mangle.engine import mutate_bytes
+    import random as _random
+
+    crashes = tmp_path / "prior-crashes"
+    crashes.mkdir()
+    base = SEED.read_bytes()
+    names = []
+    for k in range(n):
+        mutated, _ = mutate_bytes(base, "sps-dimensions", _random.Random(k))
+        name = f"{k:016x}.h265"
+        (crashes / name).write_bytes(mutated)
+        names.append(name)
+    return crashes, sorted(names)
+
+
+class TestReplaySeedFromCrashes:
+    def test_records_carry_base_seed(self, tmp_path, monkeypatch):
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        pool, names = _make_crash_pool(tmp_path)
+        out_dir = tmp_path / "out"
+        engine.fuzz_file(
+            None, out_dir, iterations=9, decoder="ffmpeg", timeout=5.0,
+            seed_rng=1, seed_from_crashes=str(pool),
+        )
+        records = load_results(out_dir)
+        assert all(r.base_seed in names for r in records)
+
+    def test_replay_resolves_base_seed_from_dir(self, tmp_path, monkeypatch):
+        # Replay a crash-fed campaign by pointing --seed-dir at the base-seed pool.
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        pool, _ = _make_crash_pool(tmp_path)
+        out_dir = tmp_path / "out"
+        engine.fuzz_file(
+            None, out_dir, iterations=9, decoder="ffmpeg", timeout=5.0,
+            seed_rng=1, seed_from_crashes=str(pool),
+        )
+        # Reconstruct each iteration and confirm it matches the engine's own
+        # re-derivation from the correct base seed.
+        for rec in load_results(out_dir):
+            out = tmp_path / f"m{rec.iteration}.h265"
+            res = replay_iteration(
+                None, out_dir, rec.iteration, out, seed_dir=str(pool)
+            )
+            base_bytes = (pool / rec.base_seed).read_bytes()
+            assert out.read_bytes() == replay_record(base_bytes, rec)
+            assert res.bytes_written == len(out.read_bytes())
+
+    def test_replay_without_seed_dir_errors(self, tmp_path, monkeypatch):
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        pool, _ = _make_crash_pool(tmp_path)
+        out_dir = tmp_path / "out"
+        engine.fuzz_file(
+            None, out_dir, iterations=3, decoder="ffmpeg", timeout=5.0,
+            seed_rng=1, seed_from_crashes=str(pool),
+        )
+        with pytest.raises(ValueError, match="--seed-dir"):
+            replay_iteration(None, out_dir, 0, tmp_path / "x.h265")
+
+    def test_cli_replays_crash_fed_campaign(self, tmp_path, monkeypatch, capsys):
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        pool, _ = _make_crash_pool(tmp_path)
+        out_dir = tmp_path / "out"
+        engine.fuzz_file(
+            None, out_dir, iterations=6, decoder="ffmpeg", timeout=5.0,
+            seed_rng=2, seed_from_crashes=str(pool),
+        )
+        out = tmp_path / "cli.h265"
+        rc = main(
+            [
+                "replay",
+                "--seed-dir",
+                str(pool),
+                "--output-dir",
+                str(out_dir),
+                "--iteration",
+                "0",
+                "--output",
+                str(out),
+            ]
+        )
+        assert rc == 0
+        assert "replayed iteration 0" in capsys.readouterr().out
+        assert out.exists()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

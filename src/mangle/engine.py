@@ -69,6 +69,34 @@ class IterationResult:
     bytes_changed: int
     detail: str
     crash_hash: str | None = None
+    # The base seed this iteration mutated. ``None`` for a single-``--seed``
+    # campaign (the v0.1 shape — the seed is implicit in --seed). For a
+    # crash-fed campaign (--seed-from-crashes) it is the basename of the crash
+    # artifact used as the base seed, so the iteration stays fully replayable.
+    base_seed: str | None = None
+
+
+def _collect_crash_seeds(crashes_dir: str | Path) -> list[tuple[str, bytes]]:
+    """Return ``(basename, bytes)`` for every crash artifact in a directory.
+
+    Reads the ``<hash>.h265`` mutants a previous campaign wrote under its
+    ``crashes/`` directory and returns them sorted by basename so the resulting
+    seed pool — and therefore every per-iteration seed assignment derived from
+    it — is deterministic regardless of filesystem listing order.
+    """
+    d = Path(crashes_dir)
+    if not d.is_dir():
+        raise FileNotFoundError(
+            f"no such crash directory: {crashes_dir} "
+            "(expected a previous campaign's crashes/ directory of *.h265 artifacts)"
+        )
+    files = sorted(d.glob("*.h265"), key=lambda p: p.name)
+    seeds = [(p.name, p.read_bytes()) for p in files]
+    if not seeds:
+        raise ValueError(
+            f"no *.h265 crash artifacts found in {crashes_dir} — nothing to seed from"
+        )
+    return seeds
 
 
 async def _run_iteration(
@@ -80,6 +108,7 @@ async def _run_iteration(
     timeout: float,
     crashes_dir: Path,
     semaphore: asyncio.Semaphore,
+    base_seed: str | None = None,
 ) -> IterationResult:
     rng = random.Random(iter_rng_seed)
     mutated, result = mutate_bytes(seed_data, mutator_name, rng)
@@ -112,6 +141,7 @@ async def _run_iteration(
         bytes_changed=result.bytes_changed,
         detail=result.detail,
         crash_hash=crash_hash,
+        base_seed=base_seed,
     )
 
 
@@ -121,7 +151,7 @@ _REWARD_OUTCOMES = {Outcome.CRASH.value, Outcome.ABORT.value}
 
 
 async def fuzz_async(
-    seed_path: str | Path,
+    seed_path: str | Path | None,
     output_dir: str | Path,
     iterations: int,
     decoder: str,
@@ -130,27 +160,57 @@ async def fuzz_async(
     mutators: list[str] | None,
     concurrency: int,
     strategy: str = "uniform",
+    seed_from_crashes: str | Path | None = None,
 ) -> list[IterationResult]:
     """Run ``iterations`` mutate+decode cycles and record outcomes.
 
     Writes per-iteration outcomes to ``<output_dir>/results.jsonl`` and crash
     artifacts under ``<output_dir>/crashes/``.
 
+    The base input each iteration mutates comes from one of two mutually
+    exclusive sources:
+
+    - ``seed_path`` (the v0.1 shape): a single seed file. Every iteration mutates
+      it; ``base_seed`` is recorded as ``None``.
+    - ``seed_from_crashes``: a previous campaign's ``crashes/`` directory. The
+      crash artifacts (``<hash>.h265``) become the base-seed pool, closing the
+      fuzzing feedback loop — a crash is re-mutated to explore the state around
+      it. Iterations are assigned across the pool round-robin (deterministic), and
+      each iteration records the basename of the crash artifact it mutated so the
+      run stays fully replayable.
+
     ``strategy`` selects the mutator-scheduling policy:
 
     - ``"uniform"`` (default): every mutator is equally likely on every
       iteration. All iterations are dispatched at once and run in parallel up to
-      ``concurrency``. The RNG draw stream is unchanged from v0.1, so a campaign's
-      mutator/seed sequence is byte-identical to before.
+      ``concurrency``. With a single seed the RNG draw stream is unchanged from
+      v0.1, so a campaign's mutator/seed sequence is byte-identical to before.
     - ``"adaptive"``: an outcome-feedback bandit biases selection toward mutators
       that have produced crashes/aborts. Iterations run in rounds of
       ``concurrency`` so each round's verdicts update the scheduler before the
       next round is selected. Still fully deterministic for a given ``seed_rng``.
     """
-    seed_data = Path(seed_path).read_bytes()
+    if seed_from_crashes is not None and seed_path is not None:
+        raise ValueError(
+            "fuzz takes exactly one base-input source: --seed OR "
+            "--seed-from-crashes, not both"
+        )
+    if seed_from_crashes is None and seed_path is None:
+        raise ValueError("fuzz requires --seed or --seed-from-crashes")
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     crashes_dir = out_dir / "crashes"
+
+    # Build the base-seed pool: either one (--seed) or many (--seed-from-crashes).
+    # ``seed_pool`` is a list of (basename | None, bytes); a None basename marks
+    # the single-seed v0.1 case so its results record base_seed=None.
+    if seed_from_crashes is not None:
+        seed_pool: list[tuple[str | None, bytes]] = list(
+            _collect_crash_seeds(seed_from_crashes)
+        )
+    else:
+        seed_pool = [(None, Path(seed_path).read_bytes())]
 
     from .mutators import list_mutators
 
@@ -159,6 +219,13 @@ async def fuzz_async(
     scheduler = make_scheduler(strategy, mutator_pool)
     semaphore = asyncio.Semaphore(concurrency)
 
+    def _seed_for(i: int) -> tuple[str | None, bytes]:
+        # Round-robin over the pool by iteration index — a pure function of i, so
+        # the assignment is deterministic and independent of decode completion
+        # order. For a single seed this is always element 0, so the v0.1 RNG draw
+        # stream (mutator pick + iter seed) is unchanged.
+        return seed_pool[i % len(seed_pool)]
+
     if strategy == "uniform":
         # Single-shot dispatch preserves the exact v0.1 RNG stream and the full
         # parallelism of one big asyncio.gather.
@@ -166,6 +233,7 @@ async def fuzz_async(
         for i in range(iterations):
             mutator_name = scheduler.select(base_rng)
             iter_rng_seed = base_rng.randrange(2**32)
+            base_name, seed_data = _seed_for(i)
             tasks.append(
                 _run_iteration(
                     i,
@@ -176,6 +244,7 @@ async def fuzz_async(
                     timeout,
                     crashes_dir,
                     semaphore,
+                    base_seed=base_name,
                 )
             )
         results = await asyncio.gather(*tasks)
@@ -192,6 +261,7 @@ async def fuzz_async(
             for j in range(count):
                 mutator_name = scheduler.select(base_rng)
                 iter_rng_seed = base_rng.randrange(2**32)
+                base_name, seed_data = _seed_for(start + j)
                 picks.append(mutator_name)
                 round_tasks.append(
                     _run_iteration(
@@ -203,6 +273,7 @@ async def fuzz_async(
                         timeout,
                         crashes_dir,
                         semaphore,
+                        base_seed=base_name,
                     )
                 )
             round_results = await asyncio.gather(*round_tasks)
@@ -232,7 +303,7 @@ async def fuzz_async(
 
 
 def fuzz_file(
-    seed_path: str | Path,
+    seed_path: str | Path | None,
     output_dir: str | Path,
     iterations: int,
     decoder: str,
@@ -241,6 +312,7 @@ def fuzz_file(
     mutators: list[str] | None = None,
     concurrency: int = 4,
     strategy: str = "uniform",
+    seed_from_crashes: str | Path | None = None,
 ) -> list[IterationResult]:
     """Synchronous wrapper around :func:`fuzz_async`."""
     return asyncio.run(
@@ -254,6 +326,7 @@ def fuzz_file(
             mutators,
             concurrency,
             strategy,
+            seed_from_crashes,
         )
     )
 
