@@ -210,6 +210,95 @@ def pps_deblocking(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     )
 
 
+@register("pps-deblocking-control-gate")
+def pps_deblocking_control_gate(
+    nals: list[NalUnit], rng: random.Random
+) -> MutationResult:
+    """Flip the PPS ``deblocking_filter_control_present_flag`` gate on.
+
+    ``deblocking_filter_control_present_flag`` (H.265 §7.3.2.3) sits immediately
+    after ``pps_loop_filter_across_slices_enabled_flag`` in the PPS and gates the
+    whole deblocking-filter control sub-block that follows. When it is 1, the spec
+    requires the decoder to read, right there in the PPS:
+
+      * ``deblocking_filter_override_enabled_flag`` — u(1).
+      * ``pps_deblocking_filter_disabled_flag`` — u(1).
+      * and, when disable is 0, ``pps_beta_offset_div2`` / ``pps_tc_offset_div2`` —
+        se(v) each (H.265 §7.3.2.3).
+
+    This is the *gate* the existing ``pps-deblocking`` mutator reads to decide its
+    menu but never flips: ``pps-deblocking`` mutates the override / disable / beta /
+    tc / loop-filter-scope fields *behind* the gate when the seed already has the
+    gate on, whereas this mutator targets the gate bit itself. Flipping it from 0 to
+    1 without the dependent override / disable / offset syntax actually present makes
+    the decoder read ``deblocking_filter_override_enabled_flag`` and the disable flag
+    (and possibly two se(v) offsets) out of the bits that really hold
+    ``pps_scaling_list_data_present_flag``, ``lists_modification_present_flag``,
+    ``log2_parallel_merge_level_minus2`` and the slice-header / extension gates that
+    follow — desynchronising the entire PPS tail. The decoder then derives its
+    deblocking-filter state, and the gates it reads after, from garbage.
+
+    **Why now / why this field:** CVE-2026-33164 (libde265 <1.0.17) crashes in
+    ``set_derived_values()`` on a malformed PPS, and the deblocking control fields
+    sit in that same derive path. R18 suggested ``deblocking_filter_control_present_
+    flag`` and ``deblocking_filter_override_enabled_flag`` as the next PPS gap.
+    ``deblocking_filter_override_enabled_flag`` is only *present in the bitstream*
+    when the control gate is already on (it lives inside the ``if (control_present)``
+    block), so on the bundled seed — whose control gate is off — it does not exist to
+    flip; the override flag is therefore not the reachable gate. The control-present
+    gate *is* reachable for any untiled PPS (the parser records it whenever it reaches
+    the loop-filter scope flag), and flipping it on is the one deblocking-region
+    mutation no existing mutator performs. It is the natural deblocking-side analogue
+    of the established "claims data that isn't there" gate-on desync used by
+    ``pps-extension-flags``, ``pps-slice-header-extension``, ``pps-lists-modification``,
+    ``sps-vui-hrd``, ``sps-rext-flags`` and ``vps-timing-info``.
+
+    The gate is reached for any untiled, non-truncated PPS. The mutator only fires
+    when the seed currently has the gate *off*; if the PPS did not parse to the gate,
+    or the gate is already on (its dependent sub-block is genuinely present, so
+    flipping it off would be a different, length-changing mutation outside the
+    gate-on desync family), it raises so the engine picks another mutator.
+
+    [Worker decision: gate-flip splice keeps the PPS byte-stable]
+    The target is a single u(1) bit, so the splice never shifts the stream's
+    bit-length — only the one gate bit changes and the downstream desync is purely
+    semantic, matching the established gate-flag mutators.
+    """
+    out = _clone(nals)
+    idx = _first(out, 34)  # PPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    pps = parse_pps(rbsp)
+
+    if not pps.has_span("deblocking_filter_control_present_flag"):
+        raise ValueError(
+            "PPS did not parse to deblocking_filter_control_present_flag (tiles "
+            "enabled or truncated PPS); cannot mutate the deblocking control gate"
+        )
+    span = pps.span("deblocking_filter_control_present_flag")
+    if span.value != 0:
+        raise ValueError(
+            "deblocking_filter_control_present_flag is already set; the gate-on "
+            "desync needs an off gate"
+        )
+
+    new_value = 1  # turn the gate on; the dependent deblocking sub-block is absent
+    new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="pps-deblocking-control-gate",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=(
+            "deblocking_filter_control_present_flag: 0 -> 1 (PPS deblocking-control "
+            "gate enabled without its override/disable/offset sub-block; the decoder "
+            "reads the deblocking fields out of the PPS tail and desyncs every "
+            "following gate)"
+        ),
+    )
+
+
 @register("pps-extension-flags")
 def pps_extension_flags(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     """Flip a PPS extension gate flag to desynchronise the PPS tail.

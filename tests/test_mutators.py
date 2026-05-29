@@ -2102,3 +2102,211 @@ class TestPpsListsModificationMutator:
             pass
         else:
             raise AssertionError("expected ValueError for a tiled PPS")
+
+
+def _control_on_pps_stream() -> list[NalUnit]:
+    """A VPS+SPS+PPS stream whose PPS has deblocking_filter_control_present_flag=1.
+
+    The control gate is on with an explicit (default) override/disable/offset
+    sub-block present, so the deblocking-control-gate mutator must treat it as an
+    already-on gate and raise.
+    """
+    from mangle.bitstream import BitWriter
+
+    w = BitWriter()
+    w.write_ue(0)  # pps_pic_parameter_set_id
+    w.write_ue(0)  # pps_seq_parameter_set_id
+    w.write_bit(0)  # dependent_slice_segments_enabled_flag
+    w.write_bit(0)  # output_flag_present_flag
+    w.write_bits(0, 3)  # num_extra_slice_header_bits
+    w.write_bit(0)  # sign_data_hiding_enabled_flag
+    w.write_bit(0)  # cabac_init_present_flag
+    w.write_ue(0)  # num_ref_idx_l0_default_active_minus1
+    w.write_ue(0)  # num_ref_idx_l1_default_active_minus1
+    w.write_se(0)  # init_qp_minus26
+    w.write_bit(0)  # constrained_intra_pred_flag
+    w.write_bit(0)  # transform_skip_enabled_flag
+    w.write_bit(0)  # cu_qp_delta_enabled_flag
+    w.write_se(0)  # pps_cb_qp_offset
+    w.write_se(0)  # pps_cr_qp_offset
+    w.write_bit(0)  # pps_slice_chroma_qp_offsets_present_flag
+    w.write_bit(0)  # weighted_pred_flag
+    w.write_bit(0)  # weighted_bipred_flag
+    w.write_bit(0)  # transquant_bypass_enabled_flag
+    w.write_bit(0)  # tiles_enabled_flag
+    w.write_bit(0)  # entropy_coding_sync_enabled_flag
+    w.write_bit(1)  # pps_loop_filter_across_slices_enabled_flag
+    w.write_bit(1)  # deblocking_filter_control_present_flag = 1
+    w.write_bit(0)  # deblocking_filter_override_enabled_flag
+    w.write_bit(0)  # pps_deblocking_filter_disabled_flag
+    w.write_se(0)  # pps_beta_offset_div2
+    w.write_se(0)  # pps_tc_offset_div2
+    w.write_bit(0)  # pps_scaling_list_data_present_flag
+    w.write_bit(0)  # lists_modification_present_flag
+    w.write_ue(0)  # log2_parallel_merge_level_minus2
+    w.write_bit(0)  # slice_segment_header_extension_present_flag
+    w.write_bit(0)  # pps_extension_present_flag
+    w.write_bit(1)  # rbsp_stop_one_bit
+    rbsp = w.to_bytes()
+
+    seed = _seed_nals()
+    sps = next(n for n in seed if n.nal_unit_type == 33)
+    pps_header = bytes([(34 << 1), 0x01])
+    pps_nal = NalUnit(4, 0, pps_header + rbsp_to_ebsp(rbsp))
+    vps_header = bytes([(32 << 1), 0x01])
+    return [
+        NalUnit(4, 0, vps_header + b"\x80"),
+        NalUnit(4, 0, sps.ebsp),
+        pps_nal,
+    ]
+
+
+class TestPpsDeblockingControlGateRegistered:
+    def test_present(self):
+        assert "pps-deblocking-control-gate" in list_mutators()
+
+    def test_reproducible(self):
+        r1 = get_mutator("pps-deblocking-control-gate")(_seed_nals(), random.Random(7))
+        r2 = get_mutator("pps-deblocking-control-gate")(_seed_nals(), random.Random(7))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.detail == r2.detail
+
+    def test_result_name(self):
+        result = get_mutator("pps-deblocking-control-gate")(
+            _seed_nals(), random.Random(0)
+        )
+        assert result.mutator == "pps-deblocking-control-gate"
+
+
+class TestPpsDeblockingControlGateMutator:
+    def test_changes_bytes_on_seed(self):
+        original = SEED.read_bytes()
+        result = get_mutator("pps-deblocking-control-gate")(
+            _seed_nals(), random.Random(0)
+        )
+        mutated = assemble_nal_units(result.nals)
+        assert mutated != original
+        assert result.bytes_changed > 0
+        assert result.detail
+
+    def test_gate_is_flipped_on(self):
+        result = get_mutator("pps-deblocking-control-gate")(
+            _seed_nals(), random.Random(3)
+        )
+        pps = _reparse_pps(result.nals)
+        assert pps.deblocking_filter_control_present_flag == 1
+
+    def test_detail_names_the_gate(self):
+        result = get_mutator("pps-deblocking-control-gate")(
+            _seed_nals(), random.Random(0)
+        )
+        assert "deblocking_filter_control_present_flag" in result.detail
+
+    def test_changes_only_pps(self):
+        original = _seed_nals()
+        result = get_mutator("pps-deblocking-control-gate")(
+            _seed_nals(), random.Random(0)
+        )
+        for orig, mut in zip(original, result.nals):
+            if orig.nal_unit_type == 34:
+                continue
+            assert orig.ebsp == mut.ebsp, "non-PPS NAL modified"
+
+    def test_single_bit_change_preserves_length(self):
+        original = assemble_nal_units(_seed_nals())
+        result = get_mutator("pps-deblocking-control-gate")(
+            _seed_nals(), random.Random(3)
+        )
+        mutated = assemble_nal_units(result.nals)
+        assert len(mutated) == len(original)
+        assert result.bytes_changed >= 1
+
+    def test_neighbouring_loop_filter_flag_untouched(self):
+        # Flipping the control gate must not disturb the neighbouring
+        # pps_loop_filter_across_slices_enabled_flag that precedes it.
+        original_pps = _reparse_pps(_seed_nals())
+        result = get_mutator("pps-deblocking-control-gate")(
+            _seed_nals(), random.Random(5)
+        )
+        mutated_pps = _reparse_pps(result.nals)
+        assert (
+            mutated_pps.pps_loop_filter_across_slices_enabled_flag
+            == original_pps.pps_loop_filter_across_slices_enabled_flag
+        )
+
+    def test_framing_integrity(self):
+        result = get_mutator("pps-deblocking-control-gate")(
+            _seed_nals(), random.Random(1)
+        )
+        mutated = assemble_nal_units(result.nals)
+        assert mutated[:4] == START_CODE_LONG or mutated[:3] == START_CODE_SHORT
+        assert len(split_nal_units(mutated)) == len(_seed_nals())
+
+    def test_double_application_raises(self):
+        # After the first flip the gate is on; a second application must raise,
+        # since the gate-on desync needs an off gate.
+        first = get_mutator("pps-deblocking-control-gate")(
+            _seed_nals(), random.Random(1)
+        )
+        try:
+            get_mutator("pps-deblocking-control-gate")(first.nals, random.Random(1))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError when the gate is already on")
+
+    def test_raises_when_gate_already_on(self):
+        # A PPS whose control gate is genuinely set (with its sub-block present)
+        # offers no off gate.
+        stream = _control_on_pps_stream()
+        try:
+            get_mutator("pps-deblocking-control-gate")(stream, random.Random(0))
+        except ValueError as exc:
+            assert "already" in str(exc).lower() or "off gate" in str(exc).lower()
+        else:
+            raise AssertionError("expected ValueError when gate already on")
+
+    def test_tiles_enabled_pps_raises(self):
+        # A tiled PPS never reaches the deblocking control gate, so the mutator
+        # must raise so the engine can pick another.
+        from mangle.bitstream import BitWriter
+
+        w = BitWriter()
+        w.write_ue(0)  # pps_pic_parameter_set_id
+        w.write_ue(0)  # pps_seq_parameter_set_id
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bits(0, 3)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_ue(0)
+        w.write_ue(0)
+        w.write_se(0)  # init_qp_minus26
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_se(0)
+        w.write_se(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(1)  # tiles_enabled_flag = 1
+        w.write_bit(0)
+        w.write_bit(1)  # rbsp_stop_one_bit (truncated; tile geometry not modelled)
+        tiled_rbsp = w.to_bytes()
+        sps = next(n for n in _seed_nals() if n.nal_unit_type == 33)
+        pps_header = bytes([(34 << 1), 0x01])
+        pps_nal = NalUnit(4, 0, pps_header + rbsp_to_ebsp(tiled_rbsp))
+        vps_header = bytes([(32 << 1), 0x01])
+        nals = [
+            NalUnit(4, 0, vps_header + b"\x80"),
+            NalUnit(4, 0, sps.ebsp),
+            pps_nal,
+        ]
+        try:
+            get_mutator("pps-deblocking-control-gate")(nals, random.Random(0))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for a tiled PPS")
