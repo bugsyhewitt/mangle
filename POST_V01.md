@@ -66,7 +66,18 @@ forks.
 
 ---
 
-## 2. VPS (Video Parameter Set) mutator
+## 2. VPS (Video Parameter Set) mutator — ✅ IMPLEMENTED (2026-05-28)
+
+**Status:** Shipped. `parse_vps()` and the `VideoParameterSet` dataclass in
+`hevc.py` parse the VPS RBSP (H.265 §7.3.2.1) through the first 16 fixed-width bits,
+recording spans for `vps_max_layers_minus1` (6 bits), `vps_max_sub_layers_minus1`
+(3 bits), and `vps_temporal_id_nesting_flag` (1 bit). The `vps-layer-count` mutator
+in `builtin.py` picks one of three branches per invocation: push
+`vps_max_layers_minus1` to 63/127 (overflowing `HEVC_MAX_LAYERS = 63`), push
+`vps_max_sub_layers_minus1` to 7 (out of spec range [0, 6]), or flip
+`vps_temporal_id_nesting_flag` while clamping `vps_max_sub_layers_minus1` to 0 (a
+spec violation). Tests in `tests/test_vps.py` cover the parser spans, all three
+mutation branches, single-NAL containment, reproducibility, and framing integrity.
 
 **What:** Parse the VPS NAL (type 32) up to and including `vps_max_layers_minus1`
 and `vps_max_sub_layers_minus1`, then mutate those fields to out-of-spec values.
@@ -100,7 +111,14 @@ touches the VPS at all.
 
 ---
 
-## 3. SEI message mutators (buffering period + pic timing)
+## 3. SEI message mutators (buffering period + pic timing) — ✅ IMPLEMENTED (2026-05-28)
+
+**Status:** Shipped. `parse_sei()` in `hevc.py` walks the SEI NAL payload framing
+(H.265 §7.3.2.4) — the variable-length `payloadType` / `payloadSize` prefixes — into
+a list of `SeiMessage` records. The `sei-buffering-overflow` mutator in `builtin.py`
+targets the buffering-period (payloadType 0) and recovery-point (payloadType 6)
+payloads, pushing HRD-timing fields to overflow values and `recovery_poc_cnt` to a
+large negative se(v). Tests live in `tests/test_mutators.py` and `tests/test_hevc.py`.
 
 **What:** Parse the SEI NAL (type 39 / 40) payload dispatch table, locate
 `buffering_period` (payloadType 0) and `pic_timing` (payloadType 1) payloads, and
@@ -427,14 +445,64 @@ already reached the tile-config flags just before it, so the extension was low-c
 
 ---
 
+## 12. Slice-header DPB no-output mutator — ✅ IMPLEMENTED (2026-05-29)
+
+**Status:** Shipped. This is the first mutator to target a *slice-header* gate
+rather than a parameter set, opening the slice-side of the systematic bitstream
+walk. `parse_slice_header` in `hevc.py` now promotes the previously
+read-and-discarded `no_output_of_prior_pics_flag` (H.265 §7.3.6.1) to a tracked
+single-bit span — but only for IRAP NAL types [16, 23], the only slices that carry
+it; for non-IRAP slices the field is absent and the attribute is left `None`. One
+mutator, `slice-no-output-prior-pics`, was added to `builtin.py`; it locates the
+first IRAP VCL slice and flips the flag, inverting the decoder's decision to discard
+the DPB without outputting its pictures when a new coded-video-sequence begins. It
+raises `ValueError` on streams with no IRAP slice so the engine selects another
+mutator. Tests in `tests/test_hevc.py` (`TestSliceNoOutputPriorPicsParsing`, 6
+cases) cover the IRAP span, its position between the first-slice flag and the PPS id,
+the non-IRAP absence, a synthetic-value round-trip, the length-preserving splice, and
+the full IRAP NAL-type range; tests in `tests/test_mutators.py`
+(`TestSliceNoOutputPriorPicsRegistered` + `TestSliceNoOutputPriorPicsMutator`, 11
+cases) cover registration, reproducibility, the flag flip, length preservation,
+IRAP-only containment, framing integrity, double-application idempotence, and the
+no-IRAP-slice raise.
+
+**What:** Flip `no_output_of_prior_pics_flag` in an IRAP slice header. The flag
+controls whether the decoder discards the pictures already buffered in the DPB
+*without outputting them* when the IRAP begins a new coded-video-sequence:
+
+- `0 -> 1` forces the decoder to drop a full DPB of valid, not-yet-output pictures —
+  exercising the early DPB-flush path with live buffers.
+- `1 -> 0` forces the decoder to keep and attempt to output pictures whose POC and
+  reference state the new sequence has invalidated — exercising the DPB
+  bumping / output-reorder logic with stale entries.
+
+**Why now:** Both directions drive the same DPB output / flush machinery (the
+`bumping` process and the derived DPB sizing from `set_derived_values()`) that the
+CVE-2026-33164 crash family runs through. The flag is fully self-contained — located
+and rewritten with no SPS/PPS context — making it the cleanest first slice-header
+gate target. It is the slice-header complement to the parameter-set gate mutators
+(`sps-vui-hrd`, `sps-rext-flags`, `pps-extension-flags`).
+
+**Implementation notes:**
+
+- `parse_slice_header` already read `no_output_of_prior_pics_flag` and discarded it;
+  promoting it to a span is ~6 lines plus the dataclass field.
+- The mutator is a 1-bit `splice_fixed_bits` on the located span (length-preserving).
+- A `_first_irap_vcl` helper locates the first IRAP slice; the mutator raises when
+  none exists.
+
+**Estimated LOC:** ~75 (parser extension ~12 + mutator ~50 + helper ~10).
+
+---
+
 ## Summary table
 
 | # | Name | Attack surface | New CVE class | Cost (LOC) | Priority |
 |---|---|---|---|---|---|
 | 1 | rps-overflow / rps-lt-poc-ambiguity | RPS / DPB sizing | DPB OOB write | ~180 | ✅ DONE |
-| 2 | vps-layer-count | VPS layer/sublayer arrays | Array index OOB | ~90 | HIGH |
-| 3 | sei-hrd-timing | SEI HRD / timing payloads | Integer overflow | ~160 | HIGH |
-| 4 | corpus builder | Seed diversity | Coverage breadth | ~140 | HIGH |
+| 2 | vps-layer-count | VPS layer/sublayer arrays | Array index OOB | ~90 | ✅ DONE |
+| 3 | sei-buffering-overflow | SEI HRD / timing payloads | Integer overflow | ~160 | ✅ DONE |
+| 4 | corpus builder | Seed diversity | Coverage breadth | ~140 | ✅ DONE |
 | 5 | sps-chroma-format / sps-bit-depth | Sample buffer sizing | Buffer underflow | ~100 | ✅ DONE |
 | 6 | Differential oracle | Cross-decoder divergence | Silent corruption | ~120 | MEDIUM |
 | 7 | AFL harness | Coverage feedback | Throughput | ~200 | MEDIUM |
@@ -442,6 +510,7 @@ already reached the tile-config flags just before it, so the extension was low-c
 | 9 | pps-slice-qp | QP arithmetic / transform-skip | Integer overflow | ~80 | ✅ DONE |
 | 10 | nal-emulation-bytes | EBSP scanning | Parse confusion | ~70 | ✅ DONE |
 | 11 | pps-deblocking | PPS deblocking/loop-filter | OOB table lookup | ~110 | ✅ DONE |
+| 12 | slice-no-output-prior-pics | Slice-header DPB no-output | DPB flush/output desync | ~75 | ✅ DONE |
 
 ---
 
@@ -476,9 +545,13 @@ The four v0.1 mutators touch SPS dimensions, PPS tile flags, slice header PPS ID
 first-slice flag, and NAL type swaps. The following high-value HEVC syntax regions
 are entirely untouched:
 
-1. VPS (all fields)
-2. RPS block in SPS and slice header
-3. SEI NAL units (any payload type)
+1. VPS (all fields) — ✅ layer/sublayer/nesting gates covered by `vps-layer-count`
+   (item #2)
+2. RPS block in SPS and slice header — ✅ SPS short-term/long-term RPS covered by
+   `rps-overflow` / `rps-lt-poc-ambiguity` (item #1); the slice-header delta-RPS
+   syntax is not yet modelled.
+3. SEI NAL units (any payload type) — ✅ buffering-period / recovery-point payloads
+   covered by `sei-buffering-overflow` (item #3)
 4. Bit depth and chroma format SPS fields — ✅ covered (item #5)
 5. QP fields in PPS — ✅ covered (item #9)
 6. EMSP / EBSP byte-level malformation — ✅ covered (item #10)
@@ -514,5 +587,11 @@ are entirely untouched:
     `pps-extension-flags` mutator, which flips the PPS extension gate off→on without
     supplying the four PPS profile-extension flags / `pps_extension_4bits` / extension
     bodies they gate. The PPS extension bodies themselves are not synthesised.
+11. Slice-header gate flags — ✅ first slice-header gate covered. `parse_slice_header`
+    now promotes `no_output_of_prior_pics_flag` (H.265 §7.3.6.1) to a tracked span for
+    IRAP NAL types [16, 23]; the `slice-no-output-prior-pics` mutator flips it,
+    inverting the IRAP DPB no-output decision (item #12). The deeper slice-header
+    fields that need SPS/PPS context (`slice_segment_address`, the slice-level RPS,
+    `dependent_slice_segment_flag`) remain unmodelled.
 
 Items 1–6 above correspond directly to items 1–10 in the ranked list.

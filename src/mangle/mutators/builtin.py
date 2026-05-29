@@ -405,6 +405,73 @@ def slice_header_ref_pic_list(
     )
 
 
+def _first_irap_vcl(nals: list[NalUnit]) -> int:
+    """Index of the first IRAP VCL slice (NAL types [16, 23]).
+
+    IRAP slices are the only slices that carry ``no_output_of_prior_pics_flag``.
+    Raises ``ValueError`` when the stream has none.
+    """
+    for i, n in enumerate(nals):
+        if 16 <= n.nal_unit_type <= 23:
+            return i
+    raise ValueError("no IRAP VCL slice (NAL types 16..23) found in stream")
+
+
+@register("slice-no-output-prior-pics")
+def slice_no_output_prior_pics(
+    nals: list[NalUnit], rng: random.Random
+) -> MutationResult:
+    """Flip ``no_output_of_prior_pics_flag`` in an IRAP slice header.
+
+    ``no_output_of_prior_pics_flag`` (H.265 §7.3.6.1) appears only on IRAP slices
+    (NAL types [16, 23]). It tells the decoder whether to discard the pictures
+    already buffered in the DPB *without outputting them* when this IRAP begins a
+    new coded-video-sequence. Flipping it inverts that decision:
+
+      * 0 -> 1 forces the decoder to drop a full DPB of valid, not-yet-output
+        pictures — exercising the early DPB-flush path with live buffers.
+      * 1 -> 0 forces the decoder to *keep* and attempt to output pictures whose
+        POC / reference state the new CVS has invalidated — exercising the DPB
+        bumping / output-reorder logic with stale entries.
+
+    Both directions drive the same DPB output / flush machinery (``bumping``,
+    ``set_derived_values()`` derived DPB sizing) that the CVE-2026-33164 crash
+    family runs through, and the flag is fully self-contained: it is located and
+    rewritten with no SPS/PPS context. The 1-bit splice never changes the slice
+    length, so every other byte of the stream is preserved exactly.
+
+    Raises ``ValueError`` if the stream contains no IRAP slice (the engine then
+    picks a different mutator).
+    """
+    out = _clone(nals)
+    idx = _first_irap_vcl(out)
+    original_stream = assemble_nal_units(nals)
+    nal = out[idx]
+    rbsp = ebsp_to_rbsp(nal.ebsp[2:])
+    sh = parse_slice_header(rbsp, nal.nal_unit_type)
+
+    if not sh.has_span("no_output_of_prior_pics_flag"):
+        # Should not happen for an IRAP slice, but guard so the engine can retry.
+        raise ValueError("IRAP slice header did not expose no_output_of_prior_pics_flag")
+
+    span = sh.span("no_output_of_prior_pics_flag")
+    new_value = 1 - span.value
+    new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+    detail = (
+        f"no_output_of_prior_pics_flag: {span.value} -> {new_value} "
+        f"(IRAP NAL #{idx}, type {nal.nal_unit_type}; DPB flush/output inversion)"
+    )
+
+    out[idx] = _rewrite_payload(nal, new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="slice-no-output-prior-pics",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=detail,
+    )
+
+
 @register("nal-unit-type-swap")
 def nal_unit_type_swap(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     """Swap a NAL unit's nal_unit_type to an inconsistent type.

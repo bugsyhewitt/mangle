@@ -846,17 +846,32 @@ class SliceHeader:
     For v0.1 the slice-header mutator targets the ``first_slice_segment_in_pic``
     and ``slice_pic_parameter_set_id`` region plus the slice type, which together
     drive reference-picture-list interpretation. We expose those spans.
+
+    For IRAP slices (NAL types [16, 23]) the parser additionally records the
+    ``no_output_of_prior_pics_flag`` span. That single-bit flag, present only on
+    IRAP access units (H.265 §7.3.6.1), tells the decoder whether to *discard*
+    the pictures already in the DPB without outputting them when this IRAP starts
+    a new coded-video-sequence. It feeds the same DPB output / flush logic that
+    ``set_derived_values()`` and DPB-sizing drive (the crash family behind
+    CVE-2026-33164), and it is fully self-contained — it needs no SPS/PPS context
+    to locate or rewrite — which is why it is the clean slice-header gate target.
+    ``no_output_of_prior_pics_flag`` is ``None`` for non-IRAP slices.
     """
 
     first_slice_segment_in_pic_flag: int
     slice_pic_parameter_set_id: int
     spans: list[FieldSpan] = field(default_factory=list)
+    # Present only for IRAP NAL types [16, 23]; None otherwise.
+    no_output_of_prior_pics_flag: int | None = None
 
     def span(self, name: str) -> FieldSpan:
         for s in self.spans:
             if s.name == name:
                 return s
         raise KeyError(name)
+
+    def has_span(self, name: str) -> bool:
+        return any(s.name == name for s in self.spans)
 
 
 def parse_slice_header(rbsp: bytes, nal_unit_type: int) -> SliceHeader:
@@ -865,6 +880,11 @@ def parse_slice_header(rbsp: bytes, nal_unit_type: int) -> SliceHeader:
     ``rbsp`` is the slice payload without the NAL header, emulation bytes removed.
     We stop after ``slice_pic_parameter_set_id`` — deeper parsing requires SPS/PPS
     context we deliberately avoid for v0.1's structured-mutation scope.
+
+    For IRAP NAL types [16, 23] the ``no_output_of_prior_pics_flag`` that sits
+    between ``first_slice_segment_in_pic_flag`` and ``slice_pic_parameter_set_id``
+    is promoted to a tracked span (previously read and discarded) so a mutator can
+    flip the DPB no-output decision.
     """
     reader = BitReader(rbsp)
     spans: list[FieldSpan] = []
@@ -874,8 +894,13 @@ def parse_slice_header(rbsp: bytes, nal_unit_type: int) -> SliceHeader:
     spans.append(FieldSpan("first_slice_segment_in_pic_flag", first_off, 1, first_slice))
 
     # no_output_of_prior_pics_flag present for IRAP NAL types [16, 23].
+    no_output: int | None = None
     if 16 <= nal_unit_type <= 23:
-        reader.read_bit()
+        no_output_off = reader.bit_position
+        no_output = reader.read_bit()
+        spans.append(
+            FieldSpan("no_output_of_prior_pics_flag", no_output_off, 1, no_output)
+        )
 
     ppsid_off = reader.bit_position
     pps_id = reader.read_ue()
@@ -892,6 +917,7 @@ def parse_slice_header(rbsp: bytes, nal_unit_type: int) -> SliceHeader:
         first_slice_segment_in_pic_flag=first_slice,
         slice_pic_parameter_set_id=pps_id,
         spans=spans,
+        no_output_of_prior_pics_flag=no_output,
     )
 
 

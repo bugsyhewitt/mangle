@@ -662,3 +662,76 @@ class TestSliceParsing:
         span = sh.span("slice_pic_parameter_set_id")
         new_rbsp = splice_ue_field(rbsp, span, 5)
         assert parse_slice_header(new_rbsp, nal_type).slice_pic_parameter_set_id == 5
+
+
+def _build_slice_rbsp(
+    *,
+    first_slice: int = 1,
+    no_output: int = 0,
+    pps_id: int = 0,
+) -> bytes:
+    """Construct a minimal IRAP slice-header RBSP up to slice_pic_parameter_set_id.
+
+    The fields after pps_id require SPS/PPS context to parse, so we stop there and
+    byte-align — the parser does the same. Suitable for the IRAP NAL types [16, 23]
+    that carry ``no_output_of_prior_pics_flag``.
+    """
+    w = BitWriter()
+    w.write_bit(first_slice)  # first_slice_segment_in_pic_flag
+    w.write_bit(no_output)  # no_output_of_prior_pics_flag (IRAP only)
+    w.write_ue(pps_id)  # slice_pic_parameter_set_id
+    w.write_bit(1)  # rbsp_stop_one_bit (truncated; remainder not modelled)
+    return w.to_bytes()
+
+
+class TestSliceNoOutputPriorPicsParsing:
+    """parse_slice_header() coverage for no_output_of_prior_pics_flag (IRAP only)."""
+
+    def test_irap_slice_records_no_output_span(self):
+        # The seed's slice is an IDR_N_LP (type 20), an IRAP, so the flag is present.
+        rbsp, nal_type = _first_vcl_rbsp_and_type()
+        assert 16 <= nal_type <= 23
+        sh = parse_slice_header(rbsp, nal_type)
+        assert sh.no_output_of_prior_pics_flag in (0, 1)
+        assert sh.has_span("no_output_of_prior_pics_flag")
+        assert sh.span("no_output_of_prior_pics_flag").bit_length == 1
+
+    def test_no_output_span_sits_between_first_flag_and_pps_id(self):
+        rbsp, nal_type = _first_vcl_rbsp_and_type()
+        sh = parse_slice_header(rbsp, nal_type)
+        first_off = sh.span("first_slice_segment_in_pic_flag").bit_offset
+        no_out_off = sh.span("no_output_of_prior_pics_flag").bit_offset
+        ppsid_off = sh.span("slice_pic_parameter_set_id").bit_offset
+        assert first_off < no_out_off < ppsid_off
+
+    def test_non_irap_slice_has_no_no_output_field(self):
+        # A non-IRAP VCL type (e.g. TRAIL_R = 1) carries no no_output flag.
+        rbsp = _build_slice_rbsp(no_output=0)
+        sh = parse_slice_header(rbsp, 1)
+        assert sh.no_output_of_prior_pics_flag is None
+        assert not sh.has_span("no_output_of_prior_pics_flag")
+
+    def test_synthetic_irap_value_parsed(self):
+        for value in (0, 1):
+            rbsp = _build_slice_rbsp(no_output=value, pps_id=3)
+            sh = parse_slice_header(rbsp, 20)  # IDR_N_LP
+            assert sh.no_output_of_prior_pics_flag == value
+            assert sh.slice_pic_parameter_set_id == 3
+
+    def test_splice_no_output_round_trips_and_preserves_pps_id(self):
+        rbsp = _build_slice_rbsp(no_output=0, pps_id=7)
+        sh = parse_slice_header(rbsp, 19)  # IDR_W_RADL
+        span = sh.span("no_output_of_prior_pics_flag")
+        flipped = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1)
+        reparsed = parse_slice_header(flipped, 19)
+        assert reparsed.no_output_of_prior_pics_flag == 1
+        # The pps_id that follows the 1-bit field must be untouched.
+        assert reparsed.slice_pic_parameter_set_id == 7
+        # A single-bit splice never changes the byte length.
+        assert len(flipped) == len(rbsp)
+
+    def test_no_output_recorded_across_full_irap_range(self):
+        for nal_type in range(16, 24):
+            rbsp = _build_slice_rbsp(no_output=1)
+            sh = parse_slice_header(rbsp, nal_type)
+            assert sh.no_output_of_prior_pics_flag == 1
