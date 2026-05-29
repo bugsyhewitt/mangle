@@ -6,6 +6,7 @@ Subcommands:
   diff    - run mutants through two decoders and record where they disagree
   corpus  - generate a diverse minimal seed corpus from one seed file
   triage  - cluster and deduplicate the crashes from a fuzz run
+  reduce  - minimise one crashing input to its minimal NAL-unit reproducer
   mutators - list available mutator types
 """
 
@@ -19,6 +20,7 @@ from . import __version__
 from .corpus import build_corpus
 from .engine import diff_file, fuzz_file, mutate_file
 from .mutators import list_mutators
+from .reduce import reduce_file
 from .triage import triage
 
 
@@ -206,6 +208,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_triage.set_defaults(func=_cmd_triage)
 
+    # reduce
+    p_reduce = sub.add_parser(
+        "reduce",
+        help="minimise one crashing input to its minimal NAL-unit reproducer",
+        description=(
+            "Test-case minimiser (the afl-tmin / creduce step of a fuzzing "
+            "workflow). Given one confirmed crashing H.265 input, apply the "
+            "ddmin delta-debugging algorithm (Zeller & Hildebrandt, TSE 2002) "
+            "over its NAL units to find the smallest subset that still "
+            "reproduces the SAME crash. 'Same crash' is enforced by signature: "
+            "the candidate must hit the same ASAN-top-frame / normalised-stderr "
+            "fingerprint mangle triage uses, so the reducer never trades the "
+            "original bug for a different one. Writes the minimal reproducer to "
+            "--output. Deterministic."
+        ),
+    )
+    p_reduce.add_argument(
+        "--crash", required=True, help="path to the crashing H.265 input to minimise"
+    )
+    p_reduce.add_argument(
+        "--output", required=True, help="path to write the minimal reproducer"
+    )
+    p_reduce.add_argument(
+        "--decoder",
+        default="ffmpeg",
+        choices=["ffmpeg", "libde265"],
+        help="decoder the crash reproduces against",
+    )
+    p_reduce.add_argument(
+        "--timeout", type=float, default=5.0, help="per-decode wall-clock timeout (s)"
+    )
+    p_reduce.add_argument(
+        "--frame-depth",
+        type=int,
+        default=3,
+        help="number of top sanitizer stack frames used for the crash signature",
+    )
+    p_reduce.set_defaults(func=_cmd_reduce)
+
     # mutators
     p_list = sub.add_parser("mutators", help="list available mutator types")
     p_list.set_defaults(func=_cmd_list_mutators)
@@ -311,6 +352,31 @@ def _cmd_triage(args: argparse.Namespace) -> int:
         )
     print(f"triage written to {args.output_dir}/triage.jsonl")
     print(f"unique PoCs in {args.output_dir}/unique-crashes/")
+    return 0
+
+
+def _cmd_reduce(args: argparse.Namespace) -> int:
+    result = reduce_file(
+        crash_path=args.crash,
+        output_path=args.output,
+        decoder=args.decoder,
+        timeout=args.timeout,
+        frame_depth=args.frame_depth,
+    )
+    nal_drop = result.original_nals - result.minimal_nals
+    byte_drop = result.original_bytes - result.minimal_bytes
+    pct = (byte_drop / result.original_bytes * 100) if result.original_bytes else 0.0
+    print(
+        f"reduced {result.original_nals} -> {result.minimal_nals} NAL unit(s) "
+        f"({nal_drop} removed)"
+    )
+    print(
+        f"reduced {result.original_bytes} -> {result.minimal_bytes} bytes "
+        f"({byte_drop} removed, {pct:.1f}% smaller)"
+    )
+    print(f"crash signature preserved: {result.signature}")
+    print(f"decode probes: {result.probes}")
+    print(f"minimal reproducer written to {args.output}")
     return 0
 
 

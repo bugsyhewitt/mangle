@@ -226,6 +226,46 @@ The `--decoder` label is recorded in the cluster key (so a combined triage of tw
 campaigns keeps per-decoder buckets distinct). Triage makes **no changes** to the
 fuzzing pipeline and is fully deterministic.
 
+### Minimise a crash to its smallest reproducer
+
+```bash
+mangle reduce \
+  --crash /tmp/fuzz-out/unique-crashes/abc123.h265 \
+  --output /tmp/poc-minimal.h265
+```
+
+`triage` picks the smallest crashing mutant a campaign *happened* to produce; it
+does not shrink it. A mutant still carries the seed's full NAL framing (VPS, SPS,
+PPS, SEI, several slices) even when a single NAL unit is the load-bearing cause of
+the crash. `mangle reduce` is the `afl-tmin` / `creduce` step of the workflow: it
+finds the **minimal NAL-unit subset** that still reproduces the same bug — the
+reproducer you actually attach to a disclosure.
+
+Because mangle understands HEVC framing, reduction works at the **NAL-unit**
+granularity (not the raw-byte granularity a generic minimiser uses), applying the
+classic **ddmin** delta-debugging algorithm (Zeller & Hildebrandt, IEEE TSE 2002)
+over the NAL-unit list: try removing chunks (largest first), keep any removal that
+still crashes, and increase granularity until nothing more can be dropped.
+
+The "still crashes?" oracle is **signature-stable**: a candidate is kept only when
+the decoder hits the *same* crash signature (the same ASAN-top-frame /
+normalised-stderr fingerprint `mangle triage` uses). That stops the reducer from
+"succeeding" by swapping the original bug for a different crash — the classic
+failure mode of naive minimisers. `--decoder`, `--timeout`, and `--frame-depth`
+control the oracle exactly as in `triage` / `fuzz`. The reduction is deterministic
+and prints how many NAL units and bytes were removed:
+
+```text
+reduced 6 -> 2 NAL unit(s) (4 removed)
+reduced 812 -> 196 bytes (616 removed, 75.9% smaller)
+crash signature preserved: ff_hevc_decode_short_term_rps|hevc_parse_sps
+decode probes: 11
+minimal reproducer written to /tmp/poc-minimal.h265
+```
+
+The input must be a *confirmed* crash: if the decoder does not crash on it,
+`reduce` errors out rather than emitting a meaningless "minimal" file.
+
 ### List the available mutators
 
 ```bash
