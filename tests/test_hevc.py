@@ -28,6 +28,8 @@ def _build_pps_rbsp(
     tc: int = 0,
     init_qp: int = 0,
     transform_skip: int = 0,
+    scaling_list_present: int = 0,
+    pps_extension_present: int = 0,
 ) -> bytes:
     """Construct a minimal but spec-shaped PPS RBSP through the deblocking block.
 
@@ -64,11 +66,14 @@ def _build_pps_rbsp(
         if not disabled:
             w.write_se(beta)  # pps_beta_offset_div2
             w.write_se(tc)  # pps_tc_offset_div2
-    w.write_bit(0)  # pps_scaling_list_data_present_flag
+    w.write_bit(scaling_list_present)  # pps_scaling_list_data_present_flag
+    # When scaling_list_present is set the real scaling_list_data() body would
+    # follow; the parser stops at that gate (the body is not modelled), so the
+    # remaining flags below are only meaningful when the gate is off.
     w.write_bit(0)  # lists_modification_present_flag
     w.write_ue(0)  # log2_parallel_merge_level_minus2
     w.write_bit(0)  # slice_segment_header_extension_present_flag
-    w.write_bit(0)  # pps_extension_present_flag
+    w.write_bit(pps_extension_present)  # pps_extension_present_flag
     w.write_bit(1)  # rbsp_stop_one_bit
     return w.to_bytes()
 
@@ -573,6 +578,75 @@ class TestPpsQpParsing:
         assert reparsed.transform_skip_enabled_flag == 1
         assert reparsed.init_qp_minus26 == 0
         assert reparsed.pps_beta_offset_div2 == 1
+
+
+class TestPpsExtensionGateParsing:
+    def test_seed_reaches_both_extension_gates(self):
+        # The single-frame intra seed has no tiles and control-present off, so the
+        # parser walks the deblocking tail into the PPS extension gate region.
+        pps = parse_pps(_nal_rbsp(34))
+        assert pps.pps_scaling_list_data_present_flag in (0, 1)
+        assert pps.pps_extension_present_flag in (0, 1)
+        assert pps.has_span("pps_scaling_list_data_present_flag")
+        assert pps.has_span("pps_extension_present_flag")
+
+    def test_extension_gates_are_single_bits(self):
+        pps = parse_pps(_build_pps_rbsp())
+        assert pps.span("pps_scaling_list_data_present_flag").bit_length == 1
+        assert pps.span("pps_extension_present_flag").bit_length == 1
+
+    def test_extension_gates_follow_deblocking_region(self):
+        pps = parse_pps(_build_pps_rbsp())
+        names = [s.name for s in pps.spans]
+        assert names.index("deblocking_filter_control_present_flag") < names.index(
+            "pps_scaling_list_data_present_flag"
+        )
+        assert names.index("pps_scaling_list_data_present_flag") < names.index(
+            "pps_extension_present_flag"
+        )
+
+    def test_scaling_list_gate_on_blocks_extension_walk(self):
+        # When the scaling-list gate is set its variable-length body follows and is
+        # not modelled, so the parser must stop before pps_extension_present_flag.
+        rbsp = _build_pps_rbsp(scaling_list_present=1)
+        pps = parse_pps(rbsp)
+        assert pps.pps_scaling_list_data_present_flag == 1
+        assert pps.pps_extension_present_flag is None
+        assert not pps.has_span("pps_extension_present_flag")
+
+    def test_extension_present_gate_recorded_when_on(self):
+        rbsp = _build_pps_rbsp(pps_extension_present=1)
+        pps = parse_pps(rbsp)
+        assert pps.pps_extension_present_flag == 1
+
+    def test_tiles_enabled_leaves_extension_gates_unset(self):
+        rbsp = _build_pps_rbsp(tiles_enabled=1)
+        pps = parse_pps(rbsp)
+        assert pps.pps_scaling_list_data_present_flag is None
+        assert pps.pps_extension_present_flag is None
+        assert not pps.has_span("pps_scaling_list_data_present_flag")
+
+    def test_extension_gates_reached_after_full_deblocking_offsets(self):
+        # With control present and offsets present, the deblocking region is its
+        # longest form; the parser must still land on the extension gates after it.
+        rbsp = _build_pps_rbsp(ctl_present=1, disabled=0, beta=3, tc=-2)
+        pps = parse_pps(rbsp)
+        assert pps.has_span("pps_scaling_list_data_present_flag")
+        assert pps.has_span("pps_extension_present_flag")
+
+    def test_splice_scaling_list_gate_round_trips(self):
+        rbsp = _build_pps_rbsp(scaling_list_present=0)
+        pps = parse_pps(rbsp)
+        span = pps.span("pps_scaling_list_data_present_flag")
+        flipped = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1)
+        assert parse_pps(flipped).pps_scaling_list_data_present_flag == 1
+
+    def test_splice_extension_present_gate_round_trips(self):
+        rbsp = _build_pps_rbsp(pps_extension_present=0)
+        pps = parse_pps(rbsp)
+        span = pps.span("pps_extension_present_flag")
+        flipped = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1)
+        assert parse_pps(flipped).pps_extension_present_flag == 1
 
 
 class TestSliceParsing:

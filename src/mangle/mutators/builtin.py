@@ -210,6 +210,88 @@ def pps_deblocking(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     )
 
 
+@register("pps-extension-flags")
+def pps_extension_flags(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Flip a PPS extension gate flag to desynchronise the PPS tail.
+
+    Past the deblocking-filter control region the PPS (H.265 §7.3.2.1) carries two
+    single-bit gates, each of which promises a variable-length sub-block when set:
+
+      * ``pps_scaling_list_data_present_flag`` — when 1, a ``scaling_list_data()``
+        structure (H.265 §7.3.4) follows: a series of ue(v)/se(v)-coded
+        scaling-list coefficients whose length depends on the lists' sizes.
+      * ``pps_extension_present_flag`` — when 1, four PPS profile-extension flags
+        (``pps_range_extension_flag``, ``pps_multilayer_extension_flag``,
+        ``pps_3d_extension_flag``, ``pps_scc_extension_flag``) plus a 4-bit
+        ``pps_extension_4bits`` follow, then any enabled extension's body.
+
+    This is the PPS analogue of ``sps-rext-flags`` and addresses the PPS half of
+    gap-analysis item #8 (scaling lists) / item #10 (extension flags): both SPS
+    gates are already covered, but the PPS scaling-list and extension gates were
+    untouched. The mutator flips one gate the seed currently has *off* to *on*
+    without supplying the dependent sub-block. The decoder then reads
+    ``scaling_list_data()`` coefficients (or the extension flags and their bodies)
+    out of the PPS trailing bits — RBSP stop bits and whatever follows — forcing
+    it onto its scaling-list / profile-extension parse path with no valid data
+    behind the gate. Scaling-list parsing in particular walks DC-coefficient and
+    delta-coefficient loops sized by list dimensions, a region historically prone
+    to out-of-bounds reads when fed garbage.
+
+    Only gates the seed currently has off are offered: flipping a gate on is the
+    "claims data that isn't there" direction that desynchronises the tail without
+    being rejected as broken framing. ``pps_extension_present_flag`` is preferred
+    when reachable (it pulls the decoder through the most additional syntax). The
+    parser only reaches these gates for an untiled, non-truncated PPS — and the
+    extension-present gate is unreachable once the scaling-list gate is already on,
+    since its variable-length body is not walked. If neither off gate is present
+    the mutator raises so the engine picks another.
+
+    [Worker decision: gate-flip splice keeps the PPS byte-stable]
+    Each target is a single u(1) bit, so the splice never shifts the stream's
+    bit-length — only the one gate bit changes and the downstream desync is purely
+    semantic, matching the established gate-flag mutators (``sps-vui-hrd``,
+    ``sps-rext-flags``).
+    """
+    out = _clone(nals)
+    idx = _first(out, 34)  # PPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    pps = parse_pps(rbsp)
+
+    # Prefer the extension-present gate (pulls the decoder through the most
+    # additional unmodelled syntax), then the scaling-list gate.
+    gate_names = (
+        "pps_extension_present_flag",
+        "pps_scaling_list_data_present_flag",
+    )
+    candidates = [
+        name
+        for name in gate_names
+        if pps.has_span(name) and pps.span(name).value == 0
+    ]
+    if not candidates:
+        raise ValueError(
+            "PPS did not parse to a scaling-list / extension gate flag that is "
+            "currently off; cannot mutate PPS extension flags"
+        )
+
+    target = rng.choice(candidates)
+    span = pps.span(target)
+    new_value = 1  # turn the gate on; the dependent sub-block is absent
+    new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="pps-extension-flags",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=(
+            f"{target}: 0 -> 1 (PPS extension gate enabled without its dependent "
+            f"sub-block; downstream PPS-tail desync)"
+        ),
+    )
+
+
 @register("pps-slice-qp")
 def pps_slice_qp(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     """Corrupt the PPS quantization / transform-skip control fields.

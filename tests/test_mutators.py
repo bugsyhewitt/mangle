@@ -1517,3 +1517,201 @@ class TestSpsRextFlagsMutator:
             pass
         else:
             raise AssertionError("expected ValueError when extension unreachable")
+
+
+PPS_EXTENSION_MUTATORS = {"pps-extension-flags"}
+
+
+def _build_ext_pps_rbsp(
+    *, scaling_list_present: int = 0, pps_extension_present: int = 0
+) -> bytes:
+    """A minimal no-tiles PPS RBSP reaching the extension gate region.
+
+    ``scaling_list_present`` / ``pps_extension_present`` set the two gates so the
+    parse/mutate paths around an already-on gate can be exercised. When the
+    scaling-list gate is on its body is not modelled, so the parser stops there
+    and ``pps_extension_present`` is unreachable (matching the real parser).
+    """
+    from mangle.bitstream import BitWriter
+
+    w = BitWriter()
+    w.write_ue(0)  # pps_pic_parameter_set_id
+    w.write_ue(0)  # pps_seq_parameter_set_id
+    w.write_bit(0)  # dependent_slice_segments_enabled_flag
+    w.write_bit(0)  # output_flag_present_flag
+    w.write_bits(0, 3)  # num_extra_slice_header_bits
+    w.write_bit(0)  # sign_data_hiding_enabled_flag
+    w.write_bit(0)  # cabac_init_present_flag
+    w.write_ue(0)  # num_ref_idx_l0_default_active_minus1
+    w.write_ue(0)  # num_ref_idx_l1_default_active_minus1
+    w.write_se(0)  # init_qp_minus26
+    w.write_bit(0)  # constrained_intra_pred_flag
+    w.write_bit(0)  # transform_skip_enabled_flag
+    w.write_bit(0)  # cu_qp_delta_enabled_flag
+    w.write_se(0)  # pps_cb_qp_offset
+    w.write_se(0)  # pps_cr_qp_offset
+    w.write_bit(0)  # pps_slice_chroma_qp_offsets_present_flag
+    w.write_bit(0)  # weighted_pred_flag
+    w.write_bit(0)  # weighted_bipred_flag
+    w.write_bit(0)  # transquant_bypass_enabled_flag
+    w.write_bit(0)  # tiles_enabled_flag
+    w.write_bit(0)  # entropy_coding_sync_enabled_flag
+    w.write_bit(1)  # pps_loop_filter_across_slices_enabled_flag
+    w.write_bit(0)  # deblocking_filter_control_present_flag
+    w.write_bit(scaling_list_present)  # pps_scaling_list_data_present_flag
+    w.write_bit(0)  # lists_modification_present_flag
+    w.write_ue(0)  # log2_parallel_merge_level_minus2
+    w.write_bit(0)  # slice_segment_header_extension_present_flag
+    w.write_bit(pps_extension_present)  # pps_extension_present_flag
+    w.write_bit(1)  # rbsp_stop_one_bit
+    return w.to_bytes()
+
+
+def _ext_pps_stream(**kwargs) -> list[NalUnit]:
+    """A VPS+SPS+PPS stream whose PPS reaches the extension gate region."""
+    seed = _seed_nals()
+    sps = next(n for n in seed if n.nal_unit_type == 33)
+    pps_header = bytes([(34 << 1), 0x01])
+    pps_rbsp = _build_ext_pps_rbsp(**kwargs)
+    pps_nal = NalUnit(4, 0, pps_header + rbsp_to_ebsp(pps_rbsp))
+    vps_header = bytes([(32 << 1), 0x01])
+    return [
+        NalUnit(4, 0, vps_header + b"\x80"),
+        NalUnit(4, 0, sps.ebsp),
+        pps_nal,
+    ]
+
+
+class TestPpsExtensionFlagsRegistered:
+    def test_present(self):
+        assert PPS_EXTENSION_MUTATORS.issubset(set(list_mutators()))
+
+    def test_reproducible(self):
+        r1 = get_mutator("pps-extension-flags")(_seed_nals(), random.Random(7))
+        r2 = get_mutator("pps-extension-flags")(_seed_nals(), random.Random(7))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.detail == r2.detail
+
+    def test_result_name(self):
+        result = get_mutator("pps-extension-flags")(_seed_nals(), random.Random(0))
+        assert result.mutator == "pps-extension-flags"
+
+
+class TestPpsExtensionFlagsMutator:
+    def test_changes_bytes_on_seed(self):
+        original = SEED.read_bytes()
+        result = get_mutator("pps-extension-flags")(_seed_nals(), random.Random(0))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated != original
+        assert result.bytes_changed > 0
+        assert result.detail
+
+    def test_changes_only_pps(self):
+        original = _seed_nals()
+        result = get_mutator("pps-extension-flags")(_seed_nals(), random.Random(0))
+        for orig, mut in zip(original, result.nals):
+            if orig.nal_unit_type == 34:
+                continue
+            assert orig.ebsp == mut.ebsp, "non-PPS NAL modified"
+
+    def test_gate_is_flipped_on(self):
+        # Whichever gate the mutator names, it must re-parse as 1. (When the
+        # scaling-list gate is chosen its on-state hides the extension gate, so we
+        # only assert the chosen gate's value.)
+        for s in range(24):
+            result = get_mutator("pps-extension-flags")(_seed_nals(), random.Random(s))
+            pps = _reparse_pps(result.nals)
+            target = result.detail.split(":")[0]
+            assert pps.span(target).value == 1, (target, s)
+
+    def test_single_bit_change_preserves_length(self):
+        original = assemble_nal_units(_seed_nals())
+        result = get_mutator("pps-extension-flags")(_seed_nals(), random.Random(3))
+        mutated = assemble_nal_units(result.nals)
+        assert len(mutated) == len(original)
+        assert result.bytes_changed >= 1
+
+    def test_framing_integrity(self):
+        result = get_mutator("pps-extension-flags")(_seed_nals(), random.Random(1))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated[:4] == START_CODE_LONG or mutated[:3] == START_CODE_SHORT
+        assert len(split_nal_units(mutated)) == len(_seed_nals())
+
+    def test_seed_exposes_both_off_gates(self):
+        # The bundled seed has both gates off, so over many seeds the mutator must
+        # exercise both branches (extension is preferred but scaling can be picked).
+        targets = set()
+        for s in range(64):
+            result = get_mutator("pps-extension-flags")(_seed_nals(), random.Random(s))
+            targets.add(result.detail.split(":")[0])
+        assert targets == {
+            "pps_scaling_list_data_present_flag",
+            "pps_extension_present_flag",
+        }
+
+    def test_prefers_extension_gate_when_scaling_already_on(self):
+        # Scaling-list gate on hides the extension gate, but here we set scaling
+        # off and extension on: only the scaling gate is an off candidate, so it
+        # must be chosen.
+        stream = _ext_pps_stream(scaling_list_present=0, pps_extension_present=1)
+        for s in range(16):
+            r = get_mutator("pps-extension-flags")(stream, random.Random(s))
+            assert "pps_scaling_list_data_present_flag" in r.detail
+
+    def test_raises_when_no_off_gate_available(self):
+        # Scaling-list gate on → its body is unmodelled, the parser stops, and the
+        # only reachable gate is already on, so no off gate remains.
+        stream = _ext_pps_stream(scaling_list_present=1)
+        try:
+            get_mutator("pps-extension-flags")(stream, random.Random(0))
+        except ValueError as exc:
+            assert "extension" in str(exc).lower() or "scaling" in str(exc).lower()
+        else:
+            raise AssertionError("expected ValueError when no off-gate reachable")
+
+    def test_tiles_enabled_pps_raises(self):
+        # A tiled PPS never reaches the extension gates (variable tile geometry),
+        # so the mutator must raise so the engine can pick another.
+        nals = _deblocking_stream(ctl_present=0)
+        # Flip tiles on via the deblocking helper's stream by building a tiled PPS.
+        from mangle.bitstream import BitWriter
+
+        w = BitWriter()
+        w.write_ue(0)  # pps_pic_parameter_set_id
+        w.write_ue(0)  # pps_seq_parameter_set_id
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bits(0, 3)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_ue(0)
+        w.write_ue(0)
+        w.write_se(0)  # init_qp_minus26
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_se(0)
+        w.write_se(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(1)  # tiles_enabled_flag = 1
+        w.write_bit(0)
+        w.write_bit(1)  # rbsp_stop_one_bit (truncated; tiles geometry not modelled)
+        tiled_rbsp = w.to_bytes()
+        sps = next(n for n in _seed_nals() if n.nal_unit_type == 33)
+        pps_header = bytes([(34 << 1), 0x01])
+        pps_nal = NalUnit(4, 0, pps_header + rbsp_to_ebsp(tiled_rbsp))
+        vps_header = bytes([(32 << 1), 0x01])
+        nals = [
+            NalUnit(4, 0, vps_header + b"\x80"),
+            NalUnit(4, 0, sps.ebsp),
+            pps_nal,
+        ]
+        try:
+            get_mutator("pps-extension-flags")(nals, random.Random(0))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for a tiled PPS")

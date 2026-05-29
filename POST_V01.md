@@ -491,8 +491,14 @@ are entirely untouched:
    the decoder to read CPB/HRD fields out of unrelated downstream bits. The
    variable-length `hrd_parameters()` body itself is still not synthesised.
 8. Scaling lists (SPS/PPS) — ✅ SPS `scaling_list_enabled_flag` (and
-   `pcm_enabled_flag`) inconsistency covered by the `sps-feature-flags` mutator
-   (the variable-length `scaling_list_data()` body is still not synthesised)
+   `pcm_enabled_flag`) inconsistency covered by the `sps-feature-flags` mutator;
+   the PPS `pps_scaling_list_data_present_flag` gate is now covered by the
+   `pps-extension-flags` mutator (`parse_pps` walks past the deblocking region into
+   the PPS extension gate region, H.265 §7.3.2.1, recording the scaling-list gate;
+   the mutator flips it off→on without supplying the dependent `scaling_list_data()`
+   body, forcing the decoder to read scaling-list coefficients out of the PPS
+   trailing bits). The variable-length `scaling_list_data()` body itself is still
+   not synthesised.
 9. Deblocking filter parameters in PPS/slice header — ✅ PPS portion covered (item #11)
 10. HEVC range extensions (RExt) flags — ✅ covered. `parse_sps` now walks *past*
     the VUI block (immediately when VUI is absent, or via the VUI tail's
@@ -503,6 +509,10 @@ are entirely untouched:
     supplying the dependent `sps_range_extension()` body, forcing the decoder onto its
     Range-Extension coefficient-coding path with no valid extension parameter set. The
     variable-length `sps_range_extension()` body (nine RExt feature bits) and the
-    HRD-present walk-through are still not synthesised.
+    HRD-present walk-through are still not synthesised. The PPS analogue —
+    `pps_extension_present_flag` (H.265 §7.3.2.1) — is now also covered by the
+    `pps-extension-flags` mutator, which flips the PPS extension gate off→on without
+    supplying the four PPS profile-extension flags / `pps_extension_4bits` / extension
+    bodies they gate. The PPS extension bodies themselves are not synthesised.
 
 Items 1–6 above correspond directly to items 1–10 in the ranked list.
