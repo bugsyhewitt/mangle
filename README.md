@@ -303,6 +303,44 @@ minimal reproducer written to /tmp/poc-minimal.h265
 The input must be a *confirmed* crash: if the decoder does not crash on it,
 `reduce` errors out rather than emitting a meaningless "minimal" file.
 
+### Replay any iteration's mutant
+
+```bash
+mangle replay \
+  --seed seed.h265 \
+  --output-dir /tmp/fuzz-out \
+  --iteration 73 \
+  --output /tmp/iter-73.h265
+```
+
+A `fuzz` campaign records, for every iteration, the exact mutator and
+per-iteration RNG seed it used (the `mutator` and `seed_rng` columns in
+`results.jsonl`). Because every mutator is a pure function of `(seed bytes,
+random.Random(seed))` and the NAL split/assemble round-trips losslessly, that
+pair fully reproduces the iteration's mutant. `mangle replay` re-applies it to
+the original `--seed` file and re-derives the **byte-identical** mutant for *any*
+iteration — running no decoder and changing nothing in the pipeline.
+
+This closes the one gap `triage` and `reduce` leave open: both operate on the
+*saved crash artifacts*, but a campaign only writes mutants to `crashes/` when
+they crash/abort. The clean, timeout, and hang iterations are never saved. Replay
+reconstructs those from metadata alone, so you can recover a timeout/hang input
+the campaign discarded, or hand a colleague a one-line recipe (`--seed` +
+iteration number) instead of a binary blob.
+
+When the iteration *was* a crash, replay cross-checks the re-derived bytes
+against the saved `crashes/<hash>.h265` artifact — a reproducibility / tamper
+check that fails loudly if the on-disk artifact no longer matches what the
+recorded seed produces:
+
+```text
+replayed iteration 73: [sps-rext-flags] seed_rng=2179419893 outcome=crash
+reconstructed 3368 bytes
+mutant sha256: a1e0dd48cc46177236bcba93eede19a47e91ed9ff60631f8675aa1e59935dc98
+verified: re-derived mutant matches saved crashes/a1e0dd48cc461772.h265
+mutant written to /tmp/iter-73.h265
+```
+
 ### List the available mutators
 
 ```bash

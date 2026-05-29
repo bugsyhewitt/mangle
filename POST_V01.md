@@ -330,7 +330,23 @@ schema, PoC-byte fidelity, and the CLI.
 1. Hash of the first 8 bytes of decoder stderr (signature clustering).
 2. Stack-frame extraction if the decoder was built with ASAN/UBSAN (parse the ASAN
    output to extract the top N frames).
-3. Mutation replay: re-run the exact RNG seed to confirm reproducibility.
+3. Mutation replay: re-run the exact RNG seed to confirm reproducibility. — ✅
+   IMPLEMENTED (2026-05-29) as a standalone `mangle replay` subcommand. A `fuzz`
+   campaign records each iteration's `mutator` and per-iteration `seed_rng` in
+   `results.jsonl`; because every mutator is a pure function of
+   `(seed bytes, random.Random(seed))` and the NAL split/assemble round-trips
+   losslessly, that pair reproduces the iteration's mutant byte-for-byte. New
+   module `replay.py` (`load_results` / `find_record` / `replay_record` /
+   `replay_iteration`) re-derives the mutant for *any* iteration — including the
+   clean / timeout / hang iterations the campaign never wrote to `crashes/` — and,
+   when the iteration was a crash, cross-checks the re-derived bytes against the
+   saved `crashes/<hash>.h265` artifact (a reproducibility / tamper check). Runs
+   no decoder; zero changes to the fuzzing pipeline. Tests in
+   `tests/test_replay.py` (17 cases) cover record loading, blank-line tolerance,
+   the missing-results / missing-iteration errors, byte-exact reconstruction
+   against the saved artifact, no-artifact clean-iteration reconstruction,
+   determinism, the tamper-mismatch guard, sha256/size reporting, output-parent
+   creation, and the CLI.
 
 Outputs a `triage.jsonl` with cluster IDs and a deduplicated `unique-crashes/`
 directory.

@@ -7,6 +7,7 @@ Subcommands:
   corpus  - generate a diverse minimal seed corpus from one seed file
   triage  - cluster and deduplicate the crashes from a fuzz run
   reduce  - minimise one crashing input to its minimal NAL-unit reproducer
+  replay  - re-derive any fuzz iteration's mutant from the campaign metadata
   mutators - list available mutator types
 """
 
@@ -21,6 +22,7 @@ from .corpus import build_corpus
 from .engine import diff_file, fuzz_file, mutate_file
 from .mutators import list_mutators
 from .reduce import reduce_file
+from .replay import replay_iteration
 from .triage import triage
 
 
@@ -257,6 +259,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_reduce.set_defaults(func=_cmd_reduce)
 
+    # replay
+    p_replay = sub.add_parser(
+        "replay",
+        help="re-derive any fuzz iteration's mutant from the campaign metadata",
+        description=(
+            "Deterministic mutation replay. A fuzz campaign records the exact "
+            "mutator and per-iteration RNG seed for every iteration in "
+            "results.jsonl; because each mutator is a pure function of (seed "
+            "bytes, RNG), that pair fully reproduces the iteration's mutant. "
+            "Given the original --seed file and the campaign --output-dir, "
+            "reconstruct the byte-identical mutant for ANY iteration — including "
+            "the clean / timeout / hang iterations the campaign never saved to "
+            "crashes/. When the iteration was a crash, the re-derived bytes are "
+            "cross-checked against the saved crashes/ artifact (a reproducibility "
+            "/ tamper check). Runs no decoder; changes nothing in the pipeline."
+        ),
+    )
+    p_replay.add_argument(
+        "--seed",
+        required=True,
+        help="path to the ORIGINAL seed H.265 file the campaign fuzzed",
+    )
+    p_replay.add_argument(
+        "--output-dir",
+        required=True,
+        help="the fuzz output directory containing results.jsonl",
+    )
+    p_replay.add_argument(
+        "--iteration",
+        type=int,
+        required=True,
+        help="which iteration's mutant to reconstruct",
+    )
+    p_replay.add_argument(
+        "--output",
+        required=True,
+        help="path to write the reconstructed mutant",
+    )
+    p_replay.set_defaults(func=_cmd_replay)
+
     # mutators
     p_list = sub.add_parser("mutators", help="list available mutator types")
     p_list.set_defaults(func=_cmd_list_mutators)
@@ -393,6 +435,39 @@ def _cmd_reduce(args: argparse.Namespace) -> int:
     print(f"crash signature preserved: {result.signature}")
     print(f"decode probes: {result.probes}")
     print(f"minimal reproducer written to {args.output}")
+    return 0
+
+
+def _cmd_replay(args: argparse.Namespace) -> int:
+    result = replay_iteration(
+        seed_path=args.seed,
+        output_dir=args.output_dir,
+        iteration=args.iteration,
+        out_path=args.output,
+    )
+    print(
+        f"replayed iteration {result.iteration}: [{result.mutator}] "
+        f"seed_rng={result.seed_rng} outcome={result.outcome}"
+    )
+    print(f"reconstructed {result.bytes_written} bytes")
+    print(f"mutant sha256: {result.mutant_sha256}")
+    if result.crash_hash is not None:
+        if result.verified is True:
+            print(
+                f"verified: re-derived mutant matches saved crashes/"
+                f"{result.crash_hash}.h265"
+            )
+        elif result.verified is False:
+            print(
+                f"WARNING: re-derived mutant does NOT match saved crashes/"
+                f"{result.crash_hash}.h265 (artifact may be stale or tampered)"
+            )
+        else:
+            print(
+                f"note: iteration recorded crash_hash {result.crash_hash} but "
+                f"no saved artifact found to verify against"
+            )
+    print(f"mutant written to {args.output}")
     return 0
 
 
