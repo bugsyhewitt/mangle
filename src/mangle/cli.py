@@ -5,6 +5,7 @@ Subcommands:
   fuzz    - run many mutations against a decoder and record outcomes
   diff    - run mutants through two decoders and record where they disagree
   corpus  - generate a diverse minimal seed corpus from one seed file
+  corpus-trim - minimise a corpus directory to one seed per decode behaviour
   triage  - cluster and deduplicate the crashes from a fuzz run
   reduce  - minimise one crashing input to its minimal NAL-unit reproducer
   replay  - re-derive any fuzz iteration's mutant from the campaign metadata
@@ -19,6 +20,7 @@ from collections import Counter
 
 from . import __version__
 from .corpus import build_corpus
+from .corpus_trim import trim_corpus_dir
 from .engine import diff_file, fuzz_file, mutate_file
 from .mutators import list_mutators
 from .reduce import reduce_file
@@ -186,6 +188,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory for the generated seed files and manifest.json",
     )
     p_corpus.set_defaults(func=_cmd_corpus)
+
+    # corpus-trim
+    p_trim = sub.add_parser(
+        "corpus-trim",
+        help="minimise a corpus directory to one seed per decode behaviour",
+        description=(
+            "Corpus minimiser (the afl-cmin step of a fuzzing workflow). Probe "
+            "every seed in a directory through a decoder, bucket the seeds by "
+            "their decode behaviour (crash signature for crash/abort seeds — the "
+            "same ASAN-top-frame / normalised-stderr fingerprint mangle triage "
+            "uses; one bucket for all clean seeds; per-bucket timeout/hang), and "
+            "keep ONE representative per behaviour: the smallest file, tie-broken "
+            "by name. Redundant seeds are dropped. The kept seeds are copied into "
+            "--output-dir alongside a trim-manifest.json recording every seed's "
+            "verdict. Deterministic; runs one decode per input seed."
+        ),
+    )
+    p_trim.add_argument(
+        "--input-dir",
+        required=True,
+        help="directory of seed files to minimise",
+    )
+    p_trim.add_argument(
+        "--output-dir",
+        required=True,
+        help="directory to copy the kept seeds and trim-manifest.json into",
+    )
+    p_trim.add_argument(
+        "--decoder",
+        default="ffmpeg",
+        choices=["ffmpeg", "libde265"],
+        help="decoder used to probe each seed's behaviour",
+    )
+    p_trim.add_argument(
+        "--timeout", type=float, default=5.0, help="per-decode wall-clock timeout (s)"
+    )
+    p_trim.add_argument(
+        "--frame-depth",
+        type=int,
+        default=3,
+        help="number of top sanitizer stack frames used in the crash signature",
+    )
+    p_trim.add_argument(
+        "--pattern",
+        default="*.h265",
+        help="glob for which files in --input-dir count as seeds",
+    )
+    p_trim.set_defaults(func=_cmd_corpus_trim)
 
     # triage
     p_triage = sub.add_parser(
@@ -388,6 +438,31 @@ def _cmd_corpus(args: argparse.Namespace) -> int:
         for e in skipped:
             print(f"  {e.descriptor} ({e.strategy}): {e.skipped} — {e.detail}")
     print(f"manifest written to {args.output_dir}/manifest.json")
+    return 0
+
+
+def _cmd_corpus_trim(args: argparse.Namespace) -> int:
+    result = trim_corpus_dir(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        decoder=args.decoder,
+        timeout=args.timeout,
+        frame_depth=args.frame_depth,
+        pattern=args.pattern,
+    )
+    print(
+        f"trimmed {result.input_count} seed(s) -> {result.kept_count} kept "
+        f"({result.dropped_count} redundant dropped)"
+    )
+    print(f"distinct decode behaviour(s) preserved: {result.behaviour_count}")
+    by_outcome: Counter[str] = Counter(
+        v.outcome for v in result.verdicts if v.kept
+    )
+    for outcome in sorted(by_outcome):
+        print(f"  kept {by_outcome[outcome]} {outcome} representative(s)")
+    print(f"decode probes: {result.probes}")
+    print(f"kept seeds copied to {args.output_dir}")
+    print(f"trim manifest written to {args.output_dir}/trim-manifest.json")
     return 0
 
 
