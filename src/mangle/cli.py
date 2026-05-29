@@ -9,6 +9,7 @@ Subcommands:
   triage  - cluster and deduplicate the crashes from a fuzz run
   reduce  - minimise one crashing input to its minimal NAL-unit reproducer
   replay  - re-derive any fuzz iteration's mutant from the campaign metadata
+  coverage - report which mutators a campaign exercised (structural coverage)
   mutators - list available mutator types
 """
 
@@ -21,6 +22,7 @@ from collections import Counter
 from . import __version__
 from .corpus import build_corpus
 from .corpus_trim import trim_corpus_dir
+from .coverage import write_coverage
 from .engine import diff_file, fuzz_file, mutate_file
 from .mutators import list_mutators
 from .reduce import reduce_file
@@ -349,6 +351,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_replay.set_defaults(func=_cmd_replay)
 
+    # coverage
+    p_coverage = sub.add_parser(
+        "coverage",
+        help="report which mutators a fuzz campaign exercised (structural coverage)",
+        description=(
+            "Mutation-coverage reporter. mangle is a black-box harness — it sees "
+            "only each decode's pass/fail outcome, not edge coverage — so the "
+            "coverage question it can answer is structural: did this campaign "
+            "exercise the full mutator surface, how did each mutator's outcomes "
+            "distribute, and which registered mutators did it never reach? This "
+            "is a pure post-processing pass over the campaign's results.jsonl. "
+            "For each mutator it reports iterations spent, the outcome breakdown, "
+            "crash/abort count, and the number of DISTINCT crash signatures found "
+            "(using the same triage fingerprint, so 500 crashes on one bug do not "
+            "masquerade as breadth). At the campaign level it lists the exercised "
+            "and the uncovered (blind-spot) mutators against the live registry, "
+            "the coverage and productive fractions, and any unknown mutators in "
+            "the results. Writes coverage.json. Runs no decoder; deterministic."
+        ),
+    )
+    p_coverage.add_argument(
+        "--output-dir",
+        required=True,
+        help="a fuzz output directory containing results.jsonl (and crashes/)",
+    )
+    p_coverage.add_argument(
+        "--frame-depth",
+        type=int,
+        default=3,
+        help="number of top sanitizer stack frames used for distinct-bug counting",
+    )
+    p_coverage.set_defaults(func=_cmd_coverage)
+
     # mutators
     p_list = sub.add_parser("mutators", help="list available mutator types")
     p_list.set_defaults(func=_cmd_list_mutators)
@@ -543,6 +578,49 @@ def _cmd_replay(args: argparse.Namespace) -> int:
                 f"no saved artifact found to verify against"
             )
     print(f"mutant written to {args.output}")
+    return 0
+
+
+def _cmd_coverage(args: argparse.Namespace) -> int:
+    report = write_coverage(
+        output_dir=args.output_dir,
+        frame_depth=args.frame_depth,
+    )
+    print(
+        f"mutator coverage: {report.exercised_count}/{report.registry_size} "
+        f"registered mutators exercised "
+        f"({report.coverage_fraction * 100:.0f}%) over "
+        f"{report.total_iterations} iteration(s)"
+    )
+    print(
+        f"  productive: {report.productive_count}/{report.registry_size} "
+        f"crashed/aborted the decoder "
+        f"({report.productive_fraction * 100:.0f}%)"
+    )
+    for m in report.mutators:
+        flag = "" if m.known else " [unknown — not in registry]"
+        bug_note = (
+            f", {m.distinct_signatures} distinct bug(s)"
+            if m.crash_aborts
+            else ""
+        )
+        breakdown = " ".join(f"{o}={n}" for o, n in m.outcomes.items())
+        print(
+            f"  {m.mutator}{flag}: {m.iterations} iter "
+            f"[{breakdown}]{bug_note}"
+        )
+    if report.uncovered:
+        print(f"uncovered ({len(report.uncovered)} mutator(s) never selected):")
+        for name in report.uncovered:
+            print(f"  {name}")
+    else:
+        print("uncovered: none — every registered mutator was exercised")
+    if report.unknown_mutators:
+        print(
+            f"warning: {len(report.unknown_mutators)} mutator(s) in results are "
+            f"not in this build's registry: {', '.join(report.unknown_mutators)}"
+        )
+    print(f"coverage report written to {args.output_dir}/coverage.json")
     return 0
 
 

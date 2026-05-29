@@ -382,6 +382,59 @@ verified: re-derived mutant matches saved crashes/a1e0dd48cc461772.h265
 mutant written to /tmp/iter-73.h265
 ```
 
+### Report a campaign's mutation coverage
+
+```bash
+mangle coverage \
+  --output-dir /tmp/fuzz-out
+```
+
+mangle is a **black-box** harness — it shells out to ffmpeg / libde265 and sees
+only each decode's pass/fail outcome, not edge coverage, so it cannot produce a
+libFuzzer/AFL-style coverage map. The coverage question it *can* answer is
+**structural**: did this campaign exercise the full mutator surface, how did each
+mutator's outcomes distribute, and which registered mutators did it never reach?
+
+`mangle coverage` is a pure post-processing pass over the `results.jsonl` a
+`fuzz` campaign already wrote (no decoder, fully deterministic — the same
+read-only shape as `triage` and `replay`). For each mutator it reports the
+iterations spent, the outcome breakdown, the crash/abort count, and — crucially —
+the number of **distinct crash signatures** found, computed with the exact triage
+fingerprint (ASAN top frames, else normalised-stderr hash). That distinct-bug
+count stops a mutator that crashed 500 times on *one* bug from masquerading as
+broad coverage.
+
+At the campaign level it lists the **exercised** mutators and the **uncovered**
+blind spots against the live registry, the coverage and productive fractions, and
+any unknown mutators present in the results (e.g. a `results.jsonl` written by a
+different mangle build):
+
+```text
+mutator coverage: 3/22 registered mutators exercised (14%) over 4 iteration(s)
+  productive: 1/22 crashed/aborted the decoder (5%)
+  nal-emulation-bytes: 1 iter [timeout=1]
+  rps-overflow: 2 iter [crash=2], 1 distinct bug(s)
+  sps-bit-depth: 1 iter [clean=1]
+uncovered (19 mutator(s) never selected):
+  nal-unit-type-swap
+  pps-deblocking
+  ...
+coverage report written to /tmp/fuzz-out/coverage.json
+```
+
+Outputs:
+
+- `/tmp/fuzz-out/coverage.json` — the full report: `registry_size`,
+  `exercised_count`, `productive_count`, `coverage_fraction`,
+  `productive_fraction`, the `exercised` / `uncovered` / `unknown_mutators`
+  lists, and a per-mutator `mutators` array (`iterations`, `outcomes`,
+  `crash_aborts`, `distinct_signatures`, `bytes_changed`, `known`).
+
+`--frame-depth` (default 3) controls how many top sanitizer stack frames feed the
+distinct-bug fingerprint, exactly as in `triage` / `reduce` / `corpus-trim`. Use
+this to spot under-tested mutators (raise their `--mutator` weight or seed
+diversity next campaign) and to quantify a campaign's breadth before disclosure.
+
 ### List the available mutators
 
 ```bash
