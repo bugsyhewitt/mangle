@@ -13,6 +13,7 @@ from pathlib import Path
 from .bitstream import assemble_nal_units, split_nal_units
 from .decoder import Outcome, run_decoder, run_decoder_pair
 from .mutators import MutationResult, get_mutator
+from .scheduler import make_scheduler
 
 
 @dataclass
@@ -114,6 +115,11 @@ async def _run_iteration(
     )
 
 
+# An outcome is a "reward" for the adaptive scheduler when the decoder failed —
+# this is the only feedback signal a black-box harness gets.
+_REWARD_OUTCOMES = {Outcome.CRASH.value, Outcome.ABORT.value}
+
+
 async def fuzz_async(
     seed_path: str | Path,
     output_dir: str | Path,
@@ -123,11 +129,23 @@ async def fuzz_async(
     seed_rng: int,
     mutators: list[str] | None,
     concurrency: int,
+    strategy: str = "uniform",
 ) -> list[IterationResult]:
-    """Run ``iterations`` mutate+decode cycles in parallel via asyncio.
+    """Run ``iterations`` mutate+decode cycles and record outcomes.
 
     Writes per-iteration outcomes to ``<output_dir>/results.jsonl`` and crash
     artifacts under ``<output_dir>/crashes/``.
+
+    ``strategy`` selects the mutator-scheduling policy:
+
+    - ``"uniform"`` (default): every mutator is equally likely on every
+      iteration. All iterations are dispatched at once and run in parallel up to
+      ``concurrency``. The RNG draw stream is unchanged from v0.1, so a campaign's
+      mutator/seed sequence is byte-identical to before.
+    - ``"adaptive"``: an outcome-feedback bandit biases selection toward mutators
+      that have produced crashes/aborts. Iterations run in rounds of
+      ``concurrency`` so each round's verdicts update the scheduler before the
+      next round is selected. Still fully deterministic for a given ``seed_rng``.
     """
     seed_data = Path(seed_path).read_bytes()
     out_dir = Path(output_dir)
@@ -138,32 +156,78 @@ async def fuzz_async(
 
     mutator_pool = mutators or list_mutators()
     base_rng = random.Random(seed_rng)
-
+    scheduler = make_scheduler(strategy, mutator_pool)
     semaphore = asyncio.Semaphore(concurrency)
-    tasks = []
-    for i in range(iterations):
-        mutator_name = base_rng.choice(mutator_pool)
-        iter_rng_seed = base_rng.randrange(2**32)
-        tasks.append(
-            _run_iteration(
-                i,
-                seed_data,
-                mutator_name,
-                iter_rng_seed,
-                decoder,
-                timeout,
-                crashes_dir,
-                semaphore,
-            )
-        )
 
-    results = await asyncio.gather(*tasks)
+    if strategy == "uniform":
+        # Single-shot dispatch preserves the exact v0.1 RNG stream and the full
+        # parallelism of one big asyncio.gather.
+        tasks = []
+        for i in range(iterations):
+            mutator_name = scheduler.select(base_rng)
+            iter_rng_seed = base_rng.randrange(2**32)
+            tasks.append(
+                _run_iteration(
+                    i,
+                    seed_data,
+                    mutator_name,
+                    iter_rng_seed,
+                    decoder,
+                    timeout,
+                    crashes_dir,
+                    semaphore,
+                )
+            )
+        results = await asyncio.gather(*tasks)
+    else:
+        # Round-based dispatch so each round's outcomes feed the scheduler before
+        # the next round is chosen. Round size is ``concurrency`` to keep the same
+        # parallelism budget as the uniform path.
+        results = []
+        round_size = max(1, concurrency)
+        for start in range(0, iterations, round_size):
+            count = min(round_size, iterations - start)
+            round_tasks = []
+            picks = []
+            for j in range(count):
+                mutator_name = scheduler.select(base_rng)
+                iter_rng_seed = base_rng.randrange(2**32)
+                picks.append(mutator_name)
+                round_tasks.append(
+                    _run_iteration(
+                        start + j,
+                        seed_data,
+                        mutator_name,
+                        iter_rng_seed,
+                        decoder,
+                        timeout,
+                        crashes_dir,
+                        semaphore,
+                    )
+                )
+            round_results = await asyncio.gather(*round_tasks)
+            for pick, res in zip(picks, round_results):
+                scheduler.update(pick, res.outcome in _REWARD_OUTCOMES)
+            results.extend(round_results)
+
     results.sort(key=lambda r: r.iteration)
 
     results_path = out_dir / "results.jsonl"
     with results_path.open("w") as fh:
         for r in results:
             fh.write(json.dumps(asdict(r)) + "\n")
+
+    if strategy != "uniform":
+        # Emit the learned per-mutator scoreboard so a campaign's prioritisation
+        # decisions are auditable alongside the raw results.
+        scoreboard_path = out_dir / "scheduler.json"
+        scoreboard = {
+            "strategy": strategy,
+            "iterations": iterations,
+            "arms": scheduler.stats(),
+        }
+        scoreboard_path.write_text(json.dumps(scoreboard, indent=2) + "\n")
+
     return results
 
 
@@ -176,6 +240,7 @@ def fuzz_file(
     seed_rng: int = 0,
     mutators: list[str] | None = None,
     concurrency: int = 4,
+    strategy: str = "uniform",
 ) -> list[IterationResult]:
     """Synchronous wrapper around :func:`fuzz_async`."""
     return asyncio.run(
@@ -188,6 +253,7 @@ def fuzz_file(
             seed_rng,
             mutators,
             concurrency,
+            strategy,
         )
     )
 

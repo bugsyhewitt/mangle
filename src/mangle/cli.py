@@ -96,6 +96,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="parallel decode workers (asyncio)",
     )
+    p_fuzz.add_argument(
+        "--strategy",
+        default="uniform",
+        choices=["uniform", "adaptive"],
+        help=(
+            "mutator scheduling policy: 'uniform' picks every mutator with equal "
+            "probability (default); 'adaptive' learns from crash/abort outcomes "
+            "and biases selection toward mutators that crash the decoder"
+        ),
+    )
     p_fuzz.set_defaults(func=_cmd_fuzz)
 
     # diff
@@ -273,16 +283,22 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         seed_rng=args.seed_rng,
         mutators=args.mutators,
         concurrency=args.concurrency,
+        strategy=args.strategy,
     )
     counts = Counter(r.outcome for r in results)
     crashes = [r for r in results if r.crash_hash]
-    print(f"ran {len(results)} iterations against {args.decoder}")
+    print(
+        f"ran {len(results)} iterations against {args.decoder} "
+        f"({args.strategy} scheduler)"
+    )
     for outcome in ("clean", "crash", "abort", "timeout", "hang"):
         if counts.get(outcome):
             print(f"  {outcome}: {counts[outcome]}")
     print(f"results written to {args.output_dir}/results.jsonl")
     if crashes:
         print(f"{len(crashes)} crash artifact(s) in {args.output_dir}/crashes/")
+    if args.strategy != "uniform":
+        print(f"mutator scoreboard written to {args.output_dir}/scheduler.json")
     return 0
 
 
