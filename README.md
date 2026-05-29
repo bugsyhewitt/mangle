@@ -206,6 +206,7 @@ mangle mutators
 | `nal-emulation-bytes` | NAL EBSP (raw bytes) | Inserts a phantom `0x000003` emulation sequence, drops a real emulation-prevention byte, or floods the payload head with `0x000003` triplets to stress the decoder's EBSP-to-RBSP scanner |
 | `sps-feature-flags` | SPS | Flips `scaling_list_enabled_flag` or `pcm_enabled_flag` on without supplying the variable-length data block it gates, desynchronising the rest of the SPS |
 | `sps-vui-hrd` | SPS VUI | Flips a VUI / HRD gate flag (`vui_hrd_parameters_present_flag`, `vui_timing_info_present_flag`, or `vui_parameters_present_flag`) on without supplying the sub-block it gates, forcing the decoder to read CPB/HRD fields out of unrelated downstream bits |
+| `sps-rext-flags` | SPS extension | Flips an SPS extension gate (`sps_range_extension_flag`, preferred, or `sps_extension_present_flag`) on without supplying the `sps_range_extension()` body, forcing the decoder onto its HEVC Range-Extension parse path with no valid extension parameter set behind it |
 
 All structured mutators keep the stream a parseable Annex-B bitstream while pushing
 it out of semantic spec-compliance — the input class that exercises decoder edge
@@ -357,6 +358,36 @@ throughout a decoder:
   gates the seed currently has *off* are offered; if every reachable gate is already
   on (or the SPS truncates before the VUI) the mutator raises so the engine picks
   another.
+
+### SPS Range-Extension (RExt) gate mutator
+
+- **`sps-rext-flags`** targets the SPS profile-extension region that follows the VUI
+  block (H.265 §7.3.2.2.1) — gap-analysis item #8 ("HEVC range extensions (RExt)
+  flags"), the last untouched SPS attack surface. To reach it the parser now walks
+  *past* the VUI block: when VUI is absent the extension gate follows immediately,
+  and when VUI is present (but its HRD sub-block is not) the parser walks the VUI
+  tail (`bitstream_restriction_flag` block) to land on the extension gate. The region
+  is guarded by single-bit gates that each turn on additional syntax:
+  - **`sps_range_extension_flag`** (preferred when reachable): forcing it on makes the
+    decoder expect an `sps_range_extension()` structure — nine RExt feature bits
+    (`transform_skip_rotation_enabled_flag`, `transform_skip_context_enabled_flag`,
+    `implicit_rdpcm_enabled_flag`, `explicit_rdpcm_enabled_flag`,
+    `extended_precision_processing_flag`, `intra_smoothing_disabled_flag`,
+    `high_precision_offsets_enabled_flag`, `persistent_rice_adaptation_enabled_flag`,
+    `cabac_bypass_alignment_enabled_flag`) — that the bitstream never reserved. The
+    decoder reads those bits out of the SPS trailing bits, switching coefficient
+    coding onto the Range-Extension path (extended precision, RDPCM, transform-skip
+    rotation/context) with no valid parameter set behind it.
+  - **`sps_extension_present_flag`**: the outermost gate; flipping it on forces the
+    decoder to read the four profile-extension flags and `sps_extension_4bits` (and
+    any extension body they enable) out of absent data.
+
+  Every target is a single u(1) bit, so the splice never shifts the bitstream length
+  — only one gate bit changes and the downstream desync is purely semantic. Only
+  gates the seed currently has *off* are offered; if no off gate is reachable (e.g.
+  the extension is already on, or the seed's VUI carries an HRD sub-block whose
+  variable-length body blocks the walk to the extension region) the mutator raises so
+  the engine picks another.
 
 ### Emulation-prevention byte stress mutator
 

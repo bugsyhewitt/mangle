@@ -1333,3 +1333,187 @@ class TestSpsVuiHrdMutator:
             assert "vui" in str(exc).lower() or "hrd" in str(exc).lower()
         else:
             raise AssertionError("expected ValueError when no off-gate reachable")
+
+
+REXT_MUTATORS = {"sps-rext-flags"}
+
+
+def _build_rext_sps_rbsp(
+    *,
+    vui_present: int = 0,
+    timing_present: int = 1,
+    hrd_present: int = 0,
+    ext_present: int = 0,
+    rext_flag: int = 0,
+) -> bytes:
+    """A minimal SPS RBSP that parses through to the SPS extension gate region.
+
+    Builds the same RPS-free prefix as :func:`_build_vui_sps_rbsp`, then emits a
+    configurable VUI block (tail with ``bitstream_restriction_flag`` absent) and a
+    configurable extension region (H.265 §7.3.2.2.1). With ``vui_present=0`` the
+    extension gate follows the VUI gate directly — the deterministic path used to
+    exercise every off/on gate combination the mutator can encounter.
+    """
+    from mangle.bitstream import BitWriter
+
+    w = BitWriter()
+    w.write_bits(0, 4)  # sps_video_parameter_set_id
+    w.write_bits(0, 3)  # sps_max_sub_layers_minus1 = 0
+    w.write_bit(0)      # sps_temporal_id_nesting_flag
+    w.write_bits(0, 8)   # profile_tier_level
+    w.write_bits(0, 32)
+    w.write_bits(0, 48)
+    w.write_bits(0, 8)
+    w.write_ue(0)        # sps_seq_parameter_set_id
+    w.write_ue(1)        # chroma_format_idc (4:2:0)
+    w.write_ue(64)       # pic_width_in_luma_samples
+    w.write_ue(64)       # pic_height_in_luma_samples
+    w.write_bit(0)       # conformance_window_flag
+    w.write_ue(0)        # bit_depth_luma_minus8
+    w.write_ue(0)        # bit_depth_chroma_minus8
+    w.write_ue(4)        # log2_max_pic_order_cnt_lsb_minus4
+    w.write_bit(0)       # sps_sub_layer_ordering_info_present_flag
+    w.write_ue(0)        # sps_max_dec_pic_buffering_minus1[0]
+    w.write_ue(0)        # sps_max_num_reorder_pics[0]
+    w.write_ue(0)        # sps_max_latency_increase_plus1[0]
+    w.write_ue(0)        # log2_min_luma_coding_block_size_minus3
+    w.write_ue(0)        # log2_diff_max_min_luma_coding_block_size
+    w.write_ue(0)        # log2_min_luma_transform_block_size_minus2
+    w.write_ue(0)        # log2_diff_max_min_luma_transform_block_size
+    w.write_ue(0)        # max_transform_hierarchy_depth_inter
+    w.write_ue(0)        # max_transform_hierarchy_depth_intra
+    w.write_bit(0)       # scaling_list_enabled_flag
+    w.write_bit(0)       # amp_enabled_flag
+    w.write_bit(0)       # sample_adaptive_offset_enabled_flag
+    w.write_bit(0)       # pcm_enabled_flag
+    w.write_ue(0)        # num_short_term_ref_pic_sets = 0
+    w.write_bit(0)       # long_term_ref_pics_present_flag = 0
+    w.write_bit(0)       # sps_temporal_mvp_enabled_flag
+    w.write_bit(0)       # strong_intra_smoothing_enabled_flag
+    w.write_bit(vui_present)  # vui_parameters_present_flag
+    if vui_present:
+        w.write_bit(0)   # aspect_ratio_info_present_flag
+        w.write_bit(0)   # overscan_info_present_flag
+        w.write_bit(0)   # video_signal_type_present_flag
+        w.write_bit(0)   # chroma_loc_info_present_flag
+        w.write_bit(0)   # neutral_chroma_indication_flag
+        w.write_bit(0)   # field_seq_flag
+        w.write_bit(0)   # frame_field_info_present_flag
+        w.write_bit(0)   # default_display_window_flag
+        w.write_bit(timing_present)  # vui_timing_info_present_flag
+        if timing_present:
+            w.write_bits(1, 32)  # vui_num_units_in_tick
+            w.write_bits(1, 32)  # vui_time_scale
+            w.write_bit(0)       # vui_poc_proportional_to_timing_flag
+            w.write_bit(hrd_present)  # vui_hrd_parameters_present_flag
+            if hrd_present:
+                # hrd_parameters() body omitted; parser stops before the
+                # extension region for this combination.
+                w.write_bit(1)   # rbsp_stop_one_bit
+                return w.to_bytes()
+        w.write_bit(0)   # bitstream_restriction_flag
+    w.write_bit(ext_present)  # sps_extension_present_flag
+    if ext_present:
+        w.write_bit(rext_flag)  # sps_range_extension_flag
+        w.write_bit(0)   # sps_multilayer_extension_flag
+        w.write_bit(0)   # sps_3d_extension_flag
+        w.write_bit(0)   # sps_scc_extension_flag
+        w.write_bits(0, 4)  # sps_extension_4bits
+    w.write_bit(1)       # rbsp_stop_one_bit
+    return w.to_bytes()
+
+
+def _rext_stream(**kwargs) -> list[NalUnit]:
+    sps_rbsp = _build_rext_sps_rbsp(**kwargs)
+    sps_nal = NalUnit(4, 0, bytes([(33 << 1), 0x01]) + rbsp_to_ebsp(sps_rbsp))
+    vps_nal = NalUnit(4, 0, bytes([(32 << 1), 0x01]) + b"\x80")
+    pps_nal = NalUnit(4, 0, bytes([(34 << 1), 0x01]) + b"\x80")
+    return [vps_nal, sps_nal, pps_nal]
+
+
+class TestSpsRextFlagsRegistered:
+    def test_present(self):
+        assert REXT_MUTATORS.issubset(set(list_mutators()))
+
+    def test_reproducible(self):
+        r1 = get_mutator("sps-rext-flags")(_seed_nals(), random.Random(7))
+        r2 = get_mutator("sps-rext-flags")(_seed_nals(), random.Random(7))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.detail == r2.detail
+
+    def test_result_name(self):
+        result = get_mutator("sps-rext-flags")(_seed_nals(), random.Random(0))
+        assert result.mutator == "sps-rext-flags"
+
+
+class TestSpsRextFlagsMutator:
+    def test_changes_only_sps(self):
+        original = _seed_nals()
+        result = get_mutator("sps-rext-flags")(_seed_nals(), random.Random(0))
+        for orig, mut in zip(original, result.nals):
+            if orig.nal_unit_type == 33:
+                continue
+            assert orig.ebsp == mut.ebsp, "non-SPS NAL modified"
+
+    def test_gate_is_flipped_on(self):
+        for s in range(24):
+            result = get_mutator("sps-rext-flags")(_seed_nals(), random.Random(s))
+            sps = _reparse_sps(result.nals)
+            target = result.detail.split(":")[0]
+            assert sps.span(target).value == 1, (target, s)
+
+    def test_single_bit_change_preserves_length(self):
+        original = assemble_nal_units(_seed_nals())
+        result = get_mutator("sps-rext-flags")(_seed_nals(), random.Random(3))
+        mutated = assemble_nal_units(result.nals)
+        assert len(mutated) == len(original)
+        assert result.bytes_changed >= 1
+
+    def test_framing_integrity(self):
+        result = get_mutator("sps-rext-flags")(_seed_nals(), random.Random(1))
+        mutated = assemble_nal_units(result.nals)
+        assert len(split_nal_units(mutated)) == len(_seed_nals())
+
+    def test_clean_fixture_uses_extension_present_gate(self):
+        # The bundled seed has no SPS extension, so sps_extension_present_flag is
+        # the lone off candidate and must always be the chosen gate.
+        for s in range(24):
+            result = get_mutator("sps-rext-flags")(_seed_nals(), random.Random(s))
+            assert "sps_extension_present_flag" in result.detail
+
+    def test_prefers_range_extension_gate_when_off(self):
+        # An SPS that already has the extension region present but the
+        # range-extension flag off exposes both gates; the mutator must prefer the
+        # range-extension flag (it lands directly in RExt handling).
+        stream = _rext_stream(vui_present=0, ext_present=1, rext_flag=0)
+        for s in range(16):
+            r = get_mutator("sps-rext-flags")(stream, random.Random(s))
+            assert "sps_range_extension_flag" in r.detail
+
+    def test_extension_present_gate_when_no_extension(self):
+        # No extension region at all → only the outer gate is an off candidate.
+        stream = _rext_stream(vui_present=0, ext_present=0)
+        for s in range(16):
+            r = get_mutator("sps-rext-flags")(stream, random.Random(s))
+            assert "sps_extension_present_flag" in r.detail
+
+    def test_raises_when_no_off_gate_available(self):
+        # Extension present AND range-extension flag already on → no off gate.
+        all_on = _rext_stream(vui_present=0, ext_present=1, rext_flag=1)
+        try:
+            get_mutator("sps-rext-flags")(all_on, random.Random(0))
+        except ValueError as exc:
+            assert "rext" in str(exc).lower() or "extension" in str(exc).lower()
+        else:
+            raise AssertionError("expected ValueError when no off-gate reachable")
+
+    def test_hrd_present_seed_cannot_reach_extension(self):
+        # When the seed's HRD gate is on, the parser cannot walk to the extension
+        # region, so the mutator has no gate and must raise.
+        hrd_on = _rext_stream(vui_present=1, timing_present=1, hrd_present=1)
+        try:
+            get_mutator("sps-rext-flags")(hrd_on, random.Random(0))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError when extension unreachable")

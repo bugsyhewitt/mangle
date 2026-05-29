@@ -133,6 +133,17 @@ class SeqParameterSet:
     vui_parameters_present_flag: int | None = None
     vui_timing_info_present_flag: int | None = None
     vui_hrd_parameters_present_flag: int | None = None
+    # SPS extension gate flags (H.265 §7.3.2.2.1), reached only when the parser
+    # walks past the VUI block (which it does cleanly when VUI is absent). Each is
+    # a single u(1) bit. ``sps_extension_present_flag`` gates the four
+    # profile-extension flags; ``sps_range_extension_flag`` in turn gates the
+    # variable-length ``sps_range_extension()`` body (nine RExt feature bits,
+    # H.265 §7.3.2.2.2). Recording their spans lets a mutator flip a gate on
+    # without supplying the dependent extension data, desynchronising the SPS tail
+    # and forcing the decoder onto its Range-Extension parse path with no valid
+    # parameter set behind it. None means the parser did not reach the flag.
+    sps_extension_present_flag: int | None = None
+    sps_range_extension_flag: int | None = None
 
     def span(self, name: str) -> FieldSpan:
         for s in self.spans:
@@ -169,6 +180,38 @@ def _parse_short_term_rps(reader: BitReader, st_rps_idx: int) -> ShortTermRps:
     return rps
 
 
+def _parse_sps_extension_region(reader: BitReader, sps: SeqParameterSet) -> None:
+    """Record the SPS extension gate flags (H.265 §7.3.2.2.1).
+
+    Called once the reader is positioned at ``sps_extension_present_flag`` (i.e.
+    immediately after the VUI block, which for the clean path means VUI was
+    absent). Records:
+
+      * ``sps_extension_present_flag`` — always (single bit at the read position).
+      * ``sps_range_extension_flag`` — only when the extension-present gate is on,
+        as it is the first of the four profile-extension flags that follow.
+
+    This is a *gate-only* walk: it does not model the variable-length
+    ``sps_range_extension()`` body (nine RExt feature bits, H.265 §7.3.2.2.2) that
+    follows ``sps_range_extension_flag``, so it stops after recording that flag.
+    Any read past the end simply raises and the caller keeps whatever was recorded.
+    """
+    ext_off = reader.bit_position
+    ext_present = reader.read_bit()  # sps_extension_present_flag
+    sps.sps_extension_present_flag = ext_present
+    sps.spans.append(FieldSpan("sps_extension_present_flag", ext_off, 1, ext_present))
+    if not ext_present:
+        return
+
+    rext_off = reader.bit_position
+    rext_flag = reader.read_bit()  # sps_range_extension_flag
+    sps.sps_range_extension_flag = rext_flag
+    sps.spans.append(FieldSpan("sps_range_extension_flag", rext_off, 1, rext_flag))
+    # sps_multilayer/3d/scc_extension_flag + sps_extension_4bits and the
+    # variable-length sps_range_extension() body follow; not modelled. The two
+    # gate spans recorded above are what a mutator needs.
+
+
 def _parse_vui_region(
     reader: BitReader, sps: SeqParameterSet, max_sub_layers_minus1: int
 ) -> None:
@@ -196,6 +239,12 @@ def _parse_vui_region(
         FieldSpan("vui_parameters_present_flag", vui_off, 1, vui_present)
     )
     if not vui_present:
+        # No vui_parameters() block, so sps_extension_present_flag follows
+        # immediately. This is the clean, deterministic path to the SPS extension
+        # gates: when VUI *is* present its variable-length body (including the
+        # unmodelled hrd_parameters()) prevents a reliable walk to the extension
+        # region, so we only record the extension flags here.
+        _parse_sps_extension_region(reader, sps)
         return
 
     # vui_parameters() (H.265 §E.2.1), walked to the timing-info gate.
@@ -232,6 +281,9 @@ def _parse_vui_region(
         FieldSpan("vui_timing_info_present_flag", timing_off, 1, timing_present)
     )
     if not timing_present:
+        # No timing/HRD sub-block: bitstream_restriction_flag follows, then the
+        # SPS extension region — both fully modellable.
+        _parse_vui_tail_and_extension(reader, sps)
         return
 
     reader.read_bits(32)  # vui_num_units_in_tick
@@ -245,8 +297,35 @@ def _parse_vui_region(
     sps.spans.append(
         FieldSpan("vui_hrd_parameters_present_flag", hrd_off, 1, hrd_present)
     )
-    # The hrd_parameters() body that follows is variable-length and not modelled;
-    # stop here. The gate span is recorded so a mutator can flip it.
+    if hrd_present:
+        # The hrd_parameters() body that follows is variable-length and not
+        # modelled; stop here. The HRD gate span is recorded so a mutator can flip
+        # it, and the extension region is left unreachable for this SPS.
+        return
+
+    # HRD absent: bitstream_restriction_flag follows, then the SPS extension
+    # region — both fully modellable, so we walk on to record the RExt gates.
+    _parse_vui_tail_and_extension(reader, sps)
+
+
+def _parse_vui_tail_and_extension(reader: BitReader, sps: SeqParameterSet) -> None:
+    """Walk the VUI tail (``bitstream_restriction_flag`` block, H.265 §E.2.1) and
+    then record the SPS extension gate flags.
+
+    Called once the reader is positioned at ``bitstream_restriction_flag`` (i.e.
+    after a VUI with no HRD sub-block). The tail is fixed-structure and fully
+    modellable, so this reaches ``sps_extension_present_flag`` deterministically.
+    """
+    if reader.read_bit():  # bitstream_restriction_flag
+        reader.read_bit()  # tiles_fixed_structure_flag
+        reader.read_bit()  # motion_vectors_over_pic_boundaries_flag
+        reader.read_bit()  # restricted_ref_pic_lists_flag
+        reader.read_ue()  # min_spatial_segmentation_idc
+        reader.read_ue()  # max_bytes_per_pic_denom
+        reader.read_ue()  # max_bits_per_min_cu_denom
+        reader.read_ue()  # log2_max_mv_length_horizontal
+        reader.read_ue()  # log2_max_mv_length_vertical
+    _parse_sps_extension_region(reader, sps)
 
 
 @dataclass

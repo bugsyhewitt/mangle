@@ -494,6 +494,15 @@ are entirely untouched:
    `pcm_enabled_flag`) inconsistency covered by the `sps-feature-flags` mutator
    (the variable-length `scaling_list_data()` body is still not synthesised)
 9. Deblocking filter parameters in PPS/slice header — ✅ PPS portion covered (item #11)
-10. HEVC range extensions (RExt) flags
+10. HEVC range extensions (RExt) flags — ✅ covered. `parse_sps` now walks *past*
+    the VUI block (immediately when VUI is absent, or via the VUI tail's
+    `bitstream_restriction_flag` block when VUI is present without an HRD sub-block)
+    into the SPS profile-extension region (H.265 §7.3.2.2.1), recording
+    `sps_extension_present_flag` and `sps_range_extension_flag`. The `sps-rext-flags`
+    mutator flips one off-gate on (preferring `sps_range_extension_flag`) without
+    supplying the dependent `sps_range_extension()` body, forcing the decoder onto its
+    Range-Extension coefficient-coding path with no valid extension parameter set. The
+    variable-length `sps_range_extension()` body (nine RExt feature bits) and the
+    HRD-present walk-through are still not synthesised.
 
 Items 1–6 above correspond directly to items 1–10 in the ranked list.
