@@ -545,6 +545,56 @@ next VPS extension gate after `vps-layer-count`.
 
 ---
 
+## 14. PPS slice-header extension gate mutator — ✅ IMPLEMENTED (2026-05-29)
+
+**Status:** Shipped. `parse_pps` in `hevc.py` now promotes the previously
+read-and-discarded `slice_segment_header_extension_present_flag` (H.265 §7.3.2.1)
+to a tracked single-bit span. It sits in the PPS third stage between
+`log2_parallel_merge_level_minus2` and `pps_extension_present_flag`, reached for
+any untiled, non-truncated PPS whose scaling-list gate is off (the same walk the
+`pps-extension-flags` gates use). One mutator, `pps-slice-header-extension`, was
+added to `builtin.py`; it flips the gate off→on in the PPS without the slices
+carrying the dependent extension block, so every slice header that references the
+PPS must read a `slice_segment_header_extension_length` ue(v) plus that many
+extension data bytes (H.265 §7.3.6.1) out of bits that hold the real slice-header
+fields. The length read out of unrelated bits drives the decoder to skip past the
+slice payload — an out-of-bounds read on decoders that do not bound the skip
+against the NAL size. It raises when the PPS did not parse to the gate or the gate
+is already on, so the engine picks another. Tests in `tests/test_hevc.py`
+(`TestPpsSliceHeaderExtensionGateParsing`, 7 cases) cover the seed span, its
+single-bit width, its position between the scaling-list and extension gates, the
+recorded-when-on case, the scaling-list-on and tiles-on skip cases, and the
+length-preserving splice round-trip (asserting the neighbouring extension gate is
+untouched); tests in `tests/test_mutators.py`
+(`TestPpsSliceHeaderExtensionRegistered` + `TestPpsSliceHeaderExtensionMutator`,
+13 cases) cover registration, reproducibility, the gate flip, the detail string,
+PPS-only containment, length preservation, the neighbouring-gate-untouched
+invariant, framing integrity, double-application raise, the gate-already-on raise,
+and the tiled-PPS raise.
+
+**What:** Flip `slice_segment_header_extension_present_flag` (H.265 §7.3.2.1) on in
+the PPS without the slices carrying the per-slice-header extension block it gates.
+This is the first mutator whose target field is in the PPS but whose dependent
+sub-block is in the *slice header*, bridging the two sides of the systematic walk.
+
+**Why now:** It is the natural next gate in the PPS third-stage walk — the parser
+already reached and discarded it just before `pps_extension_present_flag` — and it
+is the only PPS gate whose desync lands in the slice-header parse path. The
+slice-header extension mechanism is an untouched attack surface; a
+`slice_segment_header_extension_length` read out of unrelated bits exercises the
+slice-skip / NAL-bound check that several decoders implement without a guard.
+
+**Implementation notes:**
+
+- `parse_pps` third stage already read `slice_segment_header_extension_present_flag`
+  and discarded it; promoting it to a span is ~10 lines plus the dataclass field.
+- The mutator is a 1-bit `splice_fixed_bits` on the located gate span
+  (length-preserving), matching the established gate-flag mutators.
+
+**Estimated LOC:** ~80 (parser extension ~12 + mutator ~55 + dataclass field).
+
+---
+
 ## Summary table
 
 | # | Name | Attack surface | New CVE class | Cost (LOC) | Priority |
@@ -562,6 +612,7 @@ next VPS extension gate after `vps-layer-count`.
 | 11 | pps-deblocking | PPS deblocking/loop-filter | OOB table lookup | ~110 | ✅ DONE |
 | 12 | slice-no-output-prior-pics | Slice-header DPB no-output | DPB flush/output desync | ~75 | ✅ DONE |
 | 13 | vps-timing-info | VPS timing / HRD gate | HRD-timing desync | ~90 | ✅ DONE |
+| 14 | pps-slice-header-extension | PPS→slice-header extension gate | Slice-header skip OOB read | ~80 | ✅ DONE |
 
 ---
 
@@ -647,8 +698,14 @@ are entirely untouched:
 11. Slice-header gate flags — ✅ first slice-header gate covered. `parse_slice_header`
     now promotes `no_output_of_prior_pics_flag` (H.265 §7.3.6.1) to a tracked span for
     IRAP NAL types [16, 23]; the `slice-no-output-prior-pics` mutator flips it,
-    inverting the IRAP DPB no-output decision (item #12). The deeper slice-header
-    fields that need SPS/PPS context (`slice_segment_address`, the slice-level RPS,
+    inverting the IRAP DPB no-output decision (item #12). The PPS-side gate that
+    controls *all* slice headers — `slice_segment_header_extension_present_flag`
+    (H.265 §7.3.2.1) — is now also covered by the `pps-slice-header-extension`
+    mutator (item #14): `parse_pps` promotes the gate (previously read and
+    discarded) to a tracked span and the mutator flips it off→on without the slices
+    carrying the dependent extension block, desyncing every slice header's
+    `slice_segment_header_extension_length` read. The deeper slice-header fields that
+    need SPS/PPS context (`slice_segment_address`, the slice-level RPS,
     `dependent_slice_segment_flag`) remain unmodelled.
 
 Items 1–6 above correspond directly to items 1–10 in the ranked list.

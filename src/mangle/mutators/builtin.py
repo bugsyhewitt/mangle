@@ -292,6 +292,82 @@ def pps_extension_flags(nals: list[NalUnit], rng: random.Random) -> MutationResu
     )
 
 
+@register("pps-slice-header-extension")
+def pps_slice_header_extension(
+    nals: list[NalUnit], rng: random.Random
+) -> MutationResult:
+    """Flip the PPS ``slice_segment_header_extension_present_flag`` gate on.
+
+    This is the first mutator to target a PPS gate whose dependent sub-block lives
+    in the *slice header*, bridging the PPS and slice-header sides of mangle's
+    systematic bitstream walk. ``slice_segment_header_extension_present_flag``
+    (H.265 §7.3.2.1) sits between ``log2_parallel_merge_level_minus2`` and
+    ``pps_extension_present_flag`` in the PPS. When it is 1, the spec requires
+    *every* slice segment header that references this PPS to carry, near its end
+    (H.265 §7.3.6.1):
+
+      * ``slice_segment_header_extension_length`` — ue(v), 0..256.
+      * that many ``slice_segment_header_extension_data_byte`` bytes — u(8) each.
+
+    Flipping the gate from 0 to 1 in the PPS *without* the slices actually carrying
+    that extension block makes the decoder, on entry to each slice, read a
+    ``slice_segment_header_extension_length`` ue(v) out of whatever bits follow the
+    real slice-header fields, then skip that many bytes — desynchronising the
+    byte-alignment and the entropy-decode entry point for the entire coded picture.
+    A length read as a large value (the trailing bits can encode an arbitrary
+    ue(v)) drives the decoder to skip far past the slice payload; decoders that do
+    not bounds-check the skip against the NAL size read out of bounds. This is the
+    "claims data that isn't there" gate-on desync used by the other gate-flag
+    mutators (``sps-vui-hrd``, ``sps-rext-flags``, ``pps-extension-flags``,
+    ``vps-timing-info``), but it is the only one whose desync lands in the
+    slice-header parse path rather than in the parameter set itself.
+
+    The gate is reached only for an untiled, non-truncated PPS whose scaling-list
+    gate is off (the parser cannot walk past a present scaling_list_data() body).
+    The mutator only fires when the seed currently has the gate *off*; if the PPS
+    did not parse to the gate, or the gate is already on, it raises so the engine
+    picks another mutator.
+
+    [Worker decision: gate-flip splice keeps the PPS byte-stable]
+    The target is a single u(1) bit, so the splice never shifts the stream's
+    bit-length — only the one gate bit changes and the downstream desync is purely
+    semantic, matching the established gate-flag mutators.
+    """
+    out = _clone(nals)
+    idx = _first(out, 34)  # PPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    pps = parse_pps(rbsp)
+
+    if not pps.has_span("slice_segment_header_extension_present_flag"):
+        raise ValueError(
+            "PPS did not parse to slice_segment_header_extension_present_flag "
+            "(tiles enabled, scaling-list gate on, or truncated PPS); cannot "
+            "mutate the slice-header extension gate"
+        )
+    span = pps.span("slice_segment_header_extension_present_flag")
+    if span.value != 0:
+        raise ValueError(
+            "slice_segment_header_extension_present_flag is already set; the "
+            "gate-on desync needs an off gate"
+        )
+
+    new_value = 1  # turn the gate on; the per-slice-header extension block is absent
+    new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="pps-slice-header-extension",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=(
+            "slice_segment_header_extension_present_flag: 0 -> 1 (PPS gate enabled "
+            "without the dependent per-slice-header extension block; every slice "
+            "header desyncs reading slice_segment_header_extension_length)"
+        ),
+    )
+
+
 @register("pps-slice-qp")
 def pps_slice_qp(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     """Corrupt the PPS quantization / transform-skip control fields.
