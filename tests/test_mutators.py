@@ -1523,7 +1523,10 @@ PPS_EXTENSION_MUTATORS = {"pps-extension-flags"}
 
 
 def _build_ext_pps_rbsp(
-    *, scaling_list_present: int = 0, pps_extension_present: int = 0
+    *,
+    scaling_list_present: int = 0,
+    lists_modification: int = 0,
+    pps_extension_present: int = 0,
 ) -> bytes:
     """A minimal no-tiles PPS RBSP reaching the extension gate region.
 
@@ -1559,7 +1562,7 @@ def _build_ext_pps_rbsp(
     w.write_bit(1)  # pps_loop_filter_across_slices_enabled_flag
     w.write_bit(0)  # deblocking_filter_control_present_flag
     w.write_bit(scaling_list_present)  # pps_scaling_list_data_present_flag
-    w.write_bit(0)  # lists_modification_present_flag
+    w.write_bit(lists_modification)  # lists_modification_present_flag
     w.write_ue(0)  # log2_parallel_merge_level_minus2
     w.write_bit(0)  # slice_segment_header_extension_present_flag
     w.write_bit(pps_extension_present)  # pps_extension_present_flag
@@ -1950,6 +1953,151 @@ class TestPpsSliceHeaderExtensionMutator:
         ]
         try:
             get_mutator("pps-slice-header-extension")(nals, random.Random(0))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for a tiled PPS")
+
+
+class TestPpsListsModificationRegistered:
+    def test_present(self):
+        assert "pps-lists-modification" in list_mutators()
+
+    def test_reproducible(self):
+        r1 = get_mutator("pps-lists-modification")(_seed_nals(), random.Random(7))
+        r2 = get_mutator("pps-lists-modification")(_seed_nals(), random.Random(7))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.detail == r2.detail
+
+    def test_result_name(self):
+        result = get_mutator("pps-lists-modification")(_seed_nals(), random.Random(0))
+        assert result.mutator == "pps-lists-modification"
+
+
+class TestPpsListsModificationMutator:
+    def test_changes_bytes_on_seed(self):
+        original = SEED.read_bytes()
+        result = get_mutator("pps-lists-modification")(_seed_nals(), random.Random(0))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated != original
+        assert result.bytes_changed > 0
+        assert result.detail
+
+    def test_gate_is_flipped_on(self):
+        result = get_mutator("pps-lists-modification")(_seed_nals(), random.Random(3))
+        pps = _reparse_pps(result.nals)
+        assert pps.lists_modification_present_flag == 1
+
+    def test_detail_names_the_gate(self):
+        result = get_mutator("pps-lists-modification")(_seed_nals(), random.Random(0))
+        assert "lists_modification_present_flag" in result.detail
+
+    def test_changes_only_pps(self):
+        original = _seed_nals()
+        result = get_mutator("pps-lists-modification")(_seed_nals(), random.Random(0))
+        for orig, mut in zip(original, result.nals):
+            if orig.nal_unit_type == 34:
+                continue
+            assert orig.ebsp == mut.ebsp, "non-PPS NAL modified"
+
+    def test_single_bit_change_preserves_length(self):
+        original = assemble_nal_units(_seed_nals())
+        result = get_mutator("pps-lists-modification")(_seed_nals(), random.Random(3))
+        mutated = assemble_nal_units(result.nals)
+        assert len(mutated) == len(original)
+        assert result.bytes_changed >= 1
+
+    def test_neighbouring_slice_header_gate_untouched(self):
+        # Flipping the lists-modification gate must not disturb the neighbouring
+        # slice_segment_header_extension_present_flag.
+        original_pps = _reparse_pps(_seed_nals())
+        result = get_mutator("pps-lists-modification")(_seed_nals(), random.Random(5))
+        mutated_pps = _reparse_pps(result.nals)
+        assert (
+            mutated_pps.slice_segment_header_extension_present_flag
+            == original_pps.slice_segment_header_extension_present_flag
+        )
+
+    def test_framing_integrity(self):
+        result = get_mutator("pps-lists-modification")(_seed_nals(), random.Random(1))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated[:4] == START_CODE_LONG or mutated[:3] == START_CODE_SHORT
+        assert len(split_nal_units(mutated)) == len(_seed_nals())
+
+    def test_double_application_raises(self):
+        # After the first flip the gate is on; a second application must raise,
+        # since the gate-on desync needs an off gate.
+        first = get_mutator("pps-lists-modification")(_seed_nals(), random.Random(1))
+        try:
+            get_mutator("pps-lists-modification")(first.nals, random.Random(1))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError when the gate is already on")
+
+    def test_raises_when_gate_already_on(self):
+        # A PPS whose lists-modification gate is already set offers no off gate.
+        stream = _ext_pps_stream(lists_modification=1)
+        try:
+            get_mutator("pps-lists-modification")(stream, random.Random(0))
+        except ValueError as exc:
+            assert "already" in str(exc).lower() or "off gate" in str(exc).lower()
+        else:
+            raise AssertionError("expected ValueError when gate already on")
+
+    def test_scaling_list_gate_on_raises(self):
+        # When the scaling-list gate is on the parser cannot reach the
+        # lists-modification gate, so the mutator must raise.
+        stream = _ext_pps_stream(scaling_list_present=1)
+        try:
+            get_mutator("pps-lists-modification")(stream, random.Random(0))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "expected ValueError when scaling-list gate blocks the walk"
+            )
+
+    def test_tiles_enabled_pps_raises(self):
+        # A tiled PPS never reaches the lists-modification gate, so the mutator
+        # must raise so the engine can pick another.
+        from mangle.bitstream import BitWriter
+
+        w = BitWriter()
+        w.write_ue(0)  # pps_pic_parameter_set_id
+        w.write_ue(0)  # pps_seq_parameter_set_id
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bits(0, 3)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_ue(0)
+        w.write_ue(0)
+        w.write_se(0)  # init_qp_minus26
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_se(0)
+        w.write_se(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(0)
+        w.write_bit(1)  # tiles_enabled_flag = 1
+        w.write_bit(0)
+        w.write_bit(1)  # rbsp_stop_one_bit (truncated; tile geometry not modelled)
+        tiled_rbsp = w.to_bytes()
+        sps = next(n for n in _seed_nals() if n.nal_unit_type == 33)
+        pps_header = bytes([(34 << 1), 0x01])
+        pps_nal = NalUnit(4, 0, pps_header + rbsp_to_ebsp(tiled_rbsp))
+        vps_header = bytes([(32 << 1), 0x01])
+        nals = [
+            NalUnit(4, 0, vps_header + b"\x80"),
+            NalUnit(4, 0, sps.ebsp),
+            pps_nal,
+        ]
+        try:
+            get_mutator("pps-lists-modification")(nals, random.Random(0))
         except ValueError:
             pass
         else:

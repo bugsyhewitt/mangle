@@ -211,6 +211,7 @@ mangle mutators
 | `slice-no-output-prior-pics` | Slice header (IRAP) | Flips `no_output_of_prior_pics_flag` in an IRAP slice header, inverting the decoder's decision to discard the DPB without outputting its pictures when a new coded-video-sequence begins |
 | `vps-timing-info` | VPS | Flips `vps_timing_info_present_flag` on without supplying the dependent `vps_timing_info` / `hrd_parameters()` sub-block, forcing the decoder to read `num_units_in_tick` / `time_scale` and an HRD walk out of the VPS trailing bits |
 | `pps-slice-header-extension` | PPS → slice header | Flips `slice_segment_header_extension_present_flag` on in the PPS without the slices carrying the dependent extension block, so every slice header desyncs reading a `slice_segment_header_extension_length` ue(v) out of unrelated bits |
+| `pps-lists-modification` | PPS → slice header | Flips `lists_modification_present_flag` on in the PPS without any slice carrying `ref_pic_list_modification()`, so every inter slice header desyncs reading `list_entry_lX` reference-list reorder indices — out-of-range entries are an out-of-bounds reference-list access |
 
 All structured mutators keep the stream a parseable Annex-B bitstream while pushing
 it out of semantic spec-compliance — the input class that exercises decoder edge
@@ -489,6 +490,42 @@ throughout a decoder:
   `scaling_list_data()` body is not modelled). The 1-bit splice is length-preserving.
   The mutator only fires when the seed has the gate off; if the PPS did not parse to
   the gate, or the gate is already on, it raises so the engine picks another.
+
+### PPS ref-pic-list modification gate mutator
+
+- **`pps-lists-modification`** is the second PPS gate whose dependent sub-block
+  lives in the *slice header* (after `pps-slice-header-extension`), this time landing
+  the desync in the reference-picture-list reordering path.
+  `lists_modification_present_flag` (H.265 §7.3.2.1) is a single u(1) PPS flag that
+  sits immediately after `pps_scaling_list_data_present_flag` and just before
+  `log2_parallel_merge_level_minus2`. When it is 1, the spec allows a slice segment
+  header that uses inter prediction (P/B slices) to carry a
+  `ref_pic_list_modification()` sub-block (H.265 §7.3.6.2): a
+  `ref_pic_list_modification_flag_l0` (and, for B slices, `..._l1`) followed, when
+  set, by `num_ref_idx_lX_active_minus1 + 1` entries of `list_entry_lX[i]` — each a
+  `Ceil(Log2(NumPicTotalCurr))`-bit u(v) index that *reorders* the reference picture
+  list.
+
+  This is the **reachable** analogue of the slice-side ref-pic-list reorder fields
+  (`num_ref_idx_active_override_flag`, `list_entry_l0`) that mangle's self-contained
+  per-NAL slice parser cannot reach without SPS/PPS cross-context (it would need
+  `num_extra_slice_header_bits`, `slice_type`, the slice RPS, and the active ref-idx
+  counts to locate the reorder block). Rather than parse deep into the slice header,
+  the mutator flips the PPS gate that *enables* that block. Flipping it `0 -> 1`
+  **without** any slice actually being structured around list modification makes the
+  decoder read the `ref_pic_list_modification()` syntax out of bits that hold the real
+  slice-header fields, then index the reference lists with the indices it reads.
+  `list_entry_lX[i]` indices that exceed `NumPicTotalCurr` are a classic out-of-bounds
+  reference-list access — the same DPB / reference-management surface the
+  CVE-2026-33164 derive path (`set_derived_values()`) and ffmpeg's `hevcdec.c`
+  ref-list construction run through. It is the same "claims data that isn't there"
+  gate-on desync as the other gate-flag mutators.
+
+  The parser promotes the flag (previously read and discarded) to a tracked span only
+  for an untiled, non-truncated PPS whose scaling-list gate is off. The 1-bit splice
+  is length-preserving. The mutator only fires when the seed has the gate off; if the
+  PPS did not parse to the gate, or the gate is already on, it raises so the engine
+  picks another.
 
 ### Emulation-prevention byte stress mutator
 
