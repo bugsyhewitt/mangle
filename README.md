@@ -207,6 +207,40 @@ crash-fed campaign stays exactly as replayable as a single-seed one — see
 `--seed-dir` form replay uses to resolve those base seeds. Fully deterministic
 for a given `--seed-rng`.
 
+#### Multi-seed corpus (`--seed-corpus-dir`)
+
+The engine-side companion of `mangle corpus` and `mangle corpus-trim`. Where
+`--seed-from-crashes` re-mutates a *prior campaign's crashes*, `--seed-corpus-dir`
+spreads a campaign's iterations across *any* directory of `*.h265` seed files —
+typically the diverse, minimal corpus that `mangle corpus` produces (one seed
+per SPS dimension class, chroma format, incomplete parameter-set shape, etc.),
+optionally minimised through `mangle corpus-trim`:
+
+```bash
+# 1. Generate a diverse seed corpus from one seed file.
+mangle corpus --seed tests/fixtures/clean.h265 --output-dir /tmp/corpus
+
+# 2. (optional) Minimise the corpus to one seed per decode behaviour.
+mangle corpus-trim --input-dir /tmp/corpus --output-dir /tmp/corpus-trimmed
+
+# 3. Fuzz across the corpus — iterations spread round-robin across every seed.
+mangle fuzz \
+  --seed-corpus-dir /tmp/corpus-trimmed \
+  --output-dir /tmp/fuzz-out \
+  --iterations 2000
+```
+
+`--seed`, `--seed-from-crashes`, and `--seed-corpus-dir` are mutually exclusive
+— a campaign has exactly one base-input source. The seeds are gathered into a
+pool sorted by filename for determinism and iterations are assigned round-robin
+by iteration index (the same dispatch as `--seed-from-crashes`). Each iteration
+records the `base_seed` it mutated in `results.jsonl`, so the run stays fully
+replayable via `mangle replay --seed-dir <the corpus dir>` (see
+[Replay any iteration's mutant](#replay-any-iterations-mutant)). Non-`*.h265`
+files in the directory are ignored, so a sibling `manifest.json` (the shape
+`mangle corpus` writes) is left alone. Fully deterministic for a given
+`--seed-rng`.
+
 ### Differential decoder oracle
 
 ```bash

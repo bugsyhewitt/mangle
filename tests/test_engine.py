@@ -544,6 +544,211 @@ class TestSeedFromCrashesCli:
         assert (out_dir / "results.jsonl").exists()
 
 
+class TestSeedCorpusDir:
+    """``--seed-corpus-dir``: spread iterations across a directory of seeds.
+
+    The engine-side companion of ``mangle corpus`` / ``mangle corpus-trim``.
+    Mirrors the ``--seed-from-crashes`` dispatch (sorted, round-robin, each
+    iteration records its ``base_seed`` for replay) but the source is any
+    directory of ``*.h265`` seed files, not specifically a prior crashes/ dir.
+    """
+
+    def _make_corpus(self, tmp_path, n=3):
+        """Write n distinct valid *.h265 seeds plus a manifest.json to ignore."""
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        base = SEED.read_bytes()
+        names = []
+        for k in range(n):
+            from mangle.engine import mutate_bytes
+            import random as _random
+
+            mutated, _ = mutate_bytes(base, "sps-dimensions", _random.Random(k))
+            name = f"seed-{k:03d}.h265"
+            (corpus / name).write_bytes(mutated)
+            names.append(name)
+        # mangle corpus writes a sibling manifest.json — the pool must ignore it.
+        (corpus / "manifest.json").write_text('{"entries": []}')
+        return corpus, sorted(names)
+
+    def test_rejects_seed_and_corpus_together(self, tmp_path):
+        import pytest
+
+        with pytest.raises(ValueError, match="exactly one base-input source"):
+            engine.fuzz_file(
+                SEED,
+                tmp_path / "out",
+                iterations=2,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_corpus_dir=str(tmp_path / "corpus"),
+            )
+
+    def test_rejects_crashes_and_corpus_together(self, tmp_path):
+        import pytest
+
+        with pytest.raises(ValueError, match="exactly one base-input source"):
+            engine.fuzz_file(
+                None,
+                tmp_path / "out",
+                iterations=2,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_from_crashes=str(tmp_path / "crashes"),
+                seed_corpus_dir=str(tmp_path / "corpus"),
+            )
+
+    def test_missing_corpus_dir(self, tmp_path):
+        import pytest
+
+        with pytest.raises(FileNotFoundError, match="no such corpus directory"):
+            engine.fuzz_file(
+                None,
+                tmp_path / "out",
+                iterations=2,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_corpus_dir=str(tmp_path / "nope"),
+            )
+
+    def test_empty_corpus_dir(self, tmp_path):
+        import pytest
+
+        corpus = tmp_path / "empty"
+        corpus.mkdir()
+        with pytest.raises(ValueError, match="no .* seed files"):
+            engine.fuzz_file(
+                None,
+                tmp_path / "out",
+                iterations=2,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_corpus_dir=str(corpus),
+            )
+
+    def test_ignores_non_h265_files(self, tmp_path, monkeypatch):
+        # A manifest.json alongside the *.h265 seeds must not enter the pool.
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        corpus, names = self._make_corpus(tmp_path, n=3)
+        results = engine.fuzz_file(
+            None,
+            tmp_path / "out",
+            iterations=6,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            seed_corpus_dir=str(corpus),
+        )
+        # Every base_seed picked is one of the three *.h265 names; the
+        # manifest.json is never selected.
+        used = {r.base_seed for r in results}
+        assert used.issubset(set(names))
+        assert "manifest.json" not in used
+
+    def test_records_base_seed_round_robin(self, tmp_path, monkeypatch):
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        corpus, names = self._make_corpus(tmp_path, n=3)
+        out_dir = tmp_path / "out"
+        results = engine.fuzz_file(
+            None,
+            out_dir,
+            iterations=9,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            seed_corpus_dir=str(corpus),
+        )
+        base_seeds = [r.base_seed for r in results]
+        # Round-robin by iteration index, sorted by basename.
+        assert base_seeds == [names[i % 3] for i in range(9)]
+        # results.jsonl carries base_seed for replay.
+        first = json.loads(
+            (out_dir / "results.jsonl").read_text().strip().splitlines()[0]
+        )
+        assert first["base_seed"] in names
+
+    def test_corpus_fed_campaign_is_reproducible(self, tmp_path, monkeypatch):
+        corpus, _ = self._make_corpus(tmp_path, n=2)
+
+        def content_outcome(decoder, path, timeout, runner=None):
+            data = Path(path).read_bytes()
+            if sum(data) % 3 == 0:
+                return DecodeResult(Outcome.CRASH, -signal.SIGSEGV, "boom")
+            return DecodeResult(Outcome.CLEAN, 0, "")
+
+        monkeypatch.setattr(engine, "run_decoder", content_outcome)
+        a = engine.fuzz_file(
+            None, tmp_path / "a", iterations=12, decoder="ffmpeg",
+            timeout=5.0, seed_rng=7, seed_corpus_dir=str(corpus),
+        )
+        b = engine.fuzz_file(
+            None, tmp_path / "b", iterations=12, decoder="ffmpeg",
+            timeout=5.0, seed_rng=7, seed_corpus_dir=str(corpus),
+        )
+        assert [(r.mutator, r.seed_rng, r.base_seed) for r in a] == [
+            (r.mutator, r.seed_rng, r.base_seed) for r in b
+        ]
+
+
+class TestSeedCorpusDirCli:
+    def test_cli_rejects_seed_and_corpus(self, tmp_path):
+        import pytest
+
+        with pytest.raises(SystemExit):
+            main(
+                [
+                    "fuzz",
+                    "--seed",
+                    str(SEED),
+                    "--seed-corpus-dir",
+                    str(tmp_path),
+                    "--output-dir",
+                    str(tmp_path / "out"),
+                ]
+            )
+
+    def test_cli_rejects_crashes_and_corpus(self, tmp_path):
+        import pytest
+
+        with pytest.raises(SystemExit):
+            main(
+                [
+                    "fuzz",
+                    "--seed-from-crashes",
+                    str(tmp_path / "crashes"),
+                    "--seed-corpus-dir",
+                    str(tmp_path / "corpus"),
+                    "--output-dir",
+                    str(tmp_path / "out"),
+                ]
+            )
+
+    def test_cli_runs_from_corpus(self, tmp_path, monkeypatch, capsys):
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "a.h265").write_bytes(SEED.read_bytes())
+        (corpus / "b.h265").write_bytes(SEED.read_bytes())
+        out_dir = tmp_path / "out"
+        rc = main(
+            [
+                "fuzz",
+                "--seed-corpus-dir",
+                str(corpus),
+                "--output-dir",
+                str(out_dir),
+                "--iterations",
+                "6",
+                "--seed-rng",
+                "3",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "corpus seed(s)" in out
+        assert (out_dir / "results.jsonl").exists()
+
+
 def _patch_pair(monkeypatch, pair_for):
     """Replace run_decoder_pair with a deterministic per-iteration mock."""
     state = {"i": 0}
