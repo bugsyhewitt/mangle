@@ -3,6 +3,7 @@
 Subcommands:
   mutate  - apply one structured mutation to a seed and write the mutant
   fuzz    - run many mutations against a decoder and record outcomes
+  diff    - run mutants through two decoders and record where they disagree
   corpus  - generate a diverse minimal seed corpus from one seed file
   triage  - cluster and deduplicate the crashes from a fuzz run
   mutators - list available mutator types
@@ -16,7 +17,7 @@ from collections import Counter
 
 from . import __version__
 from .corpus import build_corpus
-from .engine import fuzz_file, mutate_file
+from .engine import diff_file, fuzz_file, mutate_file
 from .mutators import list_mutators
 from .triage import triage
 
@@ -94,6 +95,63 @@ def build_parser() -> argparse.ArgumentParser:
         help="parallel decode workers (asyncio)",
     )
     p_fuzz.set_defaults(func=_cmd_fuzz)
+
+    # diff
+    p_diff = sub.add_parser(
+        "diff",
+        help="run mutants through two decoders and record where they disagree",
+        description=(
+            "Differential decoder oracle. Feeds each mutant through TWO decoders "
+            "and records the iterations where they disagree on the crash class — "
+            "one decoder crashes/aborts while the other decodes cleanly (a "
+            "'crash-split'), or both crash with different signals (a "
+            "'signal-split'). Divergences expose silent spec violations a "
+            "single-decoder crash-only campaign misses (TWINFUZZ, NDSS 2025). "
+            "Writes diff.jsonl plus a divergences/ directory holding each "
+            "diverging mutant and a side-by-side stderr report."
+        ),
+    )
+    p_diff.add_argument("--seed", required=True, help="path to the seed H.265 file")
+    p_diff.add_argument(
+        "--output-dir",
+        required=True,
+        help="directory for diff.jsonl and divergences/",
+    )
+    p_diff.add_argument(
+        "--iterations", type=int, default=100, help="number of mutate+decode-pair cycles"
+    )
+    p_diff.add_argument(
+        "--left-decoder",
+        default="ffmpeg",
+        choices=["ffmpeg", "libde265"],
+        help="first decoder of the differential pair",
+    )
+    p_diff.add_argument(
+        "--right-decoder",
+        default="libde265",
+        choices=["ffmpeg", "libde265"],
+        help="second decoder of the differential pair (must differ from --left-decoder)",
+    )
+    p_diff.add_argument(
+        "--timeout", type=float, default=5.0, help="per-decode wall-clock timeout (s)"
+    )
+    p_diff.add_argument(
+        "--seed-rng", type=int, default=0, help="RNG seed for the whole campaign"
+    )
+    p_diff.add_argument(
+        "--mutator",
+        action="append",
+        dest="mutators",
+        choices=list_mutators(),
+        help="restrict to specific mutators (repeatable); default = all",
+    )
+    p_diff.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        help="parallel decode workers (asyncio)",
+    )
+    p_diff.set_defaults(func=_cmd_diff)
 
     # corpus
     p_corpus = sub.add_parser(
@@ -184,6 +242,37 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
     print(f"results written to {args.output_dir}/results.jsonl")
     if crashes:
         print(f"{len(crashes)} crash artifact(s) in {args.output_dir}/crashes/")
+    return 0
+
+
+def _cmd_diff(args: argparse.Namespace) -> int:
+    results = diff_file(
+        seed_path=args.seed,
+        output_dir=args.output_dir,
+        iterations=args.iterations,
+        left_decoder=args.left_decoder,
+        right_decoder=args.right_decoder,
+        timeout=args.timeout,
+        seed_rng=args.seed_rng,
+        mutators=args.mutators,
+        concurrency=args.concurrency,
+    )
+    divergences = [r for r in results if r.diverged]
+    by_kind = Counter(r.kind for r in divergences)
+    print(
+        f"ran {len(results)} iterations: "
+        f"{args.left_decoder} vs {args.right_decoder}"
+    )
+    print(f"  divergences: {len(divergences)}")
+    for kind in ("crash-split", "signal-split"):
+        if by_kind.get(kind):
+            print(f"    {kind}: {by_kind[kind]}")
+    print(f"results written to {args.output_dir}/diff.jsonl")
+    if divergences:
+        print(
+            f"{len(divergences)} divergence artifact(s) in "
+            f"{args.output_dir}/divergences/"
+        )
     return 0
 
 

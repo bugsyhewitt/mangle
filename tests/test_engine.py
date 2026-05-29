@@ -7,7 +7,8 @@ import signal
 from pathlib import Path
 
 import mangle.engine as engine
-from mangle.decoder import DecodeResult, Outcome
+from mangle.cli import main
+from mangle.decoder import DecodeResult, DivergenceResult, Outcome
 
 SEED = Path(__file__).parent / "fixtures" / "clean.h265"
 
@@ -101,3 +102,190 @@ class TestFuzzFile:
         )
         seen = {r.outcome for r in results}
         assert {"clean", "crash", "timeout", "abort"} == seen
+
+
+def _patch_pair(monkeypatch, pair_for):
+    """Replace run_decoder_pair with a deterministic per-iteration mock."""
+    state = {"i": 0}
+
+    def fake(left, right, path, timeout):
+        idx = state["i"]
+        state["i"] += 1
+        return pair_for(idx, left, right)
+
+    monkeypatch.setattr(engine, "run_decoder_pair", fake)
+
+
+def _agree(left, right):
+    return DivergenceResult(
+        diverged=False,
+        kind="agree",
+        left=DecodeResult(Outcome.CLEAN, 0, "", decoder=left),
+        right=DecodeResult(Outcome.CLEAN, 0, "", decoder=right),
+    )
+
+
+def _crash_split(left, right):
+    return DivergenceResult(
+        diverged=True,
+        kind="crash-split",
+        left=DecodeResult(Outcome.CRASH, -signal.SIGSEGV, "ffmpeg boom", decoder=left),
+        right=DecodeResult(Outcome.CLEAN, 0, "", decoder=right),
+    )
+
+
+class TestDiffFile:
+    def test_records_diff_jsonl(self, tmp_path, monkeypatch):
+        _patch_pair(monkeypatch, lambda i, left, right: _agree(left, right))
+        out_dir = tmp_path / "diff-out"
+        results = engine.diff_file(
+            SEED,
+            out_dir,
+            iterations=12,
+            left_decoder="ffmpeg",
+            right_decoder="libde265",
+            timeout=5.0,
+            seed_rng=1,
+        )
+        assert len(results) == 12
+        diff_file = out_dir / "diff.jsonl"
+        assert diff_file.exists()
+        lines = diff_file.read_text().strip().splitlines()
+        assert len(lines) == 12
+        first = json.loads(lines[0])
+        assert set(first) >= {
+            "iteration",
+            "mutator",
+            "diverged",
+            "kind",
+            "left_decoder",
+            "right_decoder",
+            "left_outcome",
+            "right_outcome",
+        }
+        assert all(r.diverged is False for r in results)
+
+    def test_divergence_writes_artifacts(self, tmp_path, monkeypatch):
+        # Every 4th iteration diverges (crash-split).
+        def pair_for(i, left, right):
+            if i % 4 == 0:
+                return _crash_split(left, right)
+            return _agree(left, right)
+
+        _patch_pair(monkeypatch, pair_for)
+        out_dir = tmp_path / "diff-out"
+        results = engine.diff_file(
+            SEED,
+            out_dir,
+            iterations=12,
+            left_decoder="ffmpeg",
+            right_decoder="libde265",
+            timeout=5.0,
+            seed_rng=1,
+        )
+        div_dir = out_dir / "divergences"
+        assert div_dir.exists()
+        h265 = list(div_dir.glob("*.h265"))
+        txt = list(div_dir.glob("*.txt"))
+        assert len(h265) >= 1
+        # Each diverging mutant has a side-by-side stderr report.
+        for h in h265:
+            report = (div_dir / f"{h.stem}.txt").read_text()
+            assert "crash-split" in report
+            assert "ffmpeg" in report
+            assert "libde265" in report
+        diverged = [r for r in results if r.diverged]
+        assert len(diverged) >= 1
+        assert all(r.divergence_hash for r in diverged)
+
+    def test_same_decoder_rejected(self, tmp_path):
+        out_dir = tmp_path / "diff-out"
+        try:
+            engine.diff_file(
+                SEED,
+                out_dir,
+                iterations=4,
+                left_decoder="ffmpeg",
+                right_decoder="ffmpeg",
+                timeout=5.0,
+                seed_rng=1,
+            )
+        except ValueError as exc:
+            assert "different decoders" in str(exc)
+        else:
+            raise AssertionError("expected ValueError for identical decoders")
+
+    def test_reproducible_mutator_selection(self, tmp_path, monkeypatch):
+        # Same seed-rng picks the same mutator sequence (criterion 7).
+        _patch_pair(monkeypatch, lambda i, left, right: _agree(left, right))
+        a = engine.diff_file(
+            SEED,
+            tmp_path / "a",
+            iterations=10,
+            left_decoder="ffmpeg",
+            right_decoder="libde265",
+            timeout=5.0,
+            seed_rng=7,
+        )
+        _patch_pair(monkeypatch, lambda i, left, right: _agree(left, right))
+        b = engine.diff_file(
+            SEED,
+            tmp_path / "b",
+            iterations=10,
+            left_decoder="ffmpeg",
+            right_decoder="libde265",
+            timeout=5.0,
+            seed_rng=7,
+        )
+        assert [r.mutator for r in a] == [r.mutator for r in b]
+        assert [r.seed_rng for r in a] == [r.seed_rng for r in b]
+
+
+class TestDiffCli:
+    def test_diff_subcommand_runs(self, tmp_path, monkeypatch, capsys):
+        def pair_for(i, left, right):
+            return _crash_split(left, right) if i % 5 == 0 else _agree(left, right)
+
+        _patch_pair(monkeypatch, pair_for)
+        out_dir = tmp_path / "diff-out"
+        rc = main(
+            [
+                "diff",
+                "--seed",
+                str(SEED),
+                "--output-dir",
+                str(out_dir),
+                "--iterations",
+                "10",
+                "--left-decoder",
+                "ffmpeg",
+                "--right-decoder",
+                "libde265",
+                "--seed-rng",
+                "3",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "ffmpeg vs libde265" in out
+        assert "divergences:" in out
+        assert (out_dir / "diff.jsonl").exists()
+        assert (out_dir / "divergences").exists()
+
+    def test_diff_same_decoder_errors(self, tmp_path, capsys):
+        rc = main(
+            [
+                "diff",
+                "--seed",
+                str(SEED),
+                "--output-dir",
+                str(tmp_path / "out"),
+                "--left-decoder",
+                "ffmpeg",
+                "--right-decoder",
+                "ffmpeg",
+            ]
+        )
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "different decoders" in err
