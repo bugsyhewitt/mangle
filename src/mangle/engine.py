@@ -101,6 +101,33 @@ def _collect_crash_seeds(crashes_dir: str | Path) -> list[tuple[str, bytes]]:
     return seeds
 
 
+def _collect_corpus_seeds(corpus_dir: str | Path) -> list[tuple[str, bytes]]:
+    """Return ``(basename, bytes)`` for every ``*.h265`` seed in a corpus directory.
+
+    The pool driver behind ``--seed-corpus-dir``: spreads a campaign's iterations
+    across an arbitrary directory of seed files (typically the output of
+    ``mangle corpus`` or ``mangle corpus-trim``, but any directory of valid
+    H.265 streams works). Returned sorted by basename so the seed assignment is
+    deterministic regardless of filesystem listing order, mirroring
+    ``_collect_crash_seeds``. Non-``*.h265`` files in the directory are ignored
+    so a sibling ``manifest.json`` (the shape ``mangle corpus`` writes) does not
+    get fed to the decoder.
+    """
+    d = Path(corpus_dir)
+    if not d.is_dir():
+        raise FileNotFoundError(
+            f"no such corpus directory: {corpus_dir} "
+            "(expected a directory of *.h265 seed files)"
+        )
+    files = sorted(d.glob("*.h265"), key=lambda p: p.name)
+    seeds = [(p.name, p.read_bytes()) for p in files]
+    if not seeds:
+        raise ValueError(
+            f"no *.h265 seed files found in {corpus_dir} — nothing to seed from"
+        )
+    return seeds
+
+
 async def _run_iteration(
     i: int,
     seed_data: bytes,
@@ -163,6 +190,7 @@ async def fuzz_async(
     concurrency: int,
     strategy: str = "uniform",
     seed_from_crashes: str | Path | None = None,
+    seed_corpus_dir: str | Path | None = None,
     time_limit: float | None = None,
     clock: Callable[[], float] | None = None,
 ) -> list[IterationResult]:
@@ -171,7 +199,7 @@ async def fuzz_async(
     Writes per-iteration outcomes to ``<output_dir>/results.jsonl`` and crash
     artifacts under ``<output_dir>/crashes/``.
 
-    The base input each iteration mutates comes from one of two mutually
+    The base input each iteration mutates comes from one of three mutually
     exclusive sources:
 
     - ``seed_path`` (the v0.1 shape): a single seed file. Every iteration mutates
@@ -182,6 +210,14 @@ async def fuzz_async(
       it. Iterations are assigned across the pool round-robin (deterministic), and
       each iteration records the basename of the crash artifact it mutated so the
       run stays fully replayable.
+    - ``seed_corpus_dir``: any directory of ``*.h265`` seed files — typically the
+      output of ``mangle corpus`` or ``mangle corpus-trim``, but any directory of
+      valid H.265 streams works. The seeds become the base-seed pool, sorted by
+      filename for determinism, and iterations are assigned across the pool
+      round-robin by iteration index (the same dispatch as
+      ``seed_from_crashes``). Each iteration records the basename of the seed it
+      mutated so the run stays fully replayable via ``mangle replay`` with the
+      same ``--seed-dir`` form.
 
     ``strategy`` selects the mutator-scheduling policy:
 
@@ -208,13 +244,18 @@ async def fuzz_async(
     recorded in ``results.jsonl`` exactly as before. ``clock`` is the monotonic
     time source (injectable for testing).
     """
-    if seed_from_crashes is not None and seed_path is not None:
+    sources_supplied = sum(
+        x is not None for x in (seed_path, seed_from_crashes, seed_corpus_dir)
+    )
+    if sources_supplied > 1:
         raise ValueError(
             "fuzz takes exactly one base-input source: --seed OR "
-            "--seed-from-crashes, not both"
+            "--seed-from-crashes OR --seed-corpus-dir, not more than one"
         )
-    if seed_from_crashes is None and seed_path is None:
-        raise ValueError("fuzz requires --seed or --seed-from-crashes")
+    if sources_supplied == 0:
+        raise ValueError(
+            "fuzz requires --seed or --seed-from-crashes or --seed-corpus-dir"
+        )
     if time_limit is not None and time_limit <= 0:
         raise ValueError(
             f"--time-limit must be a positive number of seconds (got {time_limit})"
@@ -228,13 +269,16 @@ async def fuzz_async(
     out_dir.mkdir(parents=True, exist_ok=True)
     crashes_dir = out_dir / "crashes"
 
-    # Build the base-seed pool: either one (--seed) or many (--seed-from-crashes).
-    # ``seed_pool`` is a list of (basename | None, bytes); a None basename marks
-    # the single-seed v0.1 case so its results record base_seed=None.
+    # Build the base-seed pool: one (--seed) or many (--seed-from-crashes /
+    # --seed-corpus-dir). ``seed_pool`` is a list of (basename | None, bytes);
+    # a None basename marks the single-seed v0.1 case so its results record
+    # base_seed=None.
     if seed_from_crashes is not None:
         seed_pool: list[tuple[str | None, bytes]] = list(
             _collect_crash_seeds(seed_from_crashes)
         )
+    elif seed_corpus_dir is not None:
+        seed_pool = list(_collect_corpus_seeds(seed_corpus_dir))
     else:
         seed_pool = [(None, Path(seed_path).read_bytes())]
 
@@ -356,6 +400,7 @@ def fuzz_file(
     concurrency: int = 4,
     strategy: str = "uniform",
     seed_from_crashes: str | Path | None = None,
+    seed_corpus_dir: str | Path | None = None,
     time_limit: float | None = None,
     clock: Callable[[], float] | None = None,
 ) -> list[IterationResult]:
@@ -372,6 +417,7 @@ def fuzz_file(
             concurrency,
             strategy,
             seed_from_crashes,
+            seed_corpus_dir,
             time_limit,
             clock,
         )

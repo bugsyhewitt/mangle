@@ -86,6 +86,19 @@ def build_parser() -> argparse.ArgumentParser:
             "crash pool round-robin; mutually exclusive with --seed"
         ),
     )
+    fuzz_seed_src.add_argument(
+        "--seed-corpus-dir",
+        help=(
+            "directory of *.h265 seed files to spread iterations across — "
+            "typically the output of `mangle corpus` or `mangle corpus-trim`, but "
+            "any directory of valid H.265 streams works. Iterations are assigned "
+            "across the pool round-robin by iteration index (deterministic); each "
+            "iteration records the base seed's filename so the run stays fully "
+            "replayable via `mangle replay --seed-dir <this-dir>`. Mutually "
+            "exclusive with --seed and --seed-from-crashes. Non-*.h265 files in "
+            "the directory (e.g. a sibling manifest.json) are ignored"
+        ),
+    )
     p_fuzz.add_argument(
         "--output-dir", required=True, help="directory for results.jsonl and crashes/"
     )
@@ -489,6 +502,7 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         concurrency=args.concurrency,
         strategy=args.strategy,
         seed_from_crashes=args.seed_from_crashes,
+        seed_corpus_dir=args.seed_corpus_dir,
         time_limit=args.time_limit,
     )
     counts = Counter(r.outcome for r in results)
@@ -505,6 +519,13 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         print(
             f"ran {len(results)} iterations against {args.decoder} "
             f"({args.strategy} scheduler), fed from {n_seeds} crash seed(s)"
+            f"{budget_note}"
+        )
+    elif args.seed_corpus_dir:
+        n_seeds = len({r.base_seed for r in results if r.base_seed is not None})
+        print(
+            f"ran {len(results)} iterations against {args.decoder} "
+            f"({args.strategy} scheduler), fed from {n_seeds} corpus seed(s)"
             f"{budget_note}"
         )
     else:
