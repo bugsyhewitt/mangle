@@ -665,6 +665,15 @@ class PicParameterSet:
     the ``pps-extension-flags`` mutator. Either is recorded only when the parser
     reaches it (untiled PPS, not truncated).
 
+    Between the scaling-list gate and the extension gate the parser also records
+    ``slice_segment_header_extension_present_flag`` (H.265 §7.3.2.1). That single
+    u(1) flag, when 1, makes *every* slice segment header carry a
+    ``slice_segment_header_extension_length`` ue(v) plus that many extension data
+    bytes (H.265 §7.3.6.1). It is a PPS field that gates a *slice-header* sub-block
+    — bridging the PPS and slice-header sides of the systematic walk — and is the
+    target of the ``pps-slice-header-extension`` mutator. Recorded only when the
+    parser reaches it (untiled, non-truncated PPS with the scaling-list gate off).
+
     Any field not reached (e.g. tiles enabled → variable geometry, or a truncated
     PPS) is simply absent from ``spans`` and its attribute left ``None``.
     """
@@ -688,6 +697,9 @@ class PicParameterSet:
     pps_tc_offset_div2: int | None = None
     # PPS extension gate flags (None if the parser did not reach them).
     pps_scaling_list_data_present_flag: int | None = None
+    # Slice-header extension gate (None if the parser did not reach it). A PPS
+    # u(1) flag that gates a per-slice-header extension sub-block.
+    slice_segment_header_extension_present_flag: int | None = None
     pps_extension_present_flag: int | None = None
 
     def span(self, name: str) -> FieldSpan:
@@ -855,7 +867,18 @@ def parse_pps(rbsp: bytes) -> PicParameterSet:
 
             reader.read_bit()  # lists_modification_present_flag
             reader.read_ue()  # log2_parallel_merge_level_minus2
-            reader.read_bit()  # slice_segment_header_extension_present_flag
+
+            shext_off = reader.bit_position
+            shext_present = reader.read_bit()  # slice_segment_header_extension_present_flag
+            pps.slice_segment_header_extension_present_flag = shext_present
+            pps.spans.append(
+                FieldSpan(
+                    "slice_segment_header_extension_present_flag",
+                    shext_off,
+                    1,
+                    shext_present,
+                )
+            )
 
             ext_off = reader.bit_position
             ext_present = reader.read_bit()  # pps_extension_present_flag

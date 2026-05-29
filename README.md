@@ -210,6 +210,7 @@ mangle mutators
 | `pps-extension-flags` | PPS extension | Flips a PPS extension gate (`pps_extension_present_flag`, preferred, or `pps_scaling_list_data_present_flag`) on without supplying the dependent `scaling_list_data()` / profile-extension body, forcing the decoder to read scaling-list coefficients or extension flags out of the PPS trailing bits |
 | `slice-no-output-prior-pics` | Slice header (IRAP) | Flips `no_output_of_prior_pics_flag` in an IRAP slice header, inverting the decoder's decision to discard the DPB without outputting its pictures when a new coded-video-sequence begins |
 | `vps-timing-info` | VPS | Flips `vps_timing_info_present_flag` on without supplying the dependent `vps_timing_info` / `hrd_parameters()` sub-block, forcing the decoder to read `num_units_in_tick` / `time_scale` and an HRD walk out of the VPS trailing bits |
+| `pps-slice-header-extension` | PPS → slice header | Flips `slice_segment_header_extension_present_flag` on in the PPS without the slices carrying the dependent extension block, so every slice header desyncs reading a `slice_segment_header_extension_length` ue(v) out of unrelated bits |
 
 All structured mutators keep the stream a parseable Annex-B bitstream while pushing
 it out of semantic spec-compliance — the input class that exercises decoder edge
@@ -458,6 +459,36 @@ throughout a decoder:
   length, so every other byte of the stream is preserved exactly. The parser promotes
   the flag (previously read and discarded) to a tracked span only for IRAP slices; on
   a stream with no IRAP slice the mutator raises so the engine picks another.
+
+### PPS slice-header extension gate mutator
+
+- **`pps-slice-header-extension`** is the first mutator whose target lives in the
+  PPS but whose dependent sub-block lives in the *slice header*, bridging the PPS
+  and slice-header sides of the systematic bitstream walk.
+  `slice_segment_header_extension_present_flag` (H.265 §7.3.2.1) is a single u(1)
+  PPS flag that sits between `log2_parallel_merge_level_minus2` and
+  `pps_extension_present_flag`. When it is 1, the spec requires *every* slice
+  segment header that references this PPS to carry, near its end (H.265 §7.3.6.1):
+  - `slice_segment_header_extension_length` — ue(v), range `0..256`.
+  - that many `slice_segment_header_extension_data_byte` bytes — u(8) each.
+
+  Flipping the gate `0 -> 1` in the PPS **without** the slices carrying that
+  extension block makes the decoder, on entry to each slice, read a
+  `slice_segment_header_extension_length` ue(v) out of whatever bits follow the
+  real slice-header fields, then skip that many bytes — desynchronising the
+  byte-alignment and entropy-decode entry point for the entire coded picture. A
+  length read as a large value drives the decoder to skip far past the slice
+  payload; decoders that do not bounds-check the skip against the NAL size read out
+  of bounds. This is the same "claims data that isn't there" gate-on desync used by
+  `sps-vui-hrd`, `sps-rext-flags`, `pps-extension-flags`, and `vps-timing-info`, but
+  it is the only one whose desync lands in the *slice-header* parse path rather than
+  in the parameter set itself.
+
+  The parser promotes the flag (previously read and discarded) to a tracked span
+  only for an untiled, non-truncated PPS whose scaling-list gate is off (a present
+  `scaling_list_data()` body is not modelled). The 1-bit splice is length-preserving.
+  The mutator only fires when the seed has the gate off; if the PPS did not parse to
+  the gate, or the gate is already on, it raises so the engine picks another.
 
 ### Emulation-prevention byte stress mutator
 

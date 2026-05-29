@@ -29,6 +29,7 @@ def _build_pps_rbsp(
     init_qp: int = 0,
     transform_skip: int = 0,
     scaling_list_present: int = 0,
+    slice_header_extension: int = 0,
     pps_extension_present: int = 0,
 ) -> bytes:
     """Construct a minimal but spec-shaped PPS RBSP through the deblocking block.
@@ -72,7 +73,7 @@ def _build_pps_rbsp(
     # remaining flags below are only meaningful when the gate is off.
     w.write_bit(0)  # lists_modification_present_flag
     w.write_ue(0)  # log2_parallel_merge_level_minus2
-    w.write_bit(0)  # slice_segment_header_extension_present_flag
+    w.write_bit(slice_header_extension)  # slice_segment_header_extension_present_flag
     w.write_bit(pps_extension_present)  # pps_extension_present_flag
     w.write_bit(1)  # rbsp_stop_one_bit
     return w.to_bytes()
@@ -647,6 +648,64 @@ class TestPpsExtensionGateParsing:
         span = pps.span("pps_extension_present_flag")
         flipped = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1)
         assert parse_pps(flipped).pps_extension_present_flag == 1
+
+
+class TestPpsSliceHeaderExtensionGateParsing:
+    def test_seed_reaches_slice_header_extension_gate(self):
+        # The single-frame intra seed (no tiles, control-present off, scaling-list
+        # off) walks the deblocking tail into the slice-header extension gate.
+        pps = parse_pps(_nal_rbsp(34))
+        assert pps.slice_segment_header_extension_present_flag in (0, 1)
+        assert pps.has_span("slice_segment_header_extension_present_flag")
+
+    def test_gate_is_a_single_bit(self):
+        pps = parse_pps(_build_pps_rbsp())
+        assert (
+            pps.span("slice_segment_header_extension_present_flag").bit_length == 1
+        )
+
+    def test_gate_sits_between_scaling_list_and_extension_gates(self):
+        pps = parse_pps(_build_pps_rbsp())
+        names = [s.name for s in pps.spans]
+        assert names.index("pps_scaling_list_data_present_flag") < names.index(
+            "slice_segment_header_extension_present_flag"
+        )
+        assert names.index("slice_segment_header_extension_present_flag") < names.index(
+            "pps_extension_present_flag"
+        )
+
+    def test_gate_recorded_when_on(self):
+        rbsp = _build_pps_rbsp(slice_header_extension=1)
+        pps = parse_pps(rbsp)
+        assert pps.slice_segment_header_extension_present_flag == 1
+
+    def test_scaling_list_gate_on_blocks_slice_header_gate_walk(self):
+        # A present scaling_list_data() body is not modelled, so the parser stops
+        # before reaching the slice-header extension gate.
+        rbsp = _build_pps_rbsp(scaling_list_present=1)
+        pps = parse_pps(rbsp)
+        assert pps.slice_segment_header_extension_present_flag is None
+        assert not pps.has_span("slice_segment_header_extension_present_flag")
+
+    def test_tiles_enabled_leaves_slice_header_gate_unset(self):
+        rbsp = _build_pps_rbsp(tiles_enabled=1)
+        pps = parse_pps(rbsp)
+        assert pps.slice_segment_header_extension_present_flag is None
+        assert not pps.has_span("slice_segment_header_extension_present_flag")
+
+    def test_splice_gate_round_trips(self):
+        rbsp = _build_pps_rbsp(slice_header_extension=0)
+        pps = parse_pps(rbsp)
+        span = pps.span("slice_segment_header_extension_present_flag")
+        flipped = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1)
+        reparsed = parse_pps(flipped)
+        assert reparsed.slice_segment_header_extension_present_flag == 1
+        # Length-preserving single-bit flip.
+        assert len(flipped) == len(rbsp)
+        # The neighbouring extension-present gate must be untouched.
+        assert (
+            reparsed.pps_extension_present_flag == pps.pps_extension_present_flag
+        )
 
 
 class TestSliceParsing:
