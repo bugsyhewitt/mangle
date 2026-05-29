@@ -487,6 +487,59 @@ distinct-bug fingerprint, exactly as in `triage` / `reduce` / `corpus-trim`. Use
 this to spot under-tested mutators (raise their `--mutator` weight or seed
 diversity next campaign) and to quantify a campaign's breadth before disclosure.
 
+### Report a mutation heat-map by bitstream region
+
+```bash
+mangle heatmap \
+  --output-dir /tmp/fuzz-out
+```
+
+Where `coverage` reports per-mutator stats as a **flat list** of 22 rows,
+`heatmap` rolls them up by the **bitstream region** each mutator targets — VPS,
+SPS, PPS, slice-header, RPS, SEI, or raw NAL framing — derived deterministically
+from the mutator name's prefix. mangle is a grammar-aware fuzzer, so every
+mutator aims at a specific structural area of the H.265 stream; this is the
+*"where is the soft spot in the parser?"* view that a flat per-mutator list does
+not give you.
+
+`mangle heatmap` is a pure post-processing pass over the campaign's
+`results.jsonl` (no decoder, fully deterministic — the same read-only shape as
+`coverage` / `triage` / `replay`). For each region it reports the iterations
+spent (the **pressure** axis), the outcome breakdown, the crash/abort count and
+the number of **distinct bugs** (the **reward** axis, deduplicated with the exact
+triage fingerprint so many crashes on one bug do not inflate a region), the bytes
+changed, the registry mutators that map to the region, and two intensities:
+`iteration_share` (the region's fraction of all iterations) and `crash_share`
+(its fraction of all crash/abort iterations).
+
+That `iteration_share` vs `crash_share` pair *is* the heat-map. A region whose
+crash share far exceeds its pressure share is hotter than its effort — the
+profitable target to lean into next campaign; a region that soaks up iterations
+but yields nothing is wasted pressure. Regions are listed hottest-first (most
+crashes, then most iterations, then name):
+
+```text
+mutation heat-map: 4 iteration(s) across 3 bitstream region(s), 2 crash/abort(s)
+  hottest region: rps
+  rps: 2 iter (50% pressure) -> 2 crash/abort (100% reward), 2 distinct bug(s) [crash=2]
+  pps: 1 iter (25% pressure) -> 0 crash/abort (0% reward) [clean=1]
+  sps: 1 iter (25% pressure) -> 0 crash/abort (0% reward) [clean=1]
+heat-map written to /tmp/fuzz-out/heatmap.json
+```
+
+Outputs:
+
+- `/tmp/fuzz-out/heatmap.json` — the full report: `total_iterations`,
+  `total_crash_aborts`, `region_count`, `hottest_region`, and a per-region
+  `regions` array (`region`, `iterations`, `outcomes`, `crash_aborts`,
+  `distinct_signatures`, `bytes_changed`, `mutators`, `iteration_share`,
+  `crash_share`).
+
+`--frame-depth` (default 3) controls how many top sanitizer stack frames feed the
+per-region distinct-bug count, exactly as in `coverage` / `triage` / `reduce` /
+`corpus-trim`. A mutator whose name carries an unmapped prefix buckets under an
+`other` region rather than being dropped.
+
 ### List the available mutators
 
 ```bash
