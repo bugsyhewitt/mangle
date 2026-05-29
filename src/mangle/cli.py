@@ -10,6 +10,7 @@ Subcommands:
   reduce  - minimise one crashing input to its minimal NAL-unit reproducer
   replay  - re-derive any fuzz iteration's mutant from the campaign metadata
   coverage - report which mutators a campaign exercised (structural coverage)
+  heatmap - report fuzzing pressure and reward by bitstream region
   mutators - list available mutator types
 """
 
@@ -24,6 +25,7 @@ from .corpus import build_corpus
 from .corpus_trim import trim_corpus_dir
 from .coverage import write_coverage
 from .engine import diff_file, fuzz_file, mutate_file
+from .heatmap import write_heatmap
 from .mutators import list_mutators
 from .reduce import reduce_file
 from .replay import replay_iteration
@@ -407,6 +409,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_coverage.set_defaults(func=_cmd_coverage)
 
+    # heatmap
+    p_heatmap = sub.add_parser(
+        "heatmap",
+        help="report fuzzing pressure and reward by bitstream region",
+        description=(
+            "Mutation heat-map. Where ``coverage`` reports per-mutator stats as a "
+            "flat list, ``heatmap`` aggregates the campaign's pressure (iterations, "
+            "bytes changed) and reward (crashes/aborts, distinct bugs) by the "
+            "BITSTREAM REGION each mutator targets — VPS, SPS, PPS, slice-header, "
+            "RPS, SEI, or raw NAL framing — derived deterministically from the "
+            "mutator name. The result is the 'where is the soft spot in the H.265 "
+            "parser?' view: a region whose share of crashes far exceeds its share "
+            "of iterations is the profitable target; a region that absorbs effort "
+            "but yields nothing is wasted pressure. Pure post-processing over the "
+            "campaign's results.jsonl — runs no decoder, deterministic, the same "
+            "read-only shape as ``coverage`` / ``triage`` / ``replay``. Distinct "
+            "bugs per region use the exact triage fingerprint so many crashes on "
+            "one bug do not inflate a region. Writes heatmap.json."
+        ),
+    )
+    p_heatmap.add_argument(
+        "--output-dir",
+        required=True,
+        help="a fuzz output directory containing results.jsonl (and crashes/)",
+    )
+    p_heatmap.add_argument(
+        "--frame-depth",
+        type=int,
+        default=3,
+        help="number of top sanitizer stack frames used for distinct-bug counting",
+    )
+    p_heatmap.set_defaults(func=_cmd_heatmap)
+
     # mutators
     p_list = sub.add_parser("mutators", help="list available mutator types")
     p_list.set_defaults(func=_cmd_list_mutators)
@@ -653,6 +688,33 @@ def _cmd_coverage(args: argparse.Namespace) -> int:
             f"not in this build's registry: {', '.join(report.unknown_mutators)}"
         )
     print(f"coverage report written to {args.output_dir}/coverage.json")
+    return 0
+
+
+def _cmd_heatmap(args: argparse.Namespace) -> int:
+    report = write_heatmap(
+        output_dir=args.output_dir,
+        frame_depth=args.frame_depth,
+    )
+    print(
+        f"mutation heat-map: {report.total_iterations} iteration(s) across "
+        f"{report.region_count} bitstream region(s), "
+        f"{report.total_crash_aborts} crash/abort(s)"
+    )
+    if report.hottest_region is not None:
+        print(f"  hottest region: {report.hottest_region}")
+    for r in report.regions:
+        breakdown = " ".join(f"{o}={n}" for o, n in r.outcomes.items())
+        bug_note = (
+            f", {r.distinct_signatures} distinct bug(s)" if r.crash_aborts else ""
+        )
+        print(
+            f"  {r.region}: {r.iterations} iter "
+            f"({r.iteration_share * 100:.0f}% pressure) "
+            f"-> {r.crash_aborts} crash/abort "
+            f"({r.crash_share * 100:.0f}% reward){bug_note} [{breakdown}]"
+        )
+    print(f"heat-map written to {args.output_dir}/heatmap.json")
     return 0
 
 
