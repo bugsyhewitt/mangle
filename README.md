@@ -209,6 +209,7 @@ mangle mutators
 | `sps-rext-flags` | SPS extension | Flips an SPS extension gate (`sps_range_extension_flag`, preferred, or `sps_extension_present_flag`) on without supplying the `sps_range_extension()` body, forcing the decoder onto its HEVC Range-Extension parse path with no valid extension parameter set behind it |
 | `pps-extension-flags` | PPS extension | Flips a PPS extension gate (`pps_extension_present_flag`, preferred, or `pps_scaling_list_data_present_flag`) on without supplying the dependent `scaling_list_data()` / profile-extension body, forcing the decoder to read scaling-list coefficients or extension flags out of the PPS trailing bits |
 | `slice-no-output-prior-pics` | Slice header (IRAP) | Flips `no_output_of_prior_pics_flag` in an IRAP slice header, inverting the decoder's decision to discard the DPB without outputting its pictures when a new coded-video-sequence begins |
+| `vps-timing-info` | VPS | Flips `vps_timing_info_present_flag` on without supplying the dependent `vps_timing_info` / `hrd_parameters()` sub-block, forcing the decoder to read `num_units_in_tick` / `time_scale` and an HRD walk out of the VPS trailing bits |
 
 All structured mutators keep the stream a parseable Annex-B bitstream while pushing
 it out of semantic spec-compliance — the input class that exercises decoder edge
@@ -253,7 +254,27 @@ long-term reference resolution:
 
   Motivation: the **TWINFUZZ** paper (NDSS 2025) showed hardware-acceleration
   stacks are disproportionately vulnerable to spec violations in the
-  parameter-set layer. No prior mangle mutator touched the VPS at all.
+  parameter-set layer.
+
+- **`vps-timing-info`** reaches deeper into the same VPS RBSP than
+  `vps-layer-count`: the parser now walks past `profile_tier_level`, the
+  sub-layer DPB-ordering loop and the layer-set inclusion loop to the
+  `vps_timing_info_present_flag` gate (H.265 §7.3.2.1). That single u(1) flag
+  gates a variable-length `vps_timing_info` sub-block — `vps_num_units_in_tick`
+  u(32), `vps_time_scale` u(32), `vps_poc_proportional_to_timing_flag`, an
+  optional `vps_num_ticks_poc_diff_one_minus1` ue(v), and a
+  `vps_num_hrd_parameters` ue(v) loop of `hrd_parameters()` structures. The
+  mutator flips the gate *on* without supplying any of that data, so the decoder
+  consumes 64+ bits of timing fields and an `hrd_parameters()` walk out of the
+  VPS trailing bits, forcing it onto the HRD-timing parse path with no valid
+  parameter set behind it. HRD timing arithmetic is the field class behind
+  **CVE-2022-22675**, and the VPS timing block is the VPS analogue of the SPS
+  `sps-vui-hrd` gate — an entirely untouched VPS attack surface. The mutator only
+  fires when the seed's gate is currently off (the "claims data that isn't there"
+  direction that desynchronises the tail without being rejected as broken
+  framing); when the VPS uses multi-layer / multi-sub-layer geometry the parser
+  does not model, is truncated, or already has the gate on, the mutator raises so
+  the engine picks another.
 
 ### PPS deblocking / loop-filter mutator
 

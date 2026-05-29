@@ -243,3 +243,144 @@ class TestVpsLayerCountNestingFlag:
                 )
                 return
         raise AssertionError("no seed exercised the vps_temporal_id_nesting_flag mutation path")
+
+
+# ---------------------------------------------------------------------------
+# parse_vps: vps_timing_info_present_flag gate (second-stage walk)
+# ---------------------------------------------------------------------------
+
+
+class TestVpsTimingInfoParsing:
+    def test_seed_vps_exposes_timing_gate(self):
+        vps = parse_vps(_vps_rbsp_from_seed())
+        # The seed is a single-layer, single-sub-layer stream, so the parser
+        # walks cleanly past PTL / DPB ordering / layer-set loops to the gate.
+        assert vps.has_span("vps_timing_info_present_flag")
+        assert vps.vps_timing_info_present_flag == 0
+
+    def test_timing_gate_span_is_one_bit(self):
+        vps = parse_vps(_vps_rbsp_from_seed())
+        span = vps.span("vps_timing_info_present_flag")
+        assert span.bit_length == 1
+
+    def test_timing_gate_is_after_the_header_fields(self):
+        vps = parse_vps(_vps_rbsp_from_seed())
+        timing_off = vps.span("vps_timing_info_present_flag").bit_offset
+        nesting_off = vps.span("vps_temporal_id_nesting_flag").bit_offset
+        # The timing gate sits well past the 16-bit fixed header.
+        assert timing_off > nesting_off
+        assert timing_off >= 16
+
+    def test_timing_gate_splice_round_trip(self):
+        rbsp = _vps_rbsp_from_seed()
+        vps = parse_vps(rbsp)
+        span = vps.span("vps_timing_info_present_flag")
+        new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1)
+        reparsed = parse_vps(new_rbsp)
+        assert reparsed.vps_timing_info_present_flag == 1
+        # The flip is length-preserving (single bit).
+        assert len(new_rbsp) == len(rbsp)
+        # Header fields must be untouched.
+        assert reparsed.vps_max_layers_minus1 == vps.vps_max_layers_minus1
+        assert reparsed.vps_max_sub_layers_minus1 == vps.vps_max_sub_layers_minus1
+        assert reparsed.vps_temporal_id_nesting_flag == vps.vps_temporal_id_nesting_flag
+
+    def test_truncated_vps_leaves_timing_gate_none(self):
+        # A VPS RBSP that ends right after the 16-bit fixed header cannot reach
+        # the timing gate; the field must be None (not an exception).
+        vps = parse_vps(_SYNTHETIC_VPS_RBSP[:2])
+        assert vps.vps_timing_info_present_flag is None
+        assert not vps.has_span("vps_timing_info_present_flag")
+        # The fixed header view still parses.
+        assert vps.vps_max_layers_minus1 == 0
+
+
+# ---------------------------------------------------------------------------
+# vps-timing-info mutator tests
+# ---------------------------------------------------------------------------
+
+
+class TestVpsTimingInfoRegistered:
+    def test_mutator_is_registered(self):
+        from mangle.mutators import list_mutators
+        assert "vps-timing-info" in list_mutators()
+
+
+class TestVpsTimingInfoNoVps:
+    def test_raises_when_no_vps_present(self):
+        nals = _seed_nals()
+        nals_no_vps = [n for n in nals if n.nal_unit_type != 32]
+        rng = random.Random(1)
+        try:
+            get_mutator("vps-timing-info")(nals_no_vps, rng)
+        except (ValueError, KeyError):
+            pass  # expected — no VPS in stream
+        else:
+            raise AssertionError("expected an error when no VPS NAL is present")
+
+
+class TestVpsTimingInfoMutation:
+    def test_flips_gate_on(self):
+        result = get_mutator("vps-timing-info")(_seed_nals(), random.Random(3))
+        mutated = assemble_nal_units(result.nals)
+        vps_nal = next(n for n in split_nal_units(mutated) if n.nal_unit_type == 32)
+        vps = parse_vps(ebsp_to_rbsp(vps_nal.ebsp[2:]))
+        assert vps.vps_timing_info_present_flag == 1
+
+    def test_produces_change(self):
+        original = SEED.read_bytes()
+        result = get_mutator("vps-timing-info")(_seed_nals(), random.Random(42))
+        assert result.bytes_changed > 0
+        assert assemble_nal_units(result.nals) != original
+
+    def test_mutator_name_in_result(self):
+        result = get_mutator("vps-timing-info")(_seed_nals(), random.Random(0))
+        assert result.mutator == "vps-timing-info"
+
+    def test_detail_is_nonempty(self):
+        result = get_mutator("vps-timing-info")(_seed_nals(), random.Random(0))
+        assert result.detail
+        assert "vps_timing_info_present_flag" in result.detail
+
+    def test_length_preserving_single_bit_flip(self):
+        original = _seed_nals()
+        orig_vps = next(n for n in original if n.nal_unit_type == 32)
+        result = get_mutator("vps-timing-info")(_seed_nals(), random.Random(9))
+        mut_vps = next(n for n in result.nals if n.nal_unit_type == 32)
+        # One bit changed → RBSP byte length unchanged.
+        assert len(ebsp_to_rbsp(mut_vps.ebsp[2:])) == len(
+            ebsp_to_rbsp(orig_vps.ebsp[2:])
+        )
+
+    def test_only_vps_nal_changes(self):
+        original = _seed_nals()
+        result = get_mutator("vps-timing-info")(_seed_nals(), random.Random(42))
+        for orig, mut in zip(original, result.nals):
+            if orig.nal_unit_type == 32:
+                continue  # VPS may change
+            assert orig.ebsp == mut.ebsp, (
+                f"non-VPS NAL type {orig.nal_unit_type} was modified"
+            )
+
+    def test_framing_intact(self):
+        result = get_mutator("vps-timing-info")(_seed_nals(), random.Random(42))
+        mutated = assemble_nal_units(result.nals)
+        assert mutated[:4] == START_CODE_LONG or mutated[:3] == START_CODE_SHORT
+        assert len(split_nal_units(mutated)) == len(_seed_nals())
+
+    def test_reproducible(self):
+        r1 = get_mutator("vps-timing-info")(_seed_nals(), random.Random(42))
+        r2 = get_mutator("vps-timing-info")(_seed_nals(), random.Random(42))
+        assert assemble_nal_units(r1.nals) == assemble_nal_units(r2.nals)
+        assert r1.detail == r2.detail
+
+    def test_double_application_idempotent(self):
+        # After the first flip the gate is on; a second application must raise,
+        # since the gate-on desync needs an off gate.
+        first = get_mutator("vps-timing-info")(_seed_nals(), random.Random(1))
+        try:
+            get_mutator("vps-timing-info")(first.nals, random.Random(1))
+        except ValueError:
+            pass  # expected — gate already set
+        else:
+            raise AssertionError("expected ValueError when the gate is already on")

@@ -745,6 +745,80 @@ def vps_layer_count(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     )
 
 
+@register("vps-timing-info")
+def vps_timing_info(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Flip the VPS ``vps_timing_info_present_flag`` gate on without its sub-block.
+
+    After ``profile_tier_level``, the sub-layer DPB-ordering loop and the
+    layer-set inclusion loop, the VPS carries a single u(1) gate
+    ``vps_timing_info_present_flag`` (H.265 §7.3.2.1). When 1, the decoder reads a
+    variable-length ``vps_timing_info`` sub-block:
+
+      * ``vps_num_units_in_tick``  u(32)
+      * ``vps_time_scale``         u(32)
+      * ``vps_poc_proportional_to_timing_flag`` u(1)
+      * ``vps_num_ticks_poc_diff_one_minus1``   ue(v)  (only when the flag above is 1)
+      * ``vps_num_hrd_parameters`` ue(v), then a loop of ``hrd_layer_set_idx`` /
+        ``cprms_present_flag`` / ``hrd_parameters()`` structures.
+
+    This is the VPS analogue of the SPS ``sps-vui-hrd`` / ``sps-rext-flags`` gate-
+    inconsistency mutators (and the VPS complement to ``vps-layer-count``, which
+    targets the fixed layer/sublayer counts rather than a gated sub-block). It
+    flips the gate *on* without supplying any of the dependent timing/HRD data:
+    the decoder then consumes 64+ bits of ``num_units_in_tick`` / ``time_scale``
+    and an ``hrd_parameters()`` walk out of the VPS trailing bits (and whatever
+    follows the VPS in the access unit), forcing it onto the HRD timing parse path
+    with no valid parameter set behind it. HRD timing arithmetic
+    (``num_units_in_tick``, CPB removal delays) is the field class behind
+    CVE-2022-22675, and the VPS timing block is an entirely untouched attack
+    surface — no prior mangle mutator reaches past the VPS header.
+
+    The mutator only fires when the seed's gate is currently *off* (flipping a
+    gate on is the "claims data that isn't there" direction that desynchronises
+    the tail — the input class that exercises the parser without being rejected as
+    broken framing). If the VPS did not parse to the timing gate (multi-layer /
+    multi-sub-layer geometry the parser does not model, or a truncated VPS) or the
+    gate is already on, the mutator raises so the engine picks another.
+
+    [Worker decision: gate-flip splice keeps the VPS byte-stable]
+    The target is a single u(1) bit, so the splice never shifts the stream's
+    bit-length — only the one gate bit changes and the downstream desync is purely
+    semantic.
+    """
+    out = _clone(nals)
+    idx = _first(out, 32)  # VPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    vps = parse_vps(rbsp)
+
+    if not vps.has_span("vps_timing_info_present_flag"):
+        raise ValueError(
+            "VPS did not parse to vps_timing_info_present_flag; cannot mutate the "
+            "VPS timing-info gate"
+        )
+    span = vps.span("vps_timing_info_present_flag")
+    if span.value != 0:
+        raise ValueError(
+            "vps_timing_info_present_flag is already set; the gate-on desync needs "
+            "an off gate"
+        )
+
+    new_value = 1  # turn the gate on; the dependent vps_timing_info block is absent
+    new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="vps-timing-info",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=(
+            "vps_timing_info_present_flag: 0 -> 1 (VPS timing gate enabled without "
+            "its dependent vps_timing_info / hrd_parameters() block; downstream "
+            "HRD-timing desync)"
+        ),
+    )
+
+
 def _first_sei(nals: list[NalUnit]) -> int:
     """Return the index of the first PREFIX_SEI_NUT (39) or SUFFIX_SEI_NUT (40) NAL."""
     for i, n in enumerate(nals):

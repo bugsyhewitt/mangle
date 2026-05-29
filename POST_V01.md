@@ -495,6 +495,56 @@ gate target. It is the slice-header complement to the parameter-set gate mutator
 
 ---
 
+## 13. VPS timing-info gate mutator — ✅ IMPLEMENTED (2026-05-29)
+
+**Status:** Shipped. `parse_vps()` in `hevc.py` now has a second stage that walks
+past the fixed 16-bit header, `vps_reserved_0xffff_16bits`, `profile_tier_level`
+(via the existing `_parse_profile_tier_level` helper), the sub-layer DPB-ordering
+loop and the layer-set inclusion loop to record the `vps_timing_info_present_flag`
+gate (H.265 §7.3.2.1) as a tracked single-bit span. For multi-layer /
+multi-sub-layer geometry the parser does not model, or a truncated VPS, the second
+stage bails cleanly and the attribute is left `None` (the layer/sublayer view of
+`vps-layer-count` still stands). One mutator, `vps-timing-info`, was added to
+`builtin.py`; it flips the gate off→on without supplying the dependent
+`vps_timing_info` sub-block (`vps_num_units_in_tick` u(32), `vps_time_scale`
+u(32), `vps_poc_proportional_to_timing_flag`, optional
+`vps_num_ticks_poc_diff_one_minus1` ue(v), and the `vps_num_hrd_parameters` ue(v)
+`hrd_parameters()` loop), forcing the decoder to read 64+ bits of timing fields
+and an HRD walk out of the VPS trailing bits. It raises when the VPS did not parse
+to the gate or the gate is already on, so the engine picks another. Tests in
+`tests/test_vps.py` (`TestVpsTimingInfoParsing` + `TestVpsTimingInfoRegistered` +
+`TestVpsTimingInfoNoVps` + `TestVpsTimingInfoMutation`, 16 cases) cover the gate
+span, its position past the header, the truncated-VPS `None` path, the
+length-preserving splice round-trip, registration, the no-VPS raise, the gate
+flip, single-NAL containment, reproducibility, framing integrity, and the
+already-on double-application raise.
+
+**What:** Flip `vps_timing_info_present_flag` (H.265 §7.3.2.1) on without
+supplying the variable-length `vps_timing_info` / `hrd_parameters()` body it
+gates. This is the VPS analogue of the SPS `sps-vui-hrd` / `sps-rext-flags`
+gate-inconsistency mutators and the VPS complement to `vps-layer-count` (which
+touches only the fixed layer/sublayer counts, not a gated sub-block).
+
+**Why now:** HRD timing arithmetic (`num_units_in_tick`, CPB removal delays) is
+the field class behind CVE-2022-22675, and the VPS timing block is an entirely
+untouched attack surface — no prior mangle mutator reached past the VPS header.
+The clean, fully-modellable walk to the gate (the seed's single-layer geometry
+makes the DPB-ordering and layer-set loops trivially bounded) makes it the natural
+next VPS extension gate after `vps-layer-count`.
+
+**Implementation notes:**
+
+- `parse_vps` second stage reuses `_parse_profile_tier_level`; the DPB-ordering
+  and layer-set loops are bounded by already-parsed `vps_max_sub_layers_minus1`,
+  `vps_max_layer_id`, and `vps_num_layer_sets_minus1`, so the walk is exact for
+  the single-layer seed and any conformant single-layer stream.
+- The mutator is a 1-bit `splice_fixed_bits` on the located gate span
+  (length-preserving).
+
+**Estimated LOC:** ~90 (parser extension ~40 + mutator ~50).
+
+---
+
 ## Summary table
 
 | # | Name | Attack surface | New CVE class | Cost (LOC) | Priority |
@@ -511,6 +561,7 @@ gate target. It is the slice-header complement to the parameter-set gate mutator
 | 10 | nal-emulation-bytes | EBSP scanning | Parse confusion | ~70 | ✅ DONE |
 | 11 | pps-deblocking | PPS deblocking/loop-filter | OOB table lookup | ~110 | ✅ DONE |
 | 12 | slice-no-output-prior-pics | Slice-header DPB no-output | DPB flush/output desync | ~75 | ✅ DONE |
+| 13 | vps-timing-info | VPS timing / HRD gate | HRD-timing desync | ~90 | ✅ DONE |
 
 ---
 
@@ -546,7 +597,13 @@ first-slice flag, and NAL type swaps. The following high-value HEVC syntax regio
 are entirely untouched:
 
 1. VPS (all fields) — ✅ layer/sublayer/nesting gates covered by `vps-layer-count`
-   (item #2)
+   (item #2); the `vps_timing_info_present_flag` gate (and the variable-length
+   `vps_timing_info` / `hrd_parameters()` sub-block it guards) is now covered by
+   `vps-timing-info` (item #13). `parse_vps` walks past `profile_tier_level`, the
+   sub-layer DPB-ordering loop and the layer-set inclusion loop to the timing gate;
+   the mutator flips it off→on without supplying the dependent timing/HRD body. The
+   `vps_extension_flag` tail and the timing/HRD sub-block bodies themselves are
+   still not synthesised.
 2. RPS block in SPS and slice header — ✅ SPS short-term/long-term RPS covered by
    `rps-overflow` / `rps-lt-poc-ambiguity` (item #1); the slice-header delta-RPS
    syntax is not yet modelled.
