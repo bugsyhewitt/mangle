@@ -597,6 +597,21 @@ class PicParameterSet:
       * ``pps_beta_offset_div2`` / ``pps_tc_offset_div2`` — se(v), valid range
         [-6, 6]; present only when control is set and disable is off.
 
+    Past the deblocking region the parser also records the two single-bit PPS
+    extension gate flags (H.265 §7.3.2.1), which sit just after a short, fully
+    modellable run of flags:
+
+      * ``pps_scaling_list_data_present_flag`` — u(1) gate for the variable-length
+        ``scaling_list_data()`` block; when 1 the decoder reads a scaling-list
+        structure from the bits that follow.
+      * ``pps_extension_present_flag`` — u(1) gate for the four PPS profile-
+        extension flags (``pps_range_extension_flag`` etc.) and any enabled
+        extension body.
+
+    These are the PPS analogue of the SPS extension gates and are the targets of
+    the ``pps-extension-flags`` mutator. Either is recorded only when the parser
+    reaches it (untiled PPS, not truncated).
+
     Any field not reached (e.g. tiles enabled → variable geometry, or a truncated
     PPS) is simply absent from ``spans`` and its attribute left ``None``.
     """
@@ -618,6 +633,9 @@ class PicParameterSet:
     pps_deblocking_filter_disabled_flag: int | None = None
     pps_beta_offset_div2: int | None = None
     pps_tc_offset_div2: int | None = None
+    # PPS extension gate flags (None if the parser did not reach them).
+    pps_scaling_list_data_present_flag: int | None = None
+    pps_extension_present_flag: int | None = None
 
     def span(self, name: str) -> FieldSpan:
         for s in self.spans:
@@ -763,6 +781,41 @@ def parse_pps(rbsp: bytes) -> PicParameterSet:
     except (EOFError, ValueError):
         # Leave whatever deblocking fields we filled; tile view stands.
         pass
+
+    # Third stage: advance past the (fully modellable) deblocking tail into the
+    # PPS extension gate region (H.265 §7.3.2.1). Only attempt this when the
+    # second stage walked the deblocking region cleanly (i.e. the reader is
+    # positioned right after it); otherwise the reader offset is unreliable.
+    if pps.deblocking_filter_control_present_flag is not None:
+        try:
+            sl_off = reader.bit_position
+            sl_present = reader.read_bit()  # pps_scaling_list_data_present_flag
+            pps.pps_scaling_list_data_present_flag = sl_present
+            pps.spans.append(
+                FieldSpan("pps_scaling_list_data_present_flag", sl_off, 1, sl_present)
+            )
+            if sl_present:
+                # scaling_list_data() is variable-length and not modelled; the
+                # gate span is recorded so a mutator can locate it, but we cannot
+                # walk past the body to reach pps_extension_present_flag. Stop.
+                return pps
+
+            reader.read_bit()  # lists_modification_present_flag
+            reader.read_ue()  # log2_parallel_merge_level_minus2
+            reader.read_bit()  # slice_segment_header_extension_present_flag
+
+            ext_off = reader.bit_position
+            ext_present = reader.read_bit()  # pps_extension_present_flag
+            pps.pps_extension_present_flag = ext_present
+            pps.spans.append(
+                FieldSpan("pps_extension_present_flag", ext_off, 1, ext_present)
+            )
+            # The four PPS profile-extension flags (pps_range_extension_flag etc.)
+            # and their variable-length bodies follow only when this gate is on;
+            # they are not modelled. The gate span recorded above is the target.
+        except (EOFError, ValueError):
+            # Leave whatever extension gates we filled; everything else stands.
+            pass
 
     return pps
 

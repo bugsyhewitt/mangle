@@ -207,6 +207,7 @@ mangle mutators
 | `sps-feature-flags` | SPS | Flips `scaling_list_enabled_flag` or `pcm_enabled_flag` on without supplying the variable-length data block it gates, desynchronising the rest of the SPS |
 | `sps-vui-hrd` | SPS VUI | Flips a VUI / HRD gate flag (`vui_hrd_parameters_present_flag`, `vui_timing_info_present_flag`, or `vui_parameters_present_flag`) on without supplying the sub-block it gates, forcing the decoder to read CPB/HRD fields out of unrelated downstream bits |
 | `sps-rext-flags` | SPS extension | Flips an SPS extension gate (`sps_range_extension_flag`, preferred, or `sps_extension_present_flag`) on without supplying the `sps_range_extension()` body, forcing the decoder onto its HEVC Range-Extension parse path with no valid extension parameter set behind it |
+| `pps-extension-flags` | PPS extension | Flips a PPS extension gate (`pps_extension_present_flag`, preferred, or `pps_scaling_list_data_present_flag`) on without supplying the dependent `scaling_list_data()` / profile-extension body, forcing the decoder to read scaling-list coefficients or extension flags out of the PPS trailing bits |
 
 All structured mutators keep the stream a parseable Annex-B bitstream while pushing
 it out of semantic spec-compliance — the input class that exercises decoder edge
@@ -388,6 +389,30 @@ throughout a decoder:
   the extension is already on, or the seed's VUI carries an HRD sub-block whose
   variable-length body blocks the walk to the extension region) the mutator raises so
   the engine picks another.
+
+- **`pps-extension-flags`** is the PPS analogue of `sps-rext-flags` — it targets the
+  PPS extension gate region (H.265 §7.3.2.1), the PPS half of gap-analysis items #8
+  (scaling lists) and #10 (extension flags). To reach it the PPS parser walks *past*
+  the deblocking-filter control region into the short, fully-modellable run of flags
+  that precede the extension gates. The region is guarded by two single-bit gates,
+  each of which promises a variable-length sub-block when set:
+  - **`pps_extension_present_flag`** (preferred when reachable): forcing it on makes
+    the decoder read four PPS profile-extension flags (`pps_range_extension_flag`,
+    `pps_multilayer_extension_flag`, `pps_3d_extension_flag`, `pps_scc_extension_flag`)
+    plus a 4-bit `pps_extension_4bits` (and any enabled extension body) out of the PPS
+    trailing bits.
+  - **`pps_scaling_list_data_present_flag`**: forcing it on makes the decoder read a
+    `scaling_list_data()` structure (H.265 §7.3.4) — DC-coefficient and
+    delta-coefficient loops sized by the scaling lists' dimensions, a region prone to
+    out-of-bounds reads — that the bitstream never reserved.
+
+  Each target is a single u(1) bit, so the splice never shifts the bitstream length —
+  only one gate bit changes and the downstream desync is purely semantic. Only gates
+  the seed currently has *off* are offered; the parser reaches these gates only for an
+  untiled, non-truncated PPS (variable-length tile geometry is out of scope), and the
+  extension-present gate is unreachable once the scaling-list gate is already on (its
+  variable-length body is not walked). If no off gate is reachable the mutator raises
+  so the engine picks another.
 
 ### Emulation-prevention byte stress mutator
 
