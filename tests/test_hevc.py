@@ -313,6 +313,141 @@ class TestSpsVuiHrdParsing:
         assert len(new_rbsp) == len(rbsp)
 
 
+class TestSpsExtensionParsing:
+    def test_clean_fixture_reaches_extension_gate(self):
+        # The bundled seed has a VUI block (timing present, HRD absent); the
+        # parser must now walk past the VUI tail to record the SPS extension gate.
+        sps = parse_sps(_nal_rbsp(33))
+        assert sps.has_span("sps_extension_present_flag")
+        assert sps.sps_extension_present_flag == 0  # off → a valid mutation target
+
+    def test_extension_gate_after_vui_gates(self):
+        sps = parse_sps(_nal_rbsp(33))
+        ext = sps.span("sps_extension_present_flag")
+        assert ext.bit_length == 1
+        # The extension gate sits after every VUI gate.
+        assert ext.bit_offset > sps.span("vui_hrd_parameters_present_flag").bit_offset
+
+    def test_splice_extension_gate_round_trips(self):
+        rbsp = _nal_rbsp(33)
+        sps = parse_sps(rbsp)
+        span = sps.span("sps_extension_present_flag")
+        new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, 1)
+        reparsed = parse_sps(new_rbsp)
+        assert reparsed.sps_extension_present_flag == 1
+        # A single u(1) flip never shifts the bitstream length.
+        assert len(new_rbsp) == len(rbsp)
+        # With the extension gate now on, the parser reaches the range-extension
+        # flag too (the next bit, which the seed's trailing bits happen to carry).
+        assert reparsed.has_span("sps_range_extension_flag")
+
+    def test_no_vui_reaches_extension_immediately(self):
+        # When VUI is absent, sps_extension_present_flag follows the VUI gate
+        # directly; build such an SPS and confirm the parser records it.
+        rbsp = _build_extension_sps_rbsp(vui_present=0, ext_present=1, rext_flag=1)
+        sps = parse_sps(rbsp)
+        assert sps.sps_extension_present_flag == 1
+        assert sps.sps_range_extension_flag == 1
+
+    def test_extension_present_off_leaves_rext_unset(self):
+        rbsp = _build_extension_sps_rbsp(vui_present=0, ext_present=0)
+        sps = parse_sps(rbsp)
+        assert sps.sps_extension_present_flag == 0
+        assert not sps.has_span("sps_range_extension_flag")
+        assert sps.sps_range_extension_flag is None
+
+    def test_hrd_present_blocks_extension_walk(self):
+        # The hrd_parameters() body is unmodelled, so an SPS with the HRD gate on
+        # must NOT reach the extension region (the gate is left unset).
+        rbsp = _build_extension_sps_rbsp(vui_present=1, hrd_present=1)
+        sps = parse_sps(rbsp)
+        assert sps.vui_hrd_parameters_present_flag == 1
+        assert not sps.has_span("sps_extension_present_flag")
+
+
+def _build_extension_sps_rbsp(
+    *,
+    vui_present: int = 1,
+    timing_present: int = 1,
+    hrd_present: int = 0,
+    ext_present: int = 0,
+    rext_flag: int = 0,
+) -> bytes:
+    """A minimal SPS RBSP that parses through to the SPS extension gate region.
+
+    Mirrors the VUI-block prefix used elsewhere in the suite, then emits the VUI
+    tail (``bitstream_restriction_flag`` absent) and a configurable extension
+    region (H.265 §7.3.2.2.1). When ``hrd_present`` is set the hrd_parameters()
+    body is *not* emitted (the parser stops at the gate), so that combination is
+    only useful for the "HRD blocks the walk" test.
+    """
+    w = BitWriter()
+    w.write_bits(0, 4)  # sps_video_parameter_set_id
+    w.write_bits(0, 3)  # sps_max_sub_layers_minus1 = 0
+    w.write_bit(0)      # sps_temporal_id_nesting_flag
+    w.write_bits(0, 8)   # profile_tier_level
+    w.write_bits(0, 32)
+    w.write_bits(0, 48)
+    w.write_bits(0, 8)
+    w.write_ue(0)        # sps_seq_parameter_set_id
+    w.write_ue(1)        # chroma_format_idc (4:2:0)
+    w.write_ue(64)       # pic_width_in_luma_samples
+    w.write_ue(64)       # pic_height_in_luma_samples
+    w.write_bit(0)       # conformance_window_flag
+    w.write_ue(0)        # bit_depth_luma_minus8
+    w.write_ue(0)        # bit_depth_chroma_minus8
+    w.write_ue(4)        # log2_max_pic_order_cnt_lsb_minus4
+    w.write_bit(0)       # sps_sub_layer_ordering_info_present_flag
+    w.write_ue(0)        # sps_max_dec_pic_buffering_minus1[0]
+    w.write_ue(0)        # sps_max_num_reorder_pics[0]
+    w.write_ue(0)        # sps_max_latency_increase_plus1[0]
+    w.write_ue(0)        # log2_min_luma_coding_block_size_minus3
+    w.write_ue(0)        # log2_diff_max_min_luma_coding_block_size
+    w.write_ue(0)        # log2_min_luma_transform_block_size_minus2
+    w.write_ue(0)        # log2_diff_max_min_luma_transform_block_size
+    w.write_ue(0)        # max_transform_hierarchy_depth_inter
+    w.write_ue(0)        # max_transform_hierarchy_depth_intra
+    w.write_bit(0)       # scaling_list_enabled_flag
+    w.write_bit(0)       # amp_enabled_flag
+    w.write_bit(0)       # sample_adaptive_offset_enabled_flag
+    w.write_bit(0)       # pcm_enabled_flag
+    w.write_ue(0)        # num_short_term_ref_pic_sets = 0
+    w.write_bit(0)       # long_term_ref_pics_present_flag = 0
+    w.write_bit(0)       # sps_temporal_mvp_enabled_flag
+    w.write_bit(0)       # strong_intra_smoothing_enabled_flag
+    w.write_bit(vui_present)  # vui_parameters_present_flag
+    if vui_present:
+        w.write_bit(0)   # aspect_ratio_info_present_flag
+        w.write_bit(0)   # overscan_info_present_flag
+        w.write_bit(0)   # video_signal_type_present_flag
+        w.write_bit(0)   # chroma_loc_info_present_flag
+        w.write_bit(0)   # neutral_chroma_indication_flag
+        w.write_bit(0)   # field_seq_flag
+        w.write_bit(0)   # frame_field_info_present_flag
+        w.write_bit(0)   # default_display_window_flag
+        w.write_bit(timing_present)  # vui_timing_info_present_flag
+        if timing_present:
+            w.write_bits(1, 32)  # vui_num_units_in_tick
+            w.write_bits(1, 32)  # vui_time_scale
+            w.write_bit(0)       # vui_poc_proportional_to_timing_flag
+            w.write_bit(hrd_present)  # vui_hrd_parameters_present_flag
+            if hrd_present:
+                # hrd_parameters() body intentionally omitted; the parser stops at
+                # the gate and never reaches the extension region.
+                w.write_bit(1)   # rbsp_stop_one_bit
+                return w.to_bytes()
+        w.write_bit(0)   # bitstream_restriction_flag
+    w.write_bit(ext_present)  # sps_extension_present_flag
+    if ext_present:
+        w.write_bit(rext_flag)  # sps_range_extension_flag
+        w.write_bit(0)   # sps_multilayer_extension_flag
+        w.write_bit(0)   # sps_3d_extension_flag
+        w.write_bit(0)   # sps_scc_extension_flag
+        w.write_bits(0, 4)  # sps_extension_4bits
+    w.write_bit(1)       # rbsp_stop_one_bit
+    return w.to_bytes()
+
+
 class TestPpsParsing:
     def test_tiles_flag_present(self):
         pps = parse_pps(_nal_rbsp(34))

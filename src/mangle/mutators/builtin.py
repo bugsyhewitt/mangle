@@ -1009,6 +1009,90 @@ def sps_vui_hrd(nals: list[NalUnit], rng: random.Random) -> MutationResult:
     )
 
 
+@register("sps-rext-flags")
+def sps_rext_flags(nals: list[NalUnit], rng: random.Random) -> MutationResult:
+    """Flip an SPS Range-Extension gate flag to desynchronise the SPS tail.
+
+    After ``vui_parameters()`` the SPS carries a profile-extension region
+    (H.265 §7.3.2.2.1) gated by single u(1) flags:
+
+      * ``sps_extension_present_flag`` — when 1, four profile-extension flags
+        (``sps_range_extension_flag``, ``sps_multilayer_extension_flag``,
+        ``sps_3d_extension_flag``, ``sps_scc_extension_flag``) and a 4-bit
+        ``sps_extension_4bits`` follow, then any enabled extension's body.
+      * ``sps_range_extension_flag`` — when 1, an ``sps_range_extension()``
+        structure (nine RExt feature bits, H.265 §7.3.2.2.2:
+        ``transform_skip_rotation_enabled_flag``,
+        ``transform_skip_context_enabled_flag``,
+        ``implicit_rdpcm_enabled_flag``, ``explicit_rdpcm_enabled_flag``,
+        ``extended_precision_processing_flag``, ``intra_smoothing_disabled_flag``,
+        ``high_precision_offsets_enabled_flag``,
+        ``persistent_rice_adaptation_enabled_flag``,
+        ``cabac_bypass_alignment_enabled_flag``) follows.
+
+    This mutator addresses gap-analysis item #8 ("HEVC range extensions (RExt)
+    flags") — the last untouched SPS attack surface. It flips one of these gates
+    *on* without supplying the dependent extension body: the decoder then reads
+    RExt feature bits (and the variable extension bodies that follow) out of the
+    SPS trailing bits, forcing it onto its Range-Extension parse path with no
+    valid parameter set behind it. The RExt feature bits change coefficient
+    coding (extended precision, RDPCM, transform-skip rotation/context) — paths
+    that diverge sharply from baseline HEVC and are a known under-tested region.
+
+    Only gates the seed currently has *off* are offered (flipping a gate on is
+    the "claims data that isn't there" direction that desynchronises the tail —
+    the input class that exercises the parser without being rejected as broken
+    framing). The ``sps_range_extension_flag`` gate is preferred when reachable,
+    since it lands the decoder directly in RExt coefficient-coding handling. If
+    the SPS did not parse to an off extension gate (e.g. VUI present so the parser
+    could not walk to the extension region, the gate is already on, or the SPS is
+    truncated), the mutator raises so the engine picks another.
+
+    [Worker decision: gate-flip splice keeps the SPS byte-stable]
+    Every target is a single u(1) bit, so the splice never shifts the stream's
+    bit-length — only the one gate bit changes and the downstream desync is purely
+    semantic.
+    """
+    out = _clone(nals)
+    idx = _first(out, 33)  # SPS_NUT
+    original_stream = assemble_nal_units(nals)
+    rbsp = ebsp_to_rbsp(out[idx].ebsp[2:])
+    sps = parse_sps(rbsp)
+
+    # Prefer the range-extension gate (lands directly in RExt handling), then the
+    # outer extension-present gate.
+    gate_names = (
+        "sps_range_extension_flag",
+        "sps_extension_present_flag",
+    )
+    candidates = [
+        name
+        for name in gate_names
+        if sps.has_span(name) and sps.span(name).value == 0
+    ]
+    if not candidates:
+        raise ValueError(
+            "SPS did not parse to an SPS extension / RExt gate flag that is "
+            "currently off; cannot mutate RExt flags"
+        )
+
+    target = rng.choice(candidates)
+    span = sps.span(target)
+    new_value = 1  # turn the gate on; the dependent extension body is absent
+    new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_value)
+    out[idx] = _rewrite_payload(out[idx], new_rbsp)
+    mutated_stream = assemble_nal_units(out)
+    return MutationResult(
+        nals=out,
+        mutator="sps-rext-flags",
+        bytes_changed=count_changed_bytes(original_stream, mutated_stream),
+        detail=(
+            f"{target}: 0 -> 1 (SPS extension gate enabled without its dependent "
+            f"sps_range_extension() body; downstream RExt desync)"
+        ),
+    )
+
+
 def _find_emulation_byte_offsets(ebsp: bytes) -> list[int]:
     """Return offsets of emulation-prevention bytes (the 0x03) within an EBSP.
 
