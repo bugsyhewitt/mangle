@@ -104,6 +104,136 @@ class TestFuzzFile:
         assert {"clean", "crash", "timeout", "abort"} == seen
 
 
+class _FakeClock:
+    """A deterministic monotonic clock that advances a fixed step per read.
+
+    Lets the time-limit dispatch logic be exercised without real wall-clock
+    sleeps: the campaign's deadline is compared against successive reads, so a
+    known number of reads (one per round's budget check) crosses it.
+    """
+
+    def __init__(self, start: float = 1000.0, step: float = 1.0):
+        self.t = start
+        self.step = step
+
+    def __call__(self) -> float:
+        now = self.t
+        self.t += self.step
+        return now
+
+
+class TestTimeLimit:
+    def test_budget_halts_dispatch_before_iteration_cap(
+        self, tmp_path, monkeypatch
+    ):
+        # Clock starts at 1000 and advances 1s per read. Deadline = start + 3s.
+        # Read 1 (deadline compute) -> 1000, deadline = 1003.
+        # Round checks read 1001, 1002, 1003 -> the 3rd check (>=1003) breaks.
+        # With concurrency=1 that dispatches 2 rounds (iterations 0 and 1).
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        out_dir = tmp_path / "fuzz-out"
+        clock = _FakeClock(start=1000.0, step=1.0)
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=1000,  # high cap; the budget must stop us well short
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            concurrency=1,
+            time_limit=3.0,
+            clock=clock,
+        )
+        # Far fewer than the 1000 cap — the wall-clock budget truncated dispatch.
+        assert 0 < len(results) < 1000
+        # results.jsonl carries exactly the iterations that ran (no phantom rows).
+        lines = (out_dir / "results.jsonl").read_text().strip().splitlines()
+        assert len(lines) == len(results)
+        # Iteration indices are contiguous from 0 (sorted, no gaps).
+        assert [r.iteration for r in results] == list(range(len(results)))
+
+    def test_iteration_cap_still_caps_under_generous_budget(
+        self, tmp_path, monkeypatch
+    ):
+        # A budget that never expires (clock never advances) must let the full
+        # iteration cap run — --iterations is the other limit.
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        out_dir = tmp_path / "fuzz-out"
+        frozen = lambda: 0.0  # noqa: E731 — never reaches the deadline
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=8,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            concurrency=4,
+            time_limit=10.0,
+            clock=frozen,
+        )
+        assert len(results) == 8
+
+    def test_no_time_limit_runs_all_iterations(self, tmp_path, monkeypatch):
+        # Default (time_limit=None) must run the full requested iteration count.
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED, out_dir, iterations=20, decoder="ffmpeg", timeout=5.0, seed_rng=1
+        )
+        assert len(results) == 20
+
+    def test_no_time_limit_rng_stream_byte_identical(self, tmp_path, monkeypatch):
+        # Criterion 7 guard: adding the time-limit plumbing must NOT perturb the
+        # v0.1 mutator/seed_rng stream of a plain --iterations campaign. The
+        # single-shot uniform path is only taken when time_limit is None.
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        a = engine.fuzz_file(
+            SEED, tmp_path / "a", iterations=15, decoder="ffmpeg",
+            timeout=5.0, seed_rng=77,
+        )
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        b = engine.fuzz_file(
+            SEED, tmp_path / "b", iterations=15, decoder="ffmpeg",
+            timeout=5.0, seed_rng=77,
+        )
+        assert [(r.mutator, r.seed_rng) for r in a] == [
+            (r.mutator, r.seed_rng) for r in b
+        ]
+
+    def test_rejects_non_positive_budget(self, tmp_path):
+        import pytest
+
+        with pytest.raises(ValueError, match="positive number of seconds"):
+            engine.fuzz_file(
+                SEED,
+                tmp_path / "out",
+                iterations=4,
+                decoder="ffmpeg",
+                timeout=5.0,
+                time_limit=0.0,
+            )
+
+    def test_time_limited_iterations_are_replayable(self, tmp_path, monkeypatch):
+        # Even though COUNT is wall-clock dependent, each row that ran records the
+        # mutator + seed_rng that fully reproduce its mutant (replay contract).
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=1000,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            concurrency=2,
+            time_limit=5.0,
+            clock=_FakeClock(start=0.0, step=1.0),
+        )
+        for r in results:
+            assert isinstance(r.mutator, str) and r.mutator
+            assert isinstance(r.seed_rng, int)
+
+
 class TestAdaptiveFuzz:
     def test_adaptive_records_results_and_scoreboard(self, tmp_path, monkeypatch):
         _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
@@ -614,6 +744,55 @@ class TestDiffCli:
         assert "adaptive scheduler" in out
         assert "scoreboard written" in out
         assert (out_dir / "scheduler.json").exists()
+
+    def test_fuzz_time_limit_cli(self, tmp_path, monkeypatch, capsys):
+        _patch_decoder(
+            monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, "")
+        )
+        # Patch the engine's time source so the budget expires deterministically
+        # after a handful of reads — no real wall-clock wait, no flakiness.
+        monkeypatch.setattr(engine.time, "monotonic", _FakeClock(0.0, 1.0))
+        out_dir = tmp_path / "fuzz-out"
+        rc = main(
+            [
+                "fuzz",
+                "--seed",
+                str(SEED),
+                "--output-dir",
+                str(out_dir),
+                "--iterations",
+                "100000",  # cap far above what the budget can reach
+                "--time-limit",
+                "2",
+                "--decoder",
+                "ffmpeg",
+                "--seed-rng",
+                "3",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "time-limited to 2s" in out
+        assert "iteration cap" in out
+        # The reported run is well under the cap (the budget truncated it).
+        lines = (out_dir / "results.jsonl").read_text().strip().splitlines()
+        assert 0 < len(lines) < 100000
+
+    def test_fuzz_rejects_non_positive_time_limit_cli(self, tmp_path, capsys):
+        rc = main(
+            [
+                "fuzz",
+                "--seed",
+                str(SEED),
+                "--output-dir",
+                str(tmp_path / "out"),
+                "--time-limit",
+                "0",
+            ]
+        )
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "positive number of seconds" in err
 
     def test_fuzz_rejects_bad_strategy(self, tmp_path):
         # argparse 'choices' rejects an unknown strategy at parse time.
