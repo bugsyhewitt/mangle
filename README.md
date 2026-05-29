@@ -107,6 +107,43 @@ This runs 100 mutate+decode cycles in parallel and writes:
 - `/tmp/fuzz-out/crashes/<hash>.h265` — the mutant for any crash (segfault or
   non-zero decoder exit), alongside `<hash>.txt` containing the decoder's stderr.
 
+#### Adaptive mutator prioritisation (`--strategy`)
+
+By default (`--strategy uniform`) every mutator is equally likely on every
+iteration. That spends the same budget on a mutator that never crashes the
+decoder as on one that crashes it repeatedly. `--strategy adaptive` turns the
+campaign's own crash/abort outcomes into a feedback loop:
+
+```bash
+mangle fuzz \
+  --seed tests/fixtures/clean.h265 \
+  --output-dir /tmp/fuzz-out \
+  --iterations 1000 \
+  --strategy adaptive
+```
+
+mangle's harness is black-box — it shells out to ffmpeg / libde265 and never
+sees edge coverage — so the only learning signal available is each decode's
+verdict. The adaptive scheduler treats each mutator as an arm of a multi-armed
+bandit: it tracks how often each mutator has been tried (`trials`) and how often
+the result crashed or aborted (`rewards`), and weights selection toward the
+productive mutators using a smoothed reward rate. A per-arm **exploration floor**
+guarantees every mutator keeps being probed, so the long tail is never starved,
+and with zero observations the scheduler starts out exactly uniform — it only
+diverges as crashes accumulate. This is the realistic, in-architecture form of
+"coverage-guided mutation prioritisation" for a harness that only sees pass/fail.
+
+Adaptive mode runs iterations in rounds of `--concurrency` so each round's
+verdicts update the scheduler before the next round is selected, and it writes
+one extra artifact:
+
+- `/tmp/fuzz-out/scheduler.json` — the learned per-mutator scoreboard
+  (`trials` and `rewards` for every mutator), so the campaign's prioritisation
+  decisions are auditable alongside the raw results.
+
+Both strategies are fully deterministic for a given `--seed-rng` (the uniform
+path's mutator/seed RNG stream is byte-identical to earlier mangle releases).
+
 ### Differential decoder oracle
 
 ```bash

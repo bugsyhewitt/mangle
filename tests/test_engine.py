@@ -104,6 +104,117 @@ class TestFuzzFile:
         assert {"clean", "crash", "timeout", "abort"} == seen
 
 
+class TestAdaptiveFuzz:
+    def test_adaptive_records_results_and_scoreboard(self, tmp_path, monkeypatch):
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=16,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            strategy="adaptive",
+            concurrency=4,
+        )
+        assert len(results) == 16
+        # Every iteration index appears exactly once and they are sorted.
+        assert [r.iteration for r in results] == list(range(16))
+        assert (out_dir / "results.jsonl").exists()
+        # Adaptive mode emits a learned-scoreboard artifact.
+        scoreboard = json.loads((out_dir / "scheduler.json").read_text())
+        assert scoreboard["strategy"] == "adaptive"
+        assert scoreboard["iterations"] == 16
+        total_trials = sum(a["trials"] for a in scoreboard["arms"].values())
+        assert total_trials == 16
+
+    def test_uniform_writes_no_scoreboard(self, tmp_path, monkeypatch):
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        out_dir = tmp_path / "fuzz-out"
+        engine.fuzz_file(
+            SEED, out_dir, iterations=8, decoder="ffmpeg", timeout=5.0, seed_rng=1
+        )
+        assert not (out_dir / "scheduler.json").exists()
+
+    def test_adaptive_is_reproducible(self, tmp_path, monkeypatch):
+        # Criterion 7: same seed-rng -> identical mutator/outcome stream. The mock
+        # keys its verdict off the decoded file content (stable per input), NOT
+        # off call order, so it is immune to within-round gather scheduling.
+        def content_outcome(decoder, path, timeout, runner=None):
+            data = Path(path).read_bytes()
+            if sum(data) % 3 == 0:
+                return DecodeResult(Outcome.CRASH, -signal.SIGSEGV, "boom")
+            return DecodeResult(Outcome.CLEAN, 0, "")
+
+        monkeypatch.setattr(engine, "run_decoder", content_outcome)
+        a = engine.fuzz_file(
+            SEED, tmp_path / "a", iterations=24, decoder="ffmpeg",
+            timeout=5.0, seed_rng=5, strategy="adaptive",
+        )
+        b = engine.fuzz_file(
+            SEED, tmp_path / "b", iterations=24, decoder="ffmpeg",
+            timeout=5.0, seed_rng=5, strategy="adaptive",
+        )
+        assert [r.mutator for r in a] == [r.mutator for r in b]
+        assert [r.outcome for r in a] == [r.outcome for r in b]
+
+    def test_adaptive_biases_toward_crashing_mutator(self, tmp_path, monkeypatch):
+        # One specific mutator always crashes; all others stay clean. Over a long
+        # campaign the adaptive scheduler should spend more trials on the crasher
+        # than its uniform 1/N share would allow.
+        seed_data = SEED.read_bytes()
+        from mangle.engine import mutate_bytes
+        import random as _random
+
+        # Discover which mutator a given iter-rng maps to is not stable across the
+        # bandit, so instead key the "always crash" on the mutator NAME by
+        # intercepting at the result level via a name-aware decoder mock.
+        crash_mutator = "sps-dimensions"
+
+        # Map temp file content -> mutator by re-deriving is impossible here, so
+        # we drive the decision off the IterationResult through a custom runner:
+        # patch _run_iteration to crash only when the chosen mutator matches.
+        real_run_iteration = engine._run_iteration
+
+        async def fake_run_iteration(
+            i, sd, mutator_name, iter_rng_seed, decoder, timeout, crashes_dir, sem
+        ):
+            from mangle.engine import IterationResult
+
+            mutated, result = mutate_bytes(
+                sd, mutator_name, _random.Random(iter_rng_seed)
+            )
+            crashed = mutator_name == crash_mutator
+            return IterationResult(
+                iteration=i,
+                mutator=mutator_name,
+                seed_rng=iter_rng_seed,
+                outcome=(Outcome.CRASH.value if crashed else Outcome.CLEAN.value),
+                returncode=(-signal.SIGSEGV if crashed else 0),
+                bytes_changed=result.bytes_changed,
+                detail=result.detail,
+                crash_hash=("deadbeef" if crashed else None),
+            )
+
+        monkeypatch.setattr(engine, "_run_iteration", fake_run_iteration)
+
+        adaptive = engine.fuzz_file(
+            SEED, tmp_path / "ad", iterations=400, decoder="ffmpeg",
+            timeout=5.0, seed_rng=11, strategy="adaptive", concurrency=4,
+        )
+        uniform = engine.fuzz_file(
+            SEED, tmp_path / "un", iterations=400, decoder="ffmpeg",
+            timeout=5.0, seed_rng=11, strategy="uniform", concurrency=4,
+        )
+        engine._run_iteration = real_run_iteration
+
+        ad_share = sum(1 for r in adaptive if r.mutator == crash_mutator) / 400
+        un_share = sum(1 for r in uniform if r.mutator == crash_mutator) / 400
+        # Adaptive must over-select the crasher relative to uniform.
+        assert ad_share > un_share
+
+
 def _patch_pair(monkeypatch, pair_for):
     """Replace run_decoder_pair with a deterministic per-iteration mock."""
     state = {"i": 0}
@@ -271,6 +382,56 @@ class TestDiffCli:
         assert "divergences:" in out
         assert (out_dir / "diff.jsonl").exists()
         assert (out_dir / "divergences").exists()
+
+    def test_fuzz_adaptive_strategy_cli(self, tmp_path, monkeypatch, capsys):
+        _patch_decoder(
+            monkeypatch,
+            lambda i: DecodeResult(
+                Outcome.CRASH if i % 4 == 0 else Outcome.CLEAN,
+                -signal.SIGSEGV if i % 4 == 0 else 0,
+                "x" if i % 4 == 0 else "",
+            ),
+        )
+        out_dir = tmp_path / "fuzz-out"
+        rc = main(
+            [
+                "fuzz",
+                "--seed",
+                str(SEED),
+                "--output-dir",
+                str(out_dir),
+                "--iterations",
+                "12",
+                "--decoder",
+                "ffmpeg",
+                "--strategy",
+                "adaptive",
+                "--seed-rng",
+                "3",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "adaptive scheduler" in out
+        assert "scoreboard written" in out
+        assert (out_dir / "scheduler.json").exists()
+
+    def test_fuzz_rejects_bad_strategy(self, tmp_path):
+        # argparse 'choices' rejects an unknown strategy at parse time.
+        import pytest
+
+        with pytest.raises(SystemExit):
+            main(
+                [
+                    "fuzz",
+                    "--seed",
+                    str(SEED),
+                    "--output-dir",
+                    str(tmp_path / "out"),
+                    "--strategy",
+                    "nope",
+                ]
+            )
 
     def test_diff_same_decoder_errors(self, tmp_path, capsys):
         rc = main(
