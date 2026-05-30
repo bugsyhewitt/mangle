@@ -445,6 +445,13 @@ class DiffResult:
     bytes_changed: int
     detail: str
     divergence_hash: str | None = None
+    # SHA256 of each decoder's captured raw-frame stdout when the campaign
+    # was run with ``compare_output=True``; ``None`` otherwise (or on a
+    # decoder timeout). When both are populated and the kind is
+    # ``"output-divergence"`` the two hashes differ — the silent-acceptor
+    # signal.
+    left_output_hash: str | None = None
+    right_output_hash: str | None = None
 
 
 async def _run_diff_iteration(
@@ -457,6 +464,7 @@ async def _run_diff_iteration(
     timeout: float,
     divergences_dir: Path,
     semaphore: asyncio.Semaphore,
+    compare_output: bool = False,
 ) -> DiffResult:
     rng = random.Random(iter_rng_seed)
     mutated, result = mutate_bytes(seed_data, mutator_name, rng)
@@ -467,14 +475,26 @@ async def _run_diff_iteration(
             tmp.write(mutated)
             tmp_path = tmp.name
         try:
-            divergence = await loop.run_in_executor(
-                None,
-                run_decoder_pair,
-                left_decoder,
-                right_decoder,
-                tmp_path,
-                timeout,
-            )
+            if compare_output:
+                divergence = await loop.run_in_executor(
+                    None,
+                    lambda: run_decoder_pair(
+                        left_decoder,
+                        right_decoder,
+                        tmp_path,
+                        timeout,
+                        compare_output=True,
+                    ),
+                )
+            else:
+                divergence = await loop.run_in_executor(
+                    None,
+                    run_decoder_pair,
+                    left_decoder,
+                    right_decoder,
+                    tmp_path,
+                    timeout,
+                )
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
@@ -485,13 +505,26 @@ async def _run_diff_iteration(
         (divergences_dir / f"{divergence_hash}.h265").write_bytes(mutated)
         # Write both decoders' stderr side by side so the divergence is
         # self-documenting (the artifact alone explains why it was kept).
+        # For output-divergence kinds the stderrs are typically empty (both
+        # decoders ran cleanly); the output hashes carry the signal, so we
+        # surface them in the report as well.
+        left_hash_line = (
+            f" output_hash={divergence.left.output_hash}"
+            if divergence.left.output_hash is not None
+            else ""
+        )
+        right_hash_line = (
+            f" output_hash={divergence.right.output_hash}"
+            if divergence.right.output_hash is not None
+            else ""
+        )
         report = (
             f"=== {divergence.kind} ===\n"
             f"--- {left_decoder} ({divergence.left.outcome.value}, "
-            f"rc={divergence.left.returncode}) ---\n"
+            f"rc={divergence.left.returncode}){left_hash_line} ---\n"
             f"{divergence.left.stderr}\n"
             f"--- {right_decoder} ({divergence.right.outcome.value}, "
-            f"rc={divergence.right.returncode}) ---\n"
+            f"rc={divergence.right.returncode}){right_hash_line} ---\n"
             f"{divergence.right.stderr}\n"
         )
         (divergences_dir / f"{divergence_hash}.txt").write_text(report)
@@ -511,6 +544,8 @@ async def _run_diff_iteration(
         bytes_changed=result.bytes_changed,
         detail=result.detail,
         divergence_hash=divergence_hash,
+        left_output_hash=divergence.left.output_hash,
+        right_output_hash=divergence.right.output_hash,
     )
 
 
@@ -524,6 +559,7 @@ async def diff_async(
     seed_rng: int,
     mutators: list[str] | None,
     concurrency: int,
+    compare_output: bool = False,
 ) -> list[DiffResult]:
     """Run ``iterations`` mutate+decode-pair cycles and record divergences.
 
@@ -564,6 +600,7 @@ async def diff_async(
                 timeout,
                 divergences_dir,
                 semaphore,
+                compare_output=compare_output,
             )
         )
 
@@ -587,6 +624,7 @@ def diff_file(
     seed_rng: int = 0,
     mutators: list[str] | None = None,
     concurrency: int = 4,
+    compare_output: bool = False,
 ) -> list[DiffResult]:
     """Synchronous wrapper around :func:`diff_async`."""
     return asyncio.run(
@@ -600,5 +638,6 @@ def diff_file(
             seed_rng,
             mutators,
             concurrency,
+            compare_output=compare_output,
         )
     )

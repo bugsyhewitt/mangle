@@ -218,6 +218,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="parallel decode workers (asyncio)",
     )
+    p_diff.add_argument(
+        "--compare-output",
+        action="store_true",
+        help=(
+            "capture each decoder's raw YUV 4:2:0 output and compare SHA256 "
+            "hashes; when both decoders return CLEAN but the hashes differ, "
+            "record an 'output-divergence' (the TWINFUZZ silent-acceptor "
+            "signal: both decoders said yes, but produced different pixels)"
+        ),
+    )
     p_diff.set_defaults(func=_cmd_diff)
 
     # corpus
@@ -588,15 +598,17 @@ def _cmd_diff(args: argparse.Namespace) -> int:
         seed_rng=args.seed_rng,
         mutators=args.mutators,
         concurrency=args.concurrency,
+        compare_output=args.compare_output,
     )
     divergences = [r for r in results if r.diverged]
     by_kind = Counter(r.kind for r in divergences)
     print(
         f"ran {len(results)} iterations: "
         f"{args.left_decoder} vs {args.right_decoder}"
+        + (" (with output compare)" if args.compare_output else "")
     )
     print(f"  divergences: {len(divergences)}")
-    for kind in ("crash-split", "signal-split"):
+    for kind in ("crash-split", "signal-split", "output-divergence"):
         if by_kind.get(kind):
             print(f"    {kind}: {by_kind[kind]}")
     print(f"results written to {args.output_dir}/diff.jsonl")
