@@ -791,6 +791,67 @@ per-region distinct-bug count, exactly as in `coverage` / `triage` / `reduce` /
 `corpus-trim`. A mutator whose name carries an unmapped prefix buckets under an
 `other` region rather than being dropped.
 
+### Report a campaign's mutation-testing score
+
+```bash
+mangle mutation-score \
+  --output-dir /tmp/fuzz-out
+```
+
+Classic mutation testing scores a test suite by the fraction of mutants it
+*kills* — a "killed" mutant is one whose behaviour the suite detects, a
+"survived" mutant is one the suite shrugs off. mangle inverts the roles: the
+mutants are the bitstream variants this fuzzer generates and the "test suite"
+is the decoder under test. A mangle mutant **kills** the decoder when the
+decoder visibly diverges from a clean decode (`crash`, `abort`, `timeout`, or
+`hang`) and **survives** when the decoder accepts it as if normal (`clean`).
+The mutation score is `killed / total`.
+
+This is complementary to `coverage` (which mutators ran) and `heatmap` (which
+bitstream region got the pressure): `mutation-score` measures how **potent**
+the campaign's mutants were — overall, per mutator, and per base seed.
+
+`mangle mutation-score` is a pure post-processing pass over the campaign's
+`results.jsonl` (no decoder, fully deterministic — the same read-only shape as
+`coverage` / `heatmap` / `triage` / `replay`). It reports the campaign-level
+kill ratio, per-mutator kill ratios sorted highest-first (the most potent
+mutators), and per-base-seed kill ratios (which corpus inputs are yielding the
+productive mutants — only printed when more than the implicit `--seed` bucket
+is present):
+
+```text
+mutation score: 50.0% (2 killed / 4 total, 2 survived) [clean=2 crash=1 abort=1]
+per-mutator (highest score first):
+  rps-overflow: 50.0% (1/2 killed) [clean=1 crash=1]
+  sps-bit-depth: 50.0% (1/2 killed) [clean=1 abort=1]
+per-base-seed:
+  clean.h265: 50.0% (1/2 killed)
+  sei.h265: 50.0% (1/2 killed)
+mutation score written to /tmp/fuzz-out/mutation-score.json
+```
+
+A near-zero per-mutator score means that mutator's mutants are being silently
+accepted — either the mutator is weak or the decoder is permissive in the
+region it targets, both worth knowing before disclosure. A high score on one
+base seed and a low one on another tells you which corpus inputs to lean on
+when you next run `mangle corpus-trim` or pick seeds for a `--seed-corpus-dir`
+campaign.
+
+Outputs:
+
+- `/tmp/fuzz-out/mutation-score.json` — the full report: `total_iterations`,
+  `killed_count`, `survived_count`, `score` (the campaign kill ratio), the
+  campaign `outcomes` breakdown, a per-mutator `mutators` array (`mutator`,
+  `iterations`, `killed`, `survived`, `score`, `outcomes`) sorted by score
+  descending, and a per-base-seed `seeds` array (`base_seed`, `iterations`,
+  `killed`, `survived`, `score`) sorted by base-seed name (the implicit-seed
+  `None` bucket last).
+
+`hang` outcomes count as kills (the decoder visibly stalled). Out-of-spec
+outcome strings — a future engine state this build does not know about — are
+preserved in the breakdown but excluded from `killed` / `survived` so the
+score stays a well-defined kill / total fraction.
+
 ### AFL++ coverage-guided fuzzing integration (`mangle afl-mutate`)
 
 `mangle`'s built-in `fuzz` loop is **black-box** — it only sees each
