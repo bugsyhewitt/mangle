@@ -131,3 +131,160 @@ class TestAdaptiveScheduler:
         # Floors must sum to <= 1 across the pool.
         with pytest.raises(ValueError, match="exploration_floor"):
             AdaptiveScheduler(POOL, exploration_floor=0.5)
+
+
+class TestAdaptiveSchedulerLoadState:
+    """Warm-start the adaptive scheduler from a prior campaign's scoreboard."""
+
+    def test_loads_prior_arm_counts(self):
+        sched = AdaptiveScheduler(POOL)
+        report = sched.load_state(
+            {
+                "alpha": {"trials": 10, "rewards": 7},
+                "beta": {"trials": 5, "rewards": 0},
+                "gamma": {"trials": 0, "rewards": 0},
+                "delta": {"trials": 3, "rewards": 1},
+            }
+        )
+        stats = sched.stats()
+        assert stats["alpha"] == {"trials": 10, "rewards": 7}
+        assert stats["beta"] == {"trials": 5, "rewards": 0}
+        assert stats["gamma"] == {"trials": 0, "rewards": 0}
+        assert stats["delta"] == {"trials": 3, "rewards": 1}
+        assert report.loaded == ["alpha", "beta", "delta", "gamma"]
+        assert report.unknown == []
+        assert report.cold == []
+        assert report.total_trials == 18
+        assert report.total_rewards == 8
+
+    def test_loaded_counts_shift_weights_like_live_updates(self):
+        # Loading {alpha: 20/20, beta: 20/0} must yield the same weight vector as
+        # making the same 40 update() calls — proving the load *is* the bandit's
+        # posterior, not a parallel tracker.
+        live = AdaptiveScheduler(POOL)
+        for _ in range(20):
+            live.update("alpha", rewarded=True)
+        for _ in range(20):
+            live.update("beta", rewarded=False)
+
+        resumed = AdaptiveScheduler(POOL)
+        resumed.load_state(
+            {
+                "alpha": {"trials": 20, "rewards": 20},
+                "beta": {"trials": 20, "rewards": 0},
+            }
+        )
+        assert live.weights() == resumed.weights()
+
+    def test_load_then_resume_select_matches_continuous_run(self):
+        # A "split campaign" — half the trials, save stats, load into a fresh
+        # scheduler, run the second half — must select the exact mutator stream
+        # that one continuous scheduler would have, given the same RNG. This is
+        # the determinism contract the resume flow rests on.
+        continuous = AdaptiveScheduler(POOL)
+        rng_cont = random.Random(11)
+        cont_picks = []
+        for i in range(40):
+            pick = continuous.select(rng_cont)
+            cont_picks.append(pick)
+            continuous.update(pick, rewarded=(i % 3 == 0))
+
+        # Now simulate a split: first half on one scheduler, save, resume.
+        first = AdaptiveScheduler(POOL)
+        rng_split = random.Random(11)
+        split_picks = []
+        for i in range(20):
+            pick = first.select(rng_split)
+            split_picks.append(pick)
+            first.update(pick, rewarded=(i % 3 == 0))
+        second = AdaptiveScheduler(POOL)
+        second.load_state(first.stats())
+        for i in range(20, 40):
+            pick = second.select(rng_split)
+            split_picks.append(pick)
+            second.update(pick, rewarded=(i % 3 == 0))
+
+        assert split_picks == cont_picks
+        # And the final state matches too.
+        assert second.stats() == continuous.stats()
+
+    def test_unknown_mutators_dropped(self):
+        sched = AdaptiveScheduler(POOL)
+        report = sched.load_state(
+            {
+                "alpha": {"trials": 2, "rewards": 1},
+                "vanished-mutator": {"trials": 99, "rewards": 88},
+            }
+        )
+        assert report.unknown == ["vanished-mutator"]
+        assert report.loaded == ["alpha"]
+        # The vanished arm contributes nothing.
+        assert "vanished-mutator" not in sched.stats()
+        assert sched.stats()["alpha"] == {"trials": 2, "rewards": 1}
+
+    def test_cold_arms_listed(self):
+        sched = AdaptiveScheduler(POOL)
+        report = sched.load_state({"alpha": {"trials": 1, "rewards": 0}})
+        assert report.loaded == ["alpha"]
+        # Three pool members got no prior data.
+        assert report.cold == ["beta", "delta", "gamma"]
+
+    def test_loads_are_additive(self):
+        sched = AdaptiveScheduler(POOL)
+        sched.update("alpha", rewarded=True)
+        sched.update("alpha", rewarded=False)
+        sched.load_state({"alpha": {"trials": 5, "rewards": 3}})
+        # Live counts (2/1) + loaded (5/3) = (7/4)
+        assert sched.stats()["alpha"] == {"trials": 7, "rewards": 4}
+
+    def test_rewards_exceeding_trials_rejected(self):
+        sched = AdaptiveScheduler(POOL)
+        with pytest.raises(ValueError, match="rewards .* > trials"):
+            sched.load_state({"alpha": {"trials": 1, "rewards": 2}})
+        # All-or-nothing: nothing was loaded.
+        assert all(
+            v == {"trials": 0, "rewards": 0} for v in sched.stats().values()
+        )
+
+    def test_negative_counts_rejected(self):
+        sched = AdaptiveScheduler(POOL)
+        with pytest.raises(ValueError, match="negative count"):
+            sched.load_state({"alpha": {"trials": -1, "rewards": 0}})
+        with pytest.raises(ValueError, match="negative count"):
+            sched.load_state({"alpha": {"trials": 0, "rewards": -1}})
+
+    def test_non_integer_counts_rejected(self):
+        sched = AdaptiveScheduler(POOL)
+        with pytest.raises(ValueError, match="integer trials/rewards"):
+            sched.load_state({"alpha": {"trials": 1.5, "rewards": 0}})
+
+    def test_non_mapping_state_rejected(self):
+        sched = AdaptiveScheduler(POOL)
+        with pytest.raises(ValueError, match="'arms' must be a mapping"):
+            sched.load_state([("alpha", {"trials": 1, "rewards": 0})])  # type: ignore[arg-type]
+
+    def test_non_mapping_arm_value_rejected(self):
+        sched = AdaptiveScheduler(POOL)
+        with pytest.raises(ValueError, match="arm 'alpha' must be a mapping"):
+            sched.load_state({"alpha": [1, 0]})  # type: ignore[dict-item]
+
+    def test_missing_count_keys_default_to_zero(self):
+        sched = AdaptiveScheduler(POOL)
+        sched.load_state({"alpha": {}})
+        assert sched.stats()["alpha"] == {"trials": 0, "rewards": 0}
+
+    def test_failed_load_leaves_state_untouched(self):
+        sched = AdaptiveScheduler(POOL)
+        sched.update("alpha", rewarded=True)
+        with pytest.raises(ValueError):
+            sched.load_state(
+                {
+                    "alpha": {"trials": 5, "rewards": 2},
+                    # gamma has rewards > trials — the whole load must abort
+                    # before any arm is mutated.
+                    "gamma": {"trials": 1, "rewards": 2},
+                }
+            )
+        # alpha keeps its pre-load counts; nothing got loaded.
+        assert sched.stats()["alpha"] == {"trials": 1, "rewards": 1}
+        assert sched.stats()["gamma"] == {"trials": 0, "rewards": 0}
