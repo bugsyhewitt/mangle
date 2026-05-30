@@ -15,6 +15,7 @@ timeout firing; ``hang`` is reserved for an externally-detected stuck process.
 
 from __future__ import annotations
 
+import hashlib
 import signal
 import subprocess
 from dataclasses import dataclass
@@ -35,6 +36,14 @@ class DecodeResult:
     returncode: int | None
     stderr: str
     decoder: str | None = None
+    # SHA256 (hex) of the decoded raw-frame output. Populated only when
+    # ``run_decoder(..., capture_output=True)`` was used and the decoder ran
+    # to a non-timeout completion (CLEAN, CRASH, or ABORT — a partially
+    # decoded crash still has bytes worth comparing against another decoder's
+    # bytes). ``None`` otherwise. Used by the differential oracle's
+    # output-divergence mode to spot silent decoder disagreements when both
+    # decoders return CLEAN but produced different pixel data.
+    output_hash: str | None = None
 
 
 # Signals that indicate a hard crash vs. an intentional abort.
@@ -49,6 +58,38 @@ def decoder_command(decoder: str, path: str) -> list[str]:
     if decoder in ("libde265", "dec265"):
         # The libde265 reference decoder ships a `dec265` CLI.
         return ["dec265", path]
+    raise ValueError(f"unsupported decoder '{decoder}' (expected ffmpeg or libde265)")
+
+
+def decoder_output_command(decoder: str, path: str) -> list[str]:
+    """Build the decoder command line that writes decoded raw frames to stdout.
+
+    Used by the differential oracle's ``--compare-output`` mode: the captured
+    stdout bytes are hashed so two decoders' pixel output can be compared
+    directly when both return CLEAN. The output format is normalised to raw
+    YUV 4:2:0 across decoders so the hashes are directly comparable.
+
+    - ffmpeg: ``ffmpeg -v error -i <path> -f rawvideo -pix_fmt yuv420p -``
+      writes a single concatenated raw YUV 4:2:0 stream to stdout.
+    - libde265/dec265: ``dec265 -q -o /dev/stdout <path>`` writes the decoded
+      YUV frames to stdout in YUV 4:2:0 by default (``-q`` silences the
+      decoder's own progress logging to stderr only).
+    """
+    if decoder == "ffmpeg":
+        return [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            path,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-",
+        ]
+    if decoder in ("libde265", "dec265"):
+        return ["dec265", "-q", "-o", "/dev/stdout", path]
     raise ValueError(f"unsupported decoder '{decoder}' (expected ffmpeg or libde265)")
 
 
@@ -74,17 +115,30 @@ def run_decoder(
     path: str,
     timeout: float,
     runner=subprocess.run,
+    capture_output: bool = False,
 ) -> DecodeResult:
     """Run a decoder against ``path`` with a timeout and classify the result.
 
     ``runner`` is injectable so unit tests can mock the subprocess call without
     requiring ffmpeg/libde265 to be installed (criterion 8).
+
+    When ``capture_output`` is True the decoder is invoked via
+    :func:`decoder_output_command` (writing raw YUV 4:2:0 to stdout); stdout is
+    read into memory and a SHA256 hex digest is stored on
+    :attr:`DecodeResult.output_hash`. The hash is populated for any
+    non-timeout completion (CLEAN, CRASH, ABORT) — even a crashed decoder may
+    have flushed partial pixel data worth comparing against another decoder's
+    bytes. Timeouts leave ``output_hash`` as ``None``.
     """
-    cmd = decoder_command(decoder, path)
+    cmd = (
+        decoder_output_command(decoder, path)
+        if capture_output
+        else decoder_command(decoder, path)
+    )
     try:
         proc = runner(
             cmd,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             timeout=timeout,
         )
@@ -106,8 +160,20 @@ def run_decoder(
         stderr_text = stderr_bytes
     else:
         stderr_text = stderr_bytes.decode("utf-8", "replace")
+
+    output_hash: str | None = None
+    if capture_output:
+        stdout_bytes = proc.stdout if proc.stdout is not None else b""
+        if isinstance(stdout_bytes, str):
+            stdout_bytes = stdout_bytes.encode("utf-8", "replace")
+        output_hash = hashlib.sha256(stdout_bytes).hexdigest()
+
     return DecodeResult(
-        classify(proc.returncode), proc.returncode, stderr_text, decoder=decoder
+        classify(proc.returncode),
+        proc.returncode,
+        stderr_text,
+        decoder=decoder,
+        output_hash=output_hash,
     )
 
 
@@ -144,6 +210,15 @@ def _classify_divergence(left: DecodeResult, right: DecodeResult) -> tuple[bool,
       decoder is vulnerable to an input the other tolerates.
     - ``"signal-split"`` — both decoders failed but with different outcomes
       (e.g. one SIGSEGV crash, one SIGABRT). Weaker but still a divergence.
+    - ``"output-divergence"`` — both decoders accepted the input cleanly
+      (CLEAN), but the captured raw-frame stdout hashes differ. The TWINFUZZ
+      (NDSS 2025) silent-acceptor signal: neither decoder complained, but
+      they produced different pixel data — a real spec violation that a
+      crash-only campaign and a crash-class-only diff campaign both miss.
+      Only produced when both DecodeResults carry ``output_hash`` values
+      (i.e. the campaign was run with ``capture_output=True``); when either
+      hash is ``None`` the crash-class verdict alone determines the result
+      and a clean/clean pair is ``"agree"`` as before.
     """
     left_failed = left.outcome in _FAILURE_OUTCOMES
     right_failed = right.outcome in _FAILURE_OUTCOMES
@@ -152,6 +227,14 @@ def _classify_divergence(left: DecodeResult, right: DecodeResult) -> tuple[bool,
         return True, "crash-split"
     if left_failed and right_failed and left.outcome != right.outcome:
         return True, "signal-split"
+    if (
+        left.outcome == Outcome.CLEAN
+        and right.outcome == Outcome.CLEAN
+        and left.output_hash is not None
+        and right.output_hash is not None
+        and left.output_hash != right.output_hash
+    ):
+        return True, "output-divergence"
     return False, "agree"
 
 
@@ -161,14 +244,25 @@ def run_decoder_pair(
     path: str,
     timeout: float,
     runner=subprocess.run,
+    compare_output: bool = False,
 ) -> DivergenceResult:
     """Run one mutant through two decoders and report whether they disagree.
 
     Each decoder is invoked independently via :func:`run_decoder`; the two
     results are compared with :func:`_classify_divergence`. ``runner`` is
     injectable so tests can drive the pair without ffmpeg/libde265 installed.
+
+    When ``compare_output`` is True each decoder is invoked with
+    ``capture_output=True`` and the resulting :attr:`DecodeResult.output_hash`
+    values are fed into the divergence classifier, enabling
+    ``"output-divergence"`` detection for clean/clean pairs whose pixel data
+    disagrees.
     """
-    left = run_decoder(left_decoder, path, timeout, runner=runner)
-    right = run_decoder(right_decoder, path, timeout, runner=runner)
+    left = run_decoder(
+        left_decoder, path, timeout, runner=runner, capture_output=compare_output
+    )
+    right = run_decoder(
+        right_decoder, path, timeout, runner=runner, capture_output=compare_output
+    )
     diverged, kind = _classify_divergence(left, right)
     return DivergenceResult(diverged=diverged, kind=kind, left=left, right=right)

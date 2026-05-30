@@ -272,20 +272,58 @@ class:
 - **`signal-split`** — both decoders failed, but with different outcomes (e.g.
   one `crash` via SIGSEGV, one `abort` via SIGABRT). A weaker but still
   actionable disagreement.
+- **`output-divergence`** — both decoders accepted the input as `clean`, but
+  produced different pixel data. Only surfaced when `--compare-output` is
+  passed (see below).
 
 A timeout is *not* treated as a crash-class failure, so a clean-vs-timeout pair
 does not count as a divergence (but crash-vs-timeout does). Outputs:
 
 - `/tmp/diff-out/diff.jsonl` — one JSON object per iteration: the mutator, both
   decoders' outcomes and return codes, whether it diverged, and the divergence
-  kind.
+  kind. With `--compare-output`, each record additionally carries
+  `left_output_hash` and `right_output_hash` (SHA256 of each decoder's raw
+  YUV 4:2:0 stdout).
 - `/tmp/diff-out/divergences/<hash>.h265` — the mutant for any divergence,
   alongside `<hash>.txt` holding a side-by-side report of **both** decoders'
-  outcome, return code, and stderr, so the artifact alone explains why it was
-  kept.
+  outcome, return code, captured `output_hash` (when present), and stderr, so
+  the artifact alone explains why it was kept.
 
 The mutator selection is seeded by `--seed-rng` and is fully reproducible.
 Divergence artifacts feed directly into `mangle triage` for clustering.
+
+#### `--compare-output` — silent-acceptor detection
+
+```bash
+mangle diff \
+  --seed tests/fixtures/clean.h265 \
+  --output-dir /tmp/diff-out \
+  --iterations 100 \
+  --left-decoder ffmpeg \
+  --right-decoder libde265 \
+  --compare-output
+```
+
+By default `mangle diff` only catches disagreements in the *crash class* —
+inputs where one decoder falls over and the other doesn't. It is blind to the
+TWINFUZZ "silent-acceptor" pattern: both decoders return successfully, but
+produce **different pixel data** from the same bitstream. That class is the
+gold-standard silent spec-violation signal — neither decoder complained, but
+at least one of them got the math wrong.
+
+With `--compare-output` each decoder is invoked via a raw-output command
+(ffmpeg with `-f rawvideo -pix_fmt yuv420p -`, libde265 with `dec265 -q -o
+/dev/stdout`) so its decoded YUV 4:2:0 frames flow to stdout. mangle hashes
+the stdout bytes with SHA256 and stores the hex digest on each
+`DecodeResult.output_hash`. When both decoders return `clean` but the hashes
+differ, the iteration is classified as `output-divergence` and the mutant
+plus a side-by-side report (including both `output_hash` values) is written
+under `divergences/`, exactly like the existing crash-class kinds.
+
+Crash-class divergences still take priority: if one decoder crashes the
+iteration is still a `crash-split` regardless of any partial stdout. The
+default (no `--compare-output`) campaign is byte-identical to the previous
+behaviour — stdout is discarded and hashes are left `None`.
 
 ### Build a seed corpus
 

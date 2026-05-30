@@ -750,10 +750,15 @@ class TestSeedCorpusDirCli:
 
 
 def _patch_pair(monkeypatch, pair_for):
-    """Replace run_decoder_pair with a deterministic per-iteration mock."""
+    """Replace run_decoder_pair with a deterministic per-iteration mock.
+
+    The mock absorbs any extra kwargs (including ``compare_output``) so the
+    same helper drives both the original crash-class diff campaigns and the
+    output-divergence campaigns.
+    """
     state = {"i": 0}
 
-    def fake(left, right, path, timeout):
+    def fake(left, right, path, timeout, **kwargs):
         idx = state["i"]
         state["i"] += 1
         return pair_for(idx, left, right)
@@ -776,6 +781,23 @@ def _crash_split(left, right):
         kind="crash-split",
         left=DecodeResult(Outcome.CRASH, -signal.SIGSEGV, "ffmpeg boom", decoder=left),
         right=DecodeResult(Outcome.CLEAN, 0, "", decoder=right),
+    )
+
+
+def _output_divergence(left, right):
+    """Both decoders CLEAN, both with output_hash set, but the hashes differ.
+
+    Models the TWINFUZZ silent-acceptor signal exposed by ``compare_output``.
+    """
+    return DivergenceResult(
+        diverged=True,
+        kind="output-divergence",
+        left=DecodeResult(
+            Outcome.CLEAN, 0, "", decoder=left, output_hash="a" * 64
+        ),
+        right=DecodeResult(
+            Outcome.CLEAN, 0, "", decoder=right, output_hash="b" * 64
+        ),
     )
 
 
@@ -860,6 +882,55 @@ class TestDiffFile:
         else:
             raise AssertionError("expected ValueError for identical decoders")
 
+    def test_compare_output_records_hashes_and_kind(self, tmp_path, monkeypatch):
+        # When compare_output=True is plumbed through and the underlying pair
+        # reports an output-divergence, DiffResult records both decoders'
+        # output_hash values and the kind is preserved through to diff.jsonl.
+        def pair_for(i, left, right):
+            # All iterations diverge by output (deterministic, simple to assert).
+            return _output_divergence(left, right)
+
+        _patch_pair(monkeypatch, pair_for)
+        out_dir = tmp_path / "diff-out"
+        results = engine.diff_file(
+            SEED,
+            out_dir,
+            iterations=4,
+            left_decoder="ffmpeg",
+            right_decoder="libde265",
+            timeout=5.0,
+            seed_rng=11,
+            compare_output=True,
+        )
+        assert all(r.diverged for r in results)
+        assert all(r.kind == "output-divergence" for r in results)
+        # Hashes carried through on every iteration.
+        assert all(r.left_output_hash and r.right_output_hash for r in results)
+        assert all(r.left_output_hash != r.right_output_hash for r in results)
+        # And persisted in the jsonl with the new keys.
+        first = json.loads((out_dir / "diff.jsonl").read_text().splitlines()[0])
+        assert "left_output_hash" in first
+        assert "right_output_hash" in first
+        assert first["kind"] == "output-divergence"
+
+    def test_compare_output_off_leaves_hashes_none(self, tmp_path, monkeypatch):
+        # Default path: compare_output omitted -> DiffResult.left/right
+        # output_hash are None, matching the pre-enhancement behaviour for
+        # any existing crash-class-only diff campaign.
+        _patch_pair(monkeypatch, lambda i, left, right: _agree(left, right))
+        out_dir = tmp_path / "diff-out"
+        results = engine.diff_file(
+            SEED,
+            out_dir,
+            iterations=3,
+            left_decoder="ffmpeg",
+            right_decoder="libde265",
+            timeout=5.0,
+            seed_rng=13,
+        )
+        assert all(r.left_output_hash is None for r in results)
+        assert all(r.right_output_hash is None for r in results)
+
     def test_reproducible_mutator_selection(self, tmp_path, monkeypatch):
         # Same seed-rng picks the same mutator sequence (criterion 7).
         _patch_pair(monkeypatch, lambda i, left, right: _agree(left, right))
@@ -916,6 +987,50 @@ class TestDiffCli:
         assert "divergences:" in out
         assert (out_dir / "diff.jsonl").exists()
         assert (out_dir / "divergences").exists()
+
+    def test_diff_compare_output_cli_reports_output_divergence(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # When --compare-output is passed and the underlying pair-runner
+        # reports an output-divergence, the CLI summary surfaces it as a
+        # named kind alongside crash-split / signal-split.
+        def pair_for(i, left, right):
+            return _output_divergence(left, right) if i % 3 == 0 else _agree(left, right)
+
+        _patch_pair(monkeypatch, pair_for)
+        out_dir = tmp_path / "diff-out"
+        rc = main(
+            [
+                "diff",
+                "--seed",
+                str(SEED),
+                "--output-dir",
+                str(out_dir),
+                "--iterations",
+                "9",
+                "--left-decoder",
+                "ffmpeg",
+                "--right-decoder",
+                "libde265",
+                "--seed-rng",
+                "5",
+                "--compare-output",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "with output compare" in out
+        assert "output-divergence" in out
+        # At least one output-divergence artifact written.
+        div_dir = out_dir / "divergences"
+        assert div_dir.exists()
+        assert any(div_dir.glob("*.h265"))
+        # The side-by-side report names the kind and surfaces output_hash for
+        # each decoder so the artifact alone explains why it was kept.
+        for h in div_dir.glob("*.h265"):
+            report = (div_dir / f"{h.stem}.txt").read_text()
+            assert "output-divergence" in report
+            assert "output_hash=" in report
 
     def test_fuzz_adaptive_strategy_cli(self, tmp_path, monkeypatch, capsys):
         _patch_decoder(
