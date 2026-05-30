@@ -11,6 +11,7 @@ Subcommands:
   replay  - re-derive any fuzz iteration's mutant from the campaign metadata
   coverage - report which mutators a campaign exercised (structural coverage)
   heatmap - report fuzzing pressure and reward by bitstream region
+  mutation-score - report the campaign's kill ratio (mutation testing score)
   afl-mutate - stdin/stdout mutator wrapper for AFL++ harness integration
   mutators - list available mutator types
 """
@@ -30,6 +31,7 @@ from .corpus_trim import trim_corpus_dir
 from .coverage import write_coverage
 from .engine import diff_file, fuzz_file, mutate_file
 from .heatmap import write_heatmap
+from .mutation_score import write_mutation_score
 from .mutators import list_mutators
 from .reduce import reduce_file
 from .replay import replay_iteration
@@ -540,6 +542,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_heatmap.set_defaults(func=_cmd_heatmap)
 
+    # mutation-score
+    p_mscore = sub.add_parser(
+        "mutation-score",
+        help="report the campaign's mutation-testing kill ratio",
+        description=(
+            "Mutation-testing score. Classic mutation testing scores a test "
+            "suite by the fraction of mutants it *kills* (detects). mangle "
+            "inverts the roles: the mutants are the bitstream variants this "
+            "fuzzer generates and the test suite is the decoder under test. A "
+            "mangle mutant KILLS the decoder when the decoder visibly diverges "
+            "from a clean decode (crash, abort, timeout, hang) and SURVIVES "
+            "when the decoder accepts it as if normal (clean). The mutation "
+            "score is killed / total. Complementary to coverage (which "
+            "mutators ran) and heatmap (which bitstream region): mutation-"
+            "score measures how POTENT the campaign's mutants were overall, "
+            "per mutator, and per base seed. A near-zero per-mutator score "
+            "means that mutator's mutants are being silently accepted (weak "
+            "mutator, or permissive decoder region). A high per-base-seed "
+            "score points at which corpus inputs yield productive mutants. "
+            "Pure post-processing over results.jsonl. Writes mutation-score."
+            "json. Runs no decoder; deterministic."
+        ),
+    )
+    p_mscore.add_argument(
+        "--output-dir",
+        required=True,
+        help="a fuzz output directory containing results.jsonl",
+    )
+    p_mscore.set_defaults(func=_cmd_mutation_score)
+
     # afl-mutate
     p_afl = sub.add_parser(
         "afl-mutate",
@@ -918,6 +950,38 @@ def _cmd_heatmap(args: argparse.Namespace) -> int:
             f"({r.crash_share * 100:.0f}% reward){bug_note} [{breakdown}]"
         )
     print(f"heat-map written to {args.output_dir}/heatmap.json")
+    return 0
+
+
+def _cmd_mutation_score(args: argparse.Namespace) -> int:
+    report = write_mutation_score(output_dir=args.output_dir)
+    breakdown = " ".join(f"{o}={n}" for o, n in report.outcomes.items())
+    print(
+        f"mutation score: {report.score * 100:.1f}% "
+        f"({report.killed_count} killed / {report.total_iterations} total, "
+        f"{report.survived_count} survived) [{breakdown}]"
+    )
+    if report.mutators:
+        print("per-mutator (highest score first):")
+        for m in report.mutators:
+            mb = " ".join(f"{o}={n}" for o, n in m.outcomes.items())
+            print(
+                f"  {m.mutator}: {m.score * 100:.1f}% "
+                f"({m.killed}/{m.iterations} killed) [{mb}]"
+            )
+    if report.seeds:
+        # Only show the per-seed block when the campaign used more than the
+        # implicit None bucket — a single-seed run has nothing useful to compare.
+        explicit_seeds = [s for s in report.seeds if s.base_seed is not None]
+        if explicit_seeds:
+            print("per-base-seed:")
+            for s in report.seeds:
+                label = s.base_seed if s.base_seed is not None else "(implicit --seed)"
+                print(
+                    f"  {label}: {s.score * 100:.1f}% "
+                    f"({s.killed}/{s.iterations} killed)"
+                )
+    print(f"mutation score written to {args.output_dir}/mutation-score.json")
     return 0
 
 
