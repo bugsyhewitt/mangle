@@ -175,6 +175,45 @@ one extra artifact:
 Both strategies are fully deterministic for a given `--seed-rng` (the uniform
 path's mutator/seed RNG stream is byte-identical to earlier mangle releases).
 
+##### Resuming an adaptive scheduler (`--scheduler-state`)
+
+Long fuzz campaigns are checkpointable: pass `--scheduler-state PATH` on a
+follow-up `mangle fuzz` invocation and the adaptive scheduler warm-starts from
+the prior campaign's `scheduler.json` instead of starting cold. The saved
+per-mutator `trials` / `rewards` counts are *added* to the new scheduler's
+counters, so a multi-run campaign keeps the prioritisation it learned — the
+bandit's posterior is the same as if both runs had been one long run.
+
+```bash
+# First leg — runs cold, writes /tmp/fuzz-out/scheduler.json
+mangle fuzz \
+  --seed tests/fixtures/clean.h265 \
+  --output-dir /tmp/fuzz-out \
+  --iterations 1000 \
+  --strategy adaptive
+
+# Second leg — resumes with the bandit's accumulated knowledge
+mangle fuzz \
+  --seed tests/fixtures/clean.h265 \
+  --output-dir /tmp/fuzz-out-2 \
+  --iterations 1000 \
+  --strategy adaptive \
+  --scheduler-state /tmp/fuzz-out/scheduler.json
+```
+
+The new `scheduler.json` records a `resumed_from_prior_iterations` breadcrumb so
+a chained `run -> run -> run` is self-documenting in the artifact itself. The
+flag is only meaningful with `--strategy adaptive`; combining it with the
+uniform scheduler is rejected with a clear error (the uniform scheduler does not
+learn from outcomes, so resuming it is meaningless).
+
+Cross-version resume is supported deliberately: mutators that appear in the
+saved state but no longer exist in the current pool are dropped silently, and
+mutators added to the pool since the prior run start cold. A stale
+`scheduler.json` never blocks a resume — invalid count shapes
+(`rewards > trials`, negatives, non-integer values) *do* fail fast so a corrupt
+scoreboard cannot poison a new campaign.
+
 #### Crash feedback loop (`--seed-from-crashes`)
 
 The adaptive scheduler closes the loop on *which mutator* to spend budget on.

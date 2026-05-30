@@ -18,8 +18,10 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections import Counter
+from pathlib import Path
 
 from . import __version__
 from .afl import mutate_stdin_to_stdout
@@ -159,6 +161,19 @@ def build_parser() -> argparse.ArgumentParser:
             "mutator scheduling policy: 'uniform' picks every mutator with equal "
             "probability (default); 'adaptive' learns from crash/abort outcomes "
             "and biases selection toward mutators that crash the decoder"
+        ),
+    )
+    p_fuzz.add_argument(
+        "--scheduler-state",
+        type=Path,
+        default=None,
+        help=(
+            "warm-start the adaptive scheduler from a prior campaign's "
+            "scheduler.json (path). The saved per-mutator trial/reward counts "
+            "are added to this campaign's bandit, so a multi-run campaign keeps "
+            "the prioritisation it learned. Only meaningful with "
+            "--strategy adaptive; unknown mutators in the saved state are dropped "
+            "and new mutators in the pool start cold."
         ),
     )
     p_fuzz.set_defaults(func=_cmd_fuzz)
@@ -534,6 +549,23 @@ def _cmd_mutate(args: argparse.Namespace) -> int:
 
 
 def _cmd_fuzz(args: argparse.Namespace) -> int:
+    scheduler_state = None
+    if args.scheduler_state is not None:
+        if args.strategy == "uniform":
+            print(
+                "error: --scheduler-state requires --strategy adaptive "
+                "(the uniform scheduler does not learn from outcomes)",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            scheduler_state = json.loads(Path(args.scheduler_state).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                f"error: could not read --scheduler-state {args.scheduler_state}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
     results = fuzz_file(
         seed_path=args.seed,
         output_dir=args.output_dir,
@@ -547,6 +579,7 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         seed_from_crashes=args.seed_from_crashes,
         seed_corpus_dir=args.seed_corpus_dir,
         time_limit=args.time_limit,
+        scheduler_state=scheduler_state,
     )
     counts = Counter(r.outcome for r in results)
     crashes = [r for r in results if r.crash_hash]
@@ -584,6 +617,17 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         print(f"{len(crashes)} crash artifact(s) in {args.output_dir}/crashes/")
     if args.strategy != "uniform":
         print(f"mutator scoreboard written to {args.output_dir}/scheduler.json")
+        if scheduler_state is not None:
+            prior_iters = scheduler_state.get("iterations", "?")
+            prior_arms = scheduler_state.get("arms", {})
+            prior_trials = sum(
+                int(a.get("trials", 0)) for a in prior_arms.values()
+                if isinstance(a, dict)
+            )
+            print(
+                f"  resumed adaptive scheduler from {args.scheduler_state} "
+                f"({prior_iters} prior iterations, {prior_trials} prior trials)"
+            )
     return 0
 
 

@@ -145,6 +145,95 @@ class AdaptiveScheduler:
             for m, arm in self._arms.items()
         }
 
+    def load_state(self, arms: dict[str, dict[str, int]]) -> LoadStateReport:
+        """Warm-start the scheduler from a prior campaign's ``scheduler.json``.
+
+        ``arms`` is the ``"arms"`` mapping from a previously written
+        ``scheduler.json``: ``{mutator_name: {"trials": N, "rewards": M}}``. The
+        prior counts are *added* to this scheduler's current per-arm counts (which
+        are zero on a fresh scheduler), so a resume picks up exactly where the
+        previous campaign left off — the bandit's posterior is the same as if both
+        campaigns had been one long run.
+
+        Across-version resume is supported intentionally: mutators that appear in
+        the saved state but no longer exist in the pool are dropped (counted in
+        the report); mutators in the pool that the saved state does not mention
+        start cold (counted in the report). This is the realistic shape — the
+        registered mutator set grows between releases, and a stale scheduler.json
+        should not block a resume.
+
+        ``trials`` must be ``>= rewards >= 0`` for every accepted arm; otherwise
+        the load is rejected with ``ValueError`` and no state is mutated.
+
+        Returns a :class:`LoadStateReport` describing what was loaded, skipped as
+        unknown, and left cold — so the caller can surface the resume shape.
+        """
+        if not isinstance(arms, dict):
+            raise ValueError(
+                f"scheduler state 'arms' must be a mapping, got {type(arms).__name__}"
+            )
+        pool = set(self._arms)
+        loaded: dict[str, _Arm] = {}
+        unknown: list[str] = []
+        total_trials = 0
+        total_rewards = 0
+        for name, counts in arms.items():
+            if name not in pool:
+                unknown.append(name)
+                continue
+            if not isinstance(counts, dict):
+                raise ValueError(
+                    f"scheduler state for arm '{name}' must be a mapping, "
+                    f"got {type(counts).__name__}"
+                )
+            trials = counts.get("trials", 0)
+            rewards = counts.get("rewards", 0)
+            if not isinstance(trials, int) or not isinstance(rewards, int):
+                raise ValueError(
+                    f"scheduler state arm '{name}' must have integer trials/rewards"
+                )
+            if trials < 0 or rewards < 0:
+                raise ValueError(
+                    f"scheduler state arm '{name}' has negative count "
+                    f"(trials={trials}, rewards={rewards})"
+                )
+            if rewards > trials:
+                raise ValueError(
+                    f"scheduler state arm '{name}' has rewards ({rewards}) > "
+                    f"trials ({trials})"
+                )
+            loaded[name] = _Arm(trials=trials, rewards=rewards)
+            total_trials += trials
+            total_rewards += rewards
+        # All-or-nothing: only mutate self after every entry has been validated, so
+        # a bad scheduler.json never leaves the scheduler in a half-loaded state.
+        for name, arm in loaded.items():
+            self._arms[name].trials += arm.trials
+            self._arms[name].rewards += arm.rewards
+        cold = sorted(pool - set(loaded))
+        return LoadStateReport(
+            loaded=sorted(loaded),
+            unknown=sorted(unknown),
+            cold=cold,
+            total_trials=total_trials,
+            total_rewards=total_rewards,
+        )
+
+
+@dataclass
+class LoadStateReport:
+    """Result of :meth:`AdaptiveScheduler.load_state`.
+
+    Surfaces which arms in the saved state were applied, which were dropped as
+    unknown to the current mutator pool, and which pool members started cold.
+    """
+
+    loaded: list[str]
+    unknown: list[str]
+    cold: list[str]
+    total_trials: int
+    total_rewards: int
+
 
 def make_scheduler(strategy: str, mutators: list[str]):
     """Construct a scheduler by strategy name (``uniform`` or ``adaptive``)."""

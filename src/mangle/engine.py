@@ -193,6 +193,7 @@ async def fuzz_async(
     seed_corpus_dir: str | Path | None = None,
     time_limit: float | None = None,
     clock: Callable[[], float] | None = None,
+    scheduler_state: dict | None = None,
 ) -> list[IterationResult]:
     """Run ``iterations`` mutate+decode cycles and record outcomes.
 
@@ -287,6 +288,19 @@ async def fuzz_async(
     mutator_pool = mutators or list_mutators()
     base_rng = random.Random(seed_rng)
     scheduler = make_scheduler(strategy, mutator_pool)
+    if scheduler_state is not None:
+        if strategy == "uniform":
+            raise ValueError(
+                "scheduler_state is only meaningful with --strategy adaptive "
+                "(the uniform scheduler does not learn)"
+            )
+        arms = scheduler_state.get("arms")
+        if arms is None:
+            raise ValueError(
+                "scheduler_state must contain an 'arms' mapping "
+                "(the shape written by a prior campaign's scheduler.json)"
+            )
+        scheduler.load_state(arms)
     semaphore = asyncio.Semaphore(concurrency)
 
     def _seed_for(i: int) -> tuple[str | None, bytes]:
@@ -384,6 +398,12 @@ async def fuzz_async(
             "iterations": len(results),
             "arms": scheduler.stats(),
         }
+        if scheduler_state is not None:
+            # Carry a breadcrumb so a chained resume (run -> run -> run) is
+            # self-documenting in the artifact itself.
+            scoreboard["resumed_from_prior_iterations"] = int(
+                scheduler_state.get("iterations", 0)
+            )
         scoreboard_path.write_text(json.dumps(scoreboard, indent=2) + "\n")
 
     return results
@@ -403,6 +423,7 @@ def fuzz_file(
     seed_corpus_dir: str | Path | None = None,
     time_limit: float | None = None,
     clock: Callable[[], float] | None = None,
+    scheduler_state: dict | None = None,
 ) -> list[IterationResult]:
     """Synchronous wrapper around :func:`fuzz_async`."""
     return asyncio.run(
@@ -420,6 +441,7 @@ def fuzz_file(
             seed_corpus_dir,
             time_limit,
             clock,
+            scheduler_state,
         )
     )
 
