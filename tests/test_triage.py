@@ -9,9 +9,12 @@ import pytest
 
 from mangle.cli import main
 from mangle.triage import (
+    SEVERITY_ORDER,
     CrashSignature,
+    bucket_clusters,
     cluster_crashes,
     extract_frames,
+    severity_for,
     signature_for,
     triage,
 )
@@ -343,3 +346,163 @@ class TestTriageCli:
 def test_crash_signature_dataclass_defaults():
     sig = CrashSignature(kind="stderr", signature="abc")
     assert sig.frames == []
+
+
+# ---------------------------------------------------------------------------
+# Severity bucketing
+# ---------------------------------------------------------------------------
+
+ASAN_WRITE_STDERR = """\
+==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000d54
+WRITE of size 4 at 0x602000000d54 thread T0
+    #0 0x55a3c0ffaa11 in ff_hevc_decode_short_term_rps /src/libavcodec/hevc_ps.c:401:9
+SUMMARY: AddressSanitizer: heap-buffer-overflow hevc_ps.c:401:9
+"""
+
+ASAN_UAF_STDERR = """\
+==12345==ERROR: AddressSanitizer: heap-use-after-free on address 0x602000000d54
+    #0 0x55a3c0ffaa11 in something /src/libavcodec/hevc_ps.c:401:9
+SUMMARY: AddressSanitizer: heap-use-after-free hevc_ps.c:401:9
+"""
+
+ASAN_READ_STDERR = """\
+==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000d54
+READ of size 4 at 0x602000000d54 thread T0
+    #0 0x55a3c0ffaa11 in something /src/libavcodec/hevc_ps.c:401:9
+SUMMARY: AddressSanitizer: heap-buffer-overflow hevc_ps.c:401:9
+"""
+
+UBSAN_STDERR = (
+    "/src/libavcodec/hevc_ps.c:401:9: runtime error: "
+    "signed integer overflow: 2147483647 + 1\n"
+)
+
+PLAIN_SIGSEGV_STDERR = (
+    "[hevc @ 0x5570abcd] decode_slice: bad ref\n"
+    "Segmentation fault (core dumped)\n"
+)
+
+PLAIN_ASSERT_STDERR = "decoder: hevc.c:42: foo: Assertion `x' failed.\nAborted\n"
+
+LOW_STDERR = "[hevc @ 0x5570abcd] Could not find ref with POC 7\n"
+
+
+class TestSeverity:
+    def test_write_bound_is_critical(self):
+        assert severity_for(ASAN_WRITE_STDERR) == "critical"
+
+    def test_use_after_free_is_critical(self):
+        assert severity_for(ASAN_UAF_STDERR) == "critical"
+
+    def test_read_bound_sanitizer_is_high(self):
+        assert severity_for(ASAN_READ_STDERR) == "high"
+
+    def test_ubsan_is_high(self):
+        assert severity_for(UBSAN_STDERR) == "high"
+
+    def test_plain_sigsegv_is_medium(self):
+        assert severity_for(PLAIN_SIGSEGV_STDERR) == "medium"
+
+    def test_plain_assert_is_medium(self):
+        assert severity_for(PLAIN_ASSERT_STDERR) == "medium"
+
+    def test_unknown_stderr_is_low(self):
+        assert severity_for(LOW_STDERR) == "low"
+
+    def test_severity_order_is_strictly_descending(self):
+        # The four-tier ladder, highest-to-lowest, is part of the contract.
+        assert SEVERITY_ORDER == ("critical", "high", "medium", "low")
+
+    def test_critical_beats_high_when_both_match(self):
+        # Write-bound text inside a sanitizer report -> critical, not high.
+        assert severity_for(ASAN_WRITE_STDERR) == "critical"
+
+
+class TestClusterSeverity:
+    def test_cluster_carries_severity(self, tmp_path):
+        _write_run(
+            tmp_path,
+            [
+                ("aaaa1111", "rps-overflow", ASAN_WRITE_STDERR, 0, b"\x00" * 100),
+                ("bbbb2222", "pps-deblocking", PLAIN_SIGSEGV_STDERR, 1, b"\x00" * 100),
+                ("cccc3333", "sps-bit-depth", LOW_STDERR, 2, b"\x00" * 100),
+            ],
+        )
+        clusters = cluster_crashes(tmp_path)
+        by_mut = {c.mutator: c.severity for c in clusters}
+        assert by_mut["rps-overflow"] == "critical"
+        assert by_mut["pps-deblocking"] == "medium"
+        assert by_mut["sps-bit-depth"] == "low"
+
+
+class TestBucketing:
+    def test_bucket_clusters_has_all_tiers(self, tmp_path):
+        _write_run(
+            tmp_path,
+            [("aaaa1111", "m", ASAN_WRITE_STDERR, 0, b"\x00" * 10)],
+        )
+        clusters = cluster_crashes(tmp_path)
+        buckets = bucket_clusters(clusters)
+        assert list(buckets) == list(SEVERITY_ORDER)
+        assert len(buckets["critical"]) == 1
+        assert buckets["high"] == []
+        assert buckets["medium"] == []
+        assert buckets["low"] == []
+
+    def test_triage_bucket_writes_summary_and_subdirs(self, tmp_path):
+        _write_run(
+            tmp_path,
+            [
+                ("aaaa1111", "rps-overflow", ASAN_WRITE_STDERR, 0, b"\x00" * 100),
+                ("bbbb2222", "pps-deblocking", PLAIN_SIGSEGV_STDERR, 1, b"\x00" * 100),
+                ("cccc3333", "sps-bit-depth", LOW_STDERR, 2, b"\x00" * 100),
+            ],
+        )
+        triage(tmp_path, bucket=True)
+        summary_path = tmp_path / "triage-buckets.json"
+        assert summary_path.exists()
+        summary = json.loads(summary_path.read_text())
+        assert summary["total_clusters"] == 3
+        assert summary["total_crashes"] == 3
+        bucket_map = {b["severity"]: b for b in summary["buckets"]}
+        # All four severity tiers always appear, in order.
+        assert [b["severity"] for b in summary["buckets"]] == list(SEVERITY_ORDER)
+        assert bucket_map["critical"]["cluster_count"] == 1
+        assert bucket_map["medium"]["cluster_count"] == 1
+        assert bucket_map["low"]["cluster_count"] == 1
+        assert bucket_map["high"]["cluster_count"] == 0
+        # PoC subdir layout: representative copied into severity subdir.
+        assert (tmp_path / "unique-crashes" / "critical" / "aaaa1111.h265").exists()
+        assert (tmp_path / "unique-crashes" / "medium" / "bbbb2222.h265").exists()
+        assert (tmp_path / "unique-crashes" / "low" / "cccc3333.h265").exists()
+        # And the flat layout still exists (back-compat).
+        assert (tmp_path / "unique-crashes" / "aaaa1111.h265").exists()
+
+    def test_triage_without_bucket_is_byte_identical_legacy(self, tmp_path):
+        # Default triage() must not write triage-buckets.json or severity subdirs.
+        _write_run(
+            tmp_path,
+            [("aaaa1111", "m", ASAN_WRITE_STDERR, 0, b"\x00" * 10)],
+        )
+        triage(tmp_path)
+        assert not (tmp_path / "triage-buckets.json").exists()
+        assert not (tmp_path / "unique-crashes" / "critical").exists()
+
+    def test_cli_triage_bucket_flag(self, tmp_path, capsys):
+        _write_run(
+            tmp_path,
+            [
+                ("aaaa1111", "rps-overflow", ASAN_WRITE_STDERR, 0, b"\x00" * 100),
+                ("bbbb2222", "pps-deblocking", PLAIN_SIGSEGV_STDERR, 1, b"\x00" * 100),
+            ],
+        )
+        rc = main(
+            ["triage", "--output-dir", str(tmp_path), "--triage-bucket"]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "severity buckets:" in out
+        assert "critical:" in out
+        assert "medium:" in out
+        assert (tmp_path / "triage-buckets.json").exists()
+        assert (tmp_path / "unique-crashes" / "critical" / "aaaa1111.h265").exists()
