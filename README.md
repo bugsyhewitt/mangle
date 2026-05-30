@@ -138,6 +138,58 @@ byte-for-byte. Only the iteration *count* of a time-budgeted run is wall-clock
 dependent. Omitting `--time-limit` preserves the exact iterations-only behaviour
 (and the byte-identical RNG stream) of earlier releases.
 
+#### In-campaign crash deduplication (`--crash-dedup`)
+
+At scale, one decoder bug fires from many distinct mutants — so the raw
+`crashes/` directory's artifact count vastly exceeds the unique-bug count.
+The [`mangle triage`](#triage-and-deduplicate-crashes) subcommand handles this
+*after* the campaign by clustering the artifacts that were already written.
+`--crash-dedup` does it *during* the campaign — the redundant artifact pair
+is never written in the first place, so a long-running fuzz against a noisy
+bug does not blow up the `crashes/` directory or the disk:
+
+```bash
+mangle fuzz \
+  --seed tests/fixtures/clean.h265 \
+  --output-dir /tmp/fuzz-out \
+  --iterations 100000 \
+  --crash-dedup
+```
+
+When `--crash-dedup` is set, each crashing iteration's decoder stderr is
+fingerprinted with the *same* signature `mangle triage` uses
+(ASAN/UBSAN top stack frames when present, normalised stderr hash otherwise),
+and the `crashes/<hash>.{h265,txt}` artifact pair is written **only on the
+first occurrence of each signature**. Subsequent crashes whose signature
+matches an already-seen one are still recorded in `results.jsonl` (so the
+outcome counts stay honest), and their row carries two new fields:
+
+- `dedup_signature` — the signature this crash hashed to.
+- `dedup_first` — `true` when this iteration was the first occurrence of
+  the signature (so it wrote the artifact pair), `false` when it was a
+  duplicate (suppressed).
+
+The set of seen signatures is persisted to `dedup-signatures.json` so a
+follow-on campaign into the *same* output directory resumes from the same
+dedup state — a duplicate of a signature seen by the prior campaign is
+suppressed even on the first iteration of the new one. `--dedup-frame-depth`
+selects how many top sanitizer stack frames make up the signature (default 3,
+matching `mangle triage --frame-depth`).
+
+The summary line shifts to report both numbers so the operator can see what
+dedup bought:
+
+```
+3 unique crash artifact(s) in /tmp/fuzz-out/crashes/ (147 duplicate(s)
+suppressed by --crash-dedup; signatures persisted to
+/tmp/fuzz-out/dedup-signatures.json)
+```
+
+Omitting `--crash-dedup` preserves the exact byte-identical behaviour of
+earlier releases — every crash writes its artifact pair, no
+`dedup-signatures.json` is touched, and the new results.jsonl fields are
+recorded as `null`.
+
 #### Adaptive mutator prioritisation (`--strategy`)
 
 By default (`--strategy uniform`) every mutator is equally likely on every

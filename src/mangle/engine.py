@@ -16,6 +16,7 @@ from .bitstream import assemble_nal_units, split_nal_units
 from .decoder import Outcome, run_decoder, run_decoder_pair
 from .mutators import MutationResult, get_mutator
 from .scheduler import make_scheduler
+from .triage import signature_for
 
 
 @dataclass
@@ -76,6 +77,19 @@ class IterationResult:
     # crash-fed campaign (--seed-from-crashes) it is the basename of the crash
     # artifact used as the base seed, so the iteration stays fully replayable.
     base_seed: str | None = None
+    # Crash-dedup signature (the same ASAN-top-frame / normalised-stderr
+    # fingerprint :mod:`mangle.triage` uses), recorded for every crashing
+    # iteration when the campaign was launched with ``crash_dedup=True``.
+    # ``None`` when dedup is off (the default) or the iteration did not crash —
+    # so the v0.1 results.jsonl shape is preserved field-for-field.
+    dedup_signature: str | None = None
+    # When ``crash_dedup`` is on and this iteration crashed: ``True`` if this
+    # iteration's signature was *new* (so the ``crashes/<hash>.{h265,txt}``
+    # artifacts were written), ``False`` if the signature had already been seen
+    # by an earlier iteration in this campaign (the iteration is still
+    # recorded — the count statistics stay honest — but the redundant artifact
+    # write is suppressed). ``None`` when dedup is off or no crash.
+    dedup_first: bool | None = None
 
 
 def _collect_crash_seeds(crashes_dir: str | Path) -> list[tuple[str, bytes]]:
@@ -128,6 +142,81 @@ def _collect_corpus_seeds(corpus_dir: str | Path) -> list[tuple[str, bytes]]:
     return seeds
 
 
+class _DedupRegistry:
+    """Live crash-signature registry for in-campaign deduplication.
+
+    A campaign launched with ``crash_dedup=True`` writes each crashing mutant's
+    ``crashes/<hash>.{h265,txt}`` artifact only on the *first* occurrence of
+    its signature. Subsequent crashing iterations whose signature matches an
+    already-seen one are still recorded in ``results.jsonl`` (so the outcome
+    counts stay honest), but the redundant artifact write is suppressed and
+    the iteration's ``dedup_first`` flag is set to ``False``.
+
+    The set of seen signatures is also persisted to
+    ``<output_dir>/dedup-signatures.json`` at the end of the campaign so a
+    follow-on campaign into the same output directory can resume from the same
+    state (the post-processing :func:`mangle.triage.triage` cluster view stays
+    consistent because the artifacts that *were* written are still the
+    canonical representative for each cluster). On startup we load whatever the
+    file already contains, so the registry is monotonic across resumes.
+
+    The registry is shared between coroutines via a single ``asyncio.Lock`` —
+    the check-and-insert must be atomic so two iterations that crash with the
+    same signature in the same dispatch round can never both believe they were
+    "first".
+    """
+
+    DEDUP_FILE = "dedup-signatures.json"
+
+    def __init__(self, output_dir: Path, frame_depth: int = 3) -> None:
+        self._output_dir = output_dir
+        self._frame_depth = frame_depth
+        self._seen: set[str] = set()
+        self._lock = asyncio.Lock()
+        # Resume: pick up signatures from a prior campaign in the same dir.
+        path = output_dir / self.DEDUP_FILE
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text())
+                self._seen = set(payload.get("signatures", []))
+            except (OSError, ValueError):
+                # A corrupt or unreadable file is non-fatal — start fresh; the
+                # campaign will overwrite it with the post-run state.
+                self._seen = set()
+
+    async def check_and_record(self, stderr: str) -> tuple[str, bool]:
+        """Return ``(signature, is_first)`` for one crash's stderr.
+
+        Atomically computes the signature, checks whether it has been seen
+        before, and (if not) records it. Concurrent callers in the same
+        asyncio loop are serialised — the lock is the only safe primitive for
+        a check-then-insert against a shared set in an async context.
+        """
+        sig = signature_for(stderr, frame_depth=self._frame_depth).signature
+        async with self._lock:
+            is_first = sig not in self._seen
+            if is_first:
+                self._seen.add(sig)
+        return sig, is_first
+
+    def persist(self) -> None:
+        """Write the seen-signatures set to disk for resume."""
+        path = self._output_dir / self.DEDUP_FILE
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        # ``sorted`` makes the file byte-stable for the same set of signatures —
+        # easier to diff between campaigns / between resumes.
+        path.write_text(
+            json.dumps(
+                {
+                    "frame_depth": self._frame_depth,
+                    "signatures": sorted(self._seen),
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+
+
 async def _run_iteration(
     i: int,
     seed_data: bytes,
@@ -138,6 +227,7 @@ async def _run_iteration(
     crashes_dir: Path,
     semaphore: asyncio.Semaphore,
     base_seed: str | None = None,
+    dedup: _DedupRegistry | None = None,
 ) -> IterationResult:
     rng = random.Random(iter_rng_seed)
     mutated, result = mutate_bytes(seed_data, mutator_name, rng)
@@ -155,11 +245,20 @@ async def _run_iteration(
             Path(tmp_path).unlink(missing_ok=True)
 
     crash_hash: str | None = None
+    dedup_signature: str | None = None
+    dedup_first: bool | None = None
     if decode.outcome in (Outcome.CRASH, Outcome.ABORT):
         crash_hash = hashlib.sha256(mutated).hexdigest()[:16]
-        crashes_dir.mkdir(parents=True, exist_ok=True)
-        (crashes_dir / f"{crash_hash}.h265").write_bytes(mutated)
-        (crashes_dir / f"{crash_hash}.txt").write_text(decode.stderr)
+        if dedup is not None:
+            dedup_signature, dedup_first = await dedup.check_and_record(decode.stderr)
+        # Write artifacts only on first occurrence — every iteration writes
+        # when dedup is off; only the first-of-signature writes when dedup is
+        # on. The check-and-record above is atomic, so concurrent crashes with
+        # the same signature have exactly one winner.
+        if dedup is None or dedup_first:
+            crashes_dir.mkdir(parents=True, exist_ok=True)
+            (crashes_dir / f"{crash_hash}.h265").write_bytes(mutated)
+            (crashes_dir / f"{crash_hash}.txt").write_text(decode.stderr)
 
     return IterationResult(
         iteration=i,
@@ -171,6 +270,8 @@ async def _run_iteration(
         detail=result.detail,
         crash_hash=crash_hash,
         base_seed=base_seed,
+        dedup_signature=dedup_signature,
+        dedup_first=dedup_first,
     )
 
 
@@ -194,6 +295,8 @@ async def fuzz_async(
     time_limit: float | None = None,
     clock: Callable[[], float] | None = None,
     scheduler_state: dict | None = None,
+    crash_dedup: bool = False,
+    dedup_frame_depth: int = 3,
 ) -> list[IterationResult]:
     """Run ``iterations`` mutate+decode cycles and record outcomes.
 
@@ -270,6 +373,18 @@ async def fuzz_async(
     out_dir.mkdir(parents=True, exist_ok=True)
     crashes_dir = out_dir / "crashes"
 
+    # In-campaign crash deduplication: when on, every crashing iteration's
+    # stderr is fingerprinted with the same signature mangle triage uses, and
+    # only the first occurrence of each signature writes the
+    # ``crashes/<hash>.{h265,txt}`` artifact pair — duplicates of an already-
+    # seen bug add a results.jsonl row (so the count stats stay honest) but
+    # not a redundant artifact. ``None`` means dedup is off — the v0.1 path.
+    dedup = (
+        _DedupRegistry(out_dir, frame_depth=dedup_frame_depth)
+        if crash_dedup
+        else None
+    )
+
     # Build the base-seed pool: one (--seed) or many (--seed-from-crashes /
     # --seed-corpus-dir). ``seed_pool`` is a list of (basename | None, bytes);
     # a None basename marks the single-seed v0.1 case so its results record
@@ -338,6 +453,7 @@ async def fuzz_async(
                     crashes_dir,
                     semaphore,
                     base_seed=base_name,
+                    dedup=dedup,
                 )
             )
         results = await asyncio.gather(*tasks)
@@ -373,6 +489,7 @@ async def fuzz_async(
                         crashes_dir,
                         semaphore,
                         base_seed=base_name,
+                        dedup=dedup,
                     )
                 )
             round_results = await asyncio.gather(*round_tasks)
@@ -386,6 +503,9 @@ async def fuzz_async(
     with results_path.open("w") as fh:
         for r in results:
             fh.write(json.dumps(asdict(r)) + "\n")
+
+    if dedup is not None:
+        dedup.persist()
 
     if strategy != "uniform":
         # Emit the learned per-mutator scoreboard so a campaign's prioritisation
@@ -424,6 +544,8 @@ def fuzz_file(
     time_limit: float | None = None,
     clock: Callable[[], float] | None = None,
     scheduler_state: dict | None = None,
+    crash_dedup: bool = False,
+    dedup_frame_depth: int = 3,
 ) -> list[IterationResult]:
     """Synchronous wrapper around :func:`fuzz_async`."""
     return asyncio.run(
@@ -442,6 +564,8 @@ def fuzz_file(
             time_limit,
             clock,
             scheduler_state,
+            crash_dedup=crash_dedup,
+            dedup_frame_depth=dedup_frame_depth,
         )
     )
 

@@ -309,7 +309,7 @@ class TestAdaptiveFuzz:
 
         async def fake_run_iteration(
             i, sd, mutator_name, iter_rng_seed, decoder, timeout, crashes_dir, sem,
-            base_seed=None,
+            base_seed=None, dedup=None,
         ):
             from mangle.engine import IterationResult
 
@@ -1387,3 +1387,429 @@ class TestSchedulerStateResume:
         assert rc == 2
         err = capsys.readouterr().err
         assert "could not read --scheduler-state" in err
+# ---------------------------------------------------------------------------
+# Crash deduplication (--crash-dedup)
+# ---------------------------------------------------------------------------
+
+
+# A symbolised ASAN backtrace fragment. The top three frame *function* names
+# are the signature; the address / file / line columns are deliberately
+# different across the two payloads to prove the signature ignores them.
+_ASAN_A = (
+    "==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0xdead\n"
+    "    #0 0x55a3c0ffee21 in hevc_decode_frame /src/libavcodec/hevcdec.c:1234:7\n"
+    "    #1 0x55a3c0ffe000 in decode_nal_unit /src/libavcodec/hevcdec.c:999:3\n"
+    "    #2 0x55a3c0ffd000 in ff_hevc_decode /src/libavcodec/hevcdec.c:42:1\n"
+    "SUMMARY: AddressSanitizer: heap-buffer-overflow\n"
+)
+_ASAN_A_DIFFERENT_ADDRS = (
+    "==99999==ERROR: AddressSanitizer: heap-buffer-overflow on address 0xbeef\n"
+    "    #0 0x7fffeeeeee21 in hevc_decode_frame /build/avcodec/hevcdec.c:5678:9\n"
+    "    #1 0x7fffeeeed000 in decode_nal_unit /build/avcodec/hevcdec.c:111:1\n"
+    "    #2 0x7fffeeeec000 in ff_hevc_decode /build/avcodec/hevcdec.c:50:1\n"
+    "SUMMARY: AddressSanitizer: heap-buffer-overflow\n"
+)
+# A different bug — different top frame.
+_ASAN_B = (
+    "==54321==ERROR: AddressSanitizer: SEGV on unknown address 0x0\n"
+    "    #0 0x55a3c0eeee21 in parse_sps /src/libavcodec/hevcdec.c:200:1\n"
+    "    #1 0x55a3c0eeed000 in decode_nal_unit /src/libavcodec/hevcdec.c:999:3\n"
+    "    #2 0x55a3c0eeec000 in ff_hevc_decode /src/libavcodec/hevcdec.c:42:1\n"
+    "SUMMARY: AddressSanitizer: SEGV\n"
+)
+
+
+class TestCrashDedupOff:
+    """With dedup off, the campaign and on-disk shape match the v0.1 path."""
+
+    def test_results_jsonl_fields_default_to_none(self, tmp_path, monkeypatch):
+        # Every iteration crashes with the SAME signature; with dedup OFF, every
+        # crash artifact is still written and every results row carries None
+        # for the new fields — proving the off-path is shape-stable.
+        _patch_decoder(
+            monkeypatch,
+            lambda i: DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A),
+        )
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED, out_dir, iterations=5, decoder="ffmpeg", timeout=5.0, seed_rng=1
+        )
+        assert all(r.dedup_signature is None for r in results)
+        assert all(r.dedup_first is None for r in results)
+        # No dedup-signatures.json is written when dedup is off.
+        assert not (out_dir / "dedup-signatures.json").exists()
+        # And the on-disk results.jsonl carries the new keys as null so the
+        # schema is forward-compatible without surprising older readers.
+        first = json.loads((out_dir / "results.jsonl").read_text().splitlines()[0])
+        assert first["dedup_signature"] is None
+        assert first["dedup_first"] is None
+
+    def test_off_path_writes_every_crash_artifact(self, tmp_path, monkeypatch):
+        # Three identical-signature crashes -> three distinct mutant-hash files.
+        _patch_decoder(
+            monkeypatch,
+            lambda i: DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A),
+        )
+        out_dir = tmp_path / "fuzz-out"
+        engine.fuzz_file(
+            SEED, out_dir, iterations=3, decoder="ffmpeg", timeout=5.0, seed_rng=1
+        )
+        h265s = sorted((out_dir / "crashes").glob("*.h265"))
+        assert len(h265s) == 3
+
+
+class TestCrashDedupOn:
+    """With dedup on, only the first-of-signature crash writes artifacts."""
+
+    def test_same_signature_writes_one_artifact(self, tmp_path, monkeypatch):
+        # All five iterations crash with the SAME ASAN signature (top frames
+        # are identical; only the addresses and line numbers differ). With
+        # --crash-dedup, only one mutant-hash artifact pair lands on disk.
+        def outcomes(i):
+            return DecodeResult(
+                Outcome.CRASH,
+                -signal.SIGSEGV,
+                _ASAN_A if i % 2 == 0 else _ASAN_A_DIFFERENT_ADDRS,
+            )
+
+        _patch_decoder(monkeypatch, outcomes)
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=5,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            crash_dedup=True,
+        )
+        # Every iteration is recorded.
+        assert len(results) == 5
+        crashes = [r for r in results if r.crash_hash]
+        assert len(crashes) == 5
+        # Exactly one signature, exactly one first-occurrence.
+        sigs = {r.dedup_signature for r in crashes}
+        assert len(sigs) == 1
+        assert sum(1 for r in crashes if r.dedup_first) == 1
+        assert sum(1 for r in crashes if r.dedup_first is False) == 4
+        # And only ONE artifact pair on disk — the dedup payoff.
+        h265s = sorted((out_dir / "crashes").glob("*.h265"))
+        assert len(h265s) == 1
+
+    def test_distinct_signatures_each_write_an_artifact(self, tmp_path, monkeypatch):
+        # Alternate between two distinct bugs -> two distinct artifact pairs.
+        def outcomes(i):
+            return DecodeResult(
+                Outcome.CRASH,
+                -signal.SIGSEGV,
+                _ASAN_A if i % 2 == 0 else _ASAN_B,
+            )
+
+        _patch_decoder(monkeypatch, outcomes)
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=6,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            crash_dedup=True,
+        )
+        crashes = [r for r in results if r.crash_hash]
+        sigs = {r.dedup_signature for r in crashes}
+        assert len(sigs) == 2
+        # Each signature has exactly one first-of-signature winner.
+        firsts = [r for r in crashes if r.dedup_first]
+        assert len(firsts) == 2
+        assert {r.dedup_signature for r in firsts} == sigs
+        # Two artifact pairs on disk.
+        h265s = sorted((out_dir / "crashes").glob("*.h265"))
+        assert len(h265s) == 2
+
+    def test_stderr_fallback_signature_normalises_numbers(self, tmp_path, monkeypatch):
+        # Plain (non-sanitizer) stderrs that differ ONLY in incidental
+        # numbers should hash to the same signature and dedup to one artifact.
+        def outcomes(i):
+            return DecodeResult(
+                Outcome.CRASH,
+                -signal.SIGSEGV,
+                f"plain decoder error at offset {i * 100}\n",
+            )
+
+        _patch_decoder(monkeypatch, outcomes)
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=4,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            crash_dedup=True,
+        )
+        crashes = [r for r in results if r.crash_hash]
+        sigs = {r.dedup_signature for r in crashes}
+        assert len(sigs) == 1
+        # And kind-stable: all signatures are the stderr-fallback hash form
+        # (a 16-char hex string from the triage signature_for fallback).
+        sig = next(iter(sigs))
+        assert len(sig) == 16
+        h265s = sorted((out_dir / "crashes").glob("*.h265"))
+        assert len(h265s) == 1
+
+    def test_persists_seen_signatures_for_resume(self, tmp_path, monkeypatch):
+        # After a campaign, dedup-signatures.json holds the seen set; a
+        # subsequent campaign into the same dir picks them up and suppresses
+        # the matching artifact even though it is the first iteration of the
+        # NEW campaign — that is the resume semantic.
+        _patch_decoder(
+            monkeypatch,
+            lambda i: DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A),
+        )
+        out_dir = tmp_path / "fuzz-out"
+        engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=2,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            crash_dedup=True,
+        )
+        sig_file = out_dir / "dedup-signatures.json"
+        assert sig_file.exists()
+        payload = json.loads(sig_file.read_text())
+        assert payload["frame_depth"] == 3
+        assert len(payload["signatures"]) == 1
+        first_artifact_count = len(list((out_dir / "crashes").glob("*.h265")))
+        assert first_artifact_count == 1
+
+        # Second campaign, same dir, same signature on every iteration: every
+        # iteration's dedup_first must be False because the registry resumed
+        # from disk. No NEW artifact pair lands.
+        results2 = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=3,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=2,
+            crash_dedup=True,
+        )
+        crashes2 = [r for r in results2 if r.crash_hash]
+        assert len(crashes2) == 3
+        assert all(r.dedup_first is False for r in crashes2)
+        # Same one artifact pair as before.
+        assert (
+            len(list((out_dir / "crashes").glob("*.h265"))) == first_artifact_count
+        )
+
+    def test_corrupt_dedup_file_is_non_fatal(self, tmp_path, monkeypatch):
+        # A garbage dedup-signatures.json (eg from a half-written previous run)
+        # must not crash the campaign — the registry starts fresh and persists
+        # the new state.
+        out_dir = tmp_path / "fuzz-out"
+        out_dir.mkdir()
+        (out_dir / "dedup-signatures.json").write_text("{not valid json")
+        _patch_decoder(
+            monkeypatch,
+            lambda i: DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A),
+        )
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=2,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            crash_dedup=True,
+        )
+        crashes = [r for r in results if r.crash_hash]
+        # Fresh registry -> the first crash is the first-of-signature.
+        assert any(r.dedup_first for r in crashes)
+        # And the file is overwritten with the new (valid) state.
+        payload = json.loads((out_dir / "dedup-signatures.json").read_text())
+        assert len(payload["signatures"]) == 1
+
+    def test_dedup_frame_depth_is_threaded_into_signature(self, tmp_path, monkeypatch):
+        # With frame_depth=1 only the top frame is signature-bearing — so the
+        # ASAN_A vs ASAN_A_DIFFERENT_ADDRS pair (same top frame, same second
+        # and third frames) and a hypothetical A-with-different-second-frame
+        # would still collide. Easier proof: frame_depth=1 vs frame_depth=3
+        # produce DIFFERENT signatures for the SAME stderr, because the
+        # signature is a join of the top N frame names.
+        def outcomes(i):
+            return DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A)
+
+        _patch_decoder(monkeypatch, outcomes)
+        out_a = tmp_path / "out-a"
+        engine.fuzz_file(
+            SEED,
+            out_a,
+            iterations=1,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            crash_dedup=True,
+            dedup_frame_depth=1,
+        )
+        out_b = tmp_path / "out-b"
+        engine.fuzz_file(
+            SEED,
+            out_b,
+            iterations=1,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            crash_dedup=True,
+            dedup_frame_depth=3,
+        )
+        sig_a = json.loads(
+            (out_a / "dedup-signatures.json").read_text()
+        )["signatures"][0]
+        sig_b = json.loads(
+            (out_b / "dedup-signatures.json").read_text()
+        )["signatures"][0]
+        assert sig_a != sig_b
+        # Frame-depth is also persisted so a triage tool can see what depth the
+        # signatures were derived at.
+        depth_a = json.loads(
+            (out_a / "dedup-signatures.json").read_text()
+        )["frame_depth"]
+        assert depth_a == 1
+
+    def test_clean_iterations_are_unaffected(self, tmp_path, monkeypatch):
+        # Non-crashing iterations never compute a signature and never touch
+        # the registry. Mix clean + crashing and confirm the fields are None
+        # on the clean rows and populated only on the crashing rows.
+        def outcomes(i):
+            if i % 2 == 0:
+                return DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A)
+            return DecodeResult(Outcome.CLEAN, 0, "")
+
+        _patch_decoder(monkeypatch, outcomes)
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=4,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            crash_dedup=True,
+        )
+        for r in results:
+            if r.outcome == "clean":
+                assert r.dedup_signature is None
+                assert r.dedup_first is None
+            else:
+                assert r.dedup_signature is not None
+                assert r.dedup_first in (True, False)
+
+    def test_concurrent_round_dispatch_has_single_winner(self, tmp_path, monkeypatch):
+        # The check-and-record path is an asyncio.Lock-protected critical
+        # section, so even when several same-signature crashes complete in the
+        # same dispatch round, EXACTLY ONE iteration must be flagged as the
+        # first-of-signature. Use adaptive strategy + concurrency to force
+        # round-based dispatch with several iterations in flight at once.
+        _patch_decoder(
+            monkeypatch,
+            lambda i: DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A),
+        )
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=12,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            concurrency=4,
+            strategy="adaptive",
+            crash_dedup=True,
+        )
+        crashes = [r for r in results if r.crash_hash]
+        firsts = [r for r in crashes if r.dedup_first]
+        assert len(firsts) == 1
+        # And exactly one artifact pair regardless of dispatch ordering.
+        assert len(list((out_dir / "crashes").glob("*.h265"))) == 1
+
+
+class TestCrashDedupCli:
+    """End-to-end CLI tests for --crash-dedup."""
+
+    def test_cli_flag_enables_dedup(self, tmp_path, monkeypatch, capsys):
+        _patch_decoder(
+            monkeypatch,
+            lambda i: DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A),
+        )
+        out_dir = tmp_path / "out"
+        rc = main(
+            [
+                "fuzz",
+                "--seed",
+                str(SEED),
+                "--output-dir",
+                str(out_dir),
+                "--iterations",
+                "4",
+                "--crash-dedup",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The summary line surfaces both the unique count AND the
+        # suppressed-duplicate count so the operator sees what dedup bought.
+        assert "1 unique crash artifact" in out
+        assert "3 duplicate(s) suppressed by --crash-dedup" in out
+        assert "dedup-signatures.json" in out
+        assert (out_dir / "dedup-signatures.json").exists()
+        assert len(list((out_dir / "crashes").glob("*.h265"))) == 1
+
+    def test_cli_without_flag_writes_no_dedup_file(self, tmp_path, monkeypatch, capsys):
+        _patch_decoder(
+            monkeypatch,
+            lambda i: DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A),
+        )
+        out_dir = tmp_path / "out"
+        rc = main(
+            [
+                "fuzz",
+                "--seed",
+                str(SEED),
+                "--output-dir",
+                str(out_dir),
+                "--iterations",
+                "3",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "3 crash artifact" in out
+        assert "duplicate" not in out
+        assert not (out_dir / "dedup-signatures.json").exists()
+
+    def test_cli_frame_depth_threaded_through(self, tmp_path, monkeypatch):
+        _patch_decoder(
+            monkeypatch,
+            lambda i: DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A),
+        )
+        out_dir = tmp_path / "out"
+        rc = main(
+            [
+                "fuzz",
+                "--seed",
+                str(SEED),
+                "--output-dir",
+                str(out_dir),
+                "--iterations",
+                "1",
+                "--crash-dedup",
+                "--dedup-frame-depth",
+                "1",
+            ]
+        )
+        assert rc == 0
+        payload = json.loads((out_dir / "dedup-signatures.json").read_text())
+        assert payload["frame_depth"] == 1

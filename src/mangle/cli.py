@@ -176,6 +176,34 @@ def build_parser() -> argparse.ArgumentParser:
             "and new mutators in the pool start cold."
         ),
     )
+    p_fuzz.add_argument(
+        "--crash-dedup",
+        action="store_true",
+        help=(
+            "in-campaign crash deduplication: fingerprint each crashing "
+            "iteration's decoder stderr with the same signature `mangle triage` "
+            "uses (ASAN/UBSAN top stack frames when present, normalised stderr "
+            "hash otherwise) and write the crashes/<hash>.{h265,txt} artifact "
+            "pair only on the FIRST occurrence of each signature. Duplicates of "
+            "an already-seen bug are still recorded in results.jsonl (so outcome "
+            "counts stay honest) but the redundant artifact write is suppressed "
+            "— keeping the crashes/ directory bounded by the count of UNIQUE "
+            "bugs, not the count of crashing inputs. The set of seen signatures "
+            "is persisted to dedup-signatures.json so a follow-on campaign into "
+            "the same output directory resumes from the same dedup state. "
+            "Default off — without --crash-dedup the campaign is byte-identical "
+            "to earlier releases"
+        ),
+    )
+    p_fuzz.add_argument(
+        "--dedup-frame-depth",
+        type=int,
+        default=3,
+        help=(
+            "with --crash-dedup, how many top sanitizer stack frames make up "
+            "the signature (default 3, matching `mangle triage --frame-depth`)"
+        ),
+    )
     p_fuzz.set_defaults(func=_cmd_fuzz)
 
     # diff
@@ -580,6 +608,8 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         seed_corpus_dir=args.seed_corpus_dir,
         time_limit=args.time_limit,
         scheduler_state=scheduler_state,
+        crash_dedup=args.crash_dedup,
+        dedup_frame_depth=args.dedup_frame_depth,
     )
     counts = Counter(r.outcome for r in results)
     crashes = [r for r in results if r.crash_hash]
@@ -614,7 +644,16 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
             print(f"  {outcome}: {counts[outcome]}")
     print(f"results written to {args.output_dir}/results.jsonl")
     if crashes:
-        print(f"{len(crashes)} crash artifact(s) in {args.output_dir}/crashes/")
+        if args.crash_dedup:
+            unique = sum(1 for r in crashes if r.dedup_first)
+            suppressed = len(crashes) - unique
+            print(
+                f"{unique} unique crash artifact(s) in {args.output_dir}/crashes/ "
+                f"({suppressed} duplicate(s) suppressed by --crash-dedup; "
+                f"signatures persisted to {args.output_dir}/dedup-signatures.json)"
+            )
+        else:
+            print(f"{len(crashes)} crash artifact(s) in {args.output_dir}/crashes/")
     if args.strategy != "uniform":
         print(f"mutator scoreboard written to {args.output_dir}/scheduler.json")
         if scheduler_state is not None:
