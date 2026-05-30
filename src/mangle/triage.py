@@ -82,6 +82,108 @@ _PATH_RE = re.compile(r"\S*\.(?:h265|hevc)\b")
 _INT_RE = re.compile(r"\b\d+\b")
 
 
+# ---------------------------------------------------------------------------
+# Severity classification
+# ---------------------------------------------------------------------------
+#
+# Triage answers "are these the same bug?"; severity answers "which of these
+# bugs do I look at first?". A 500-crash campaign that triages to 8 unique bugs
+# still gives the operator no ordering — and reviewing a write-bound heap
+# corruption before a plain SIGABRT is the difference between catching an
+# exploitable primitive same-day and burying it under low-severity noise. The
+# bucketing is a deliberate, narrow severity ladder over the *signals already
+# in the stderr we already parse for signatures* — no decoder re-run, no new
+# inputs, no heuristics beyond well-known sanitizer/crash markers.
+#
+# Severity tiers (highest first, deterministic, first match wins):
+#
+#   critical : sanitizer-confirmed write-bound or lifetime-corruption memory
+#              bug — heap/stack-buffer-overflow WRITE, use-after-free,
+#              double-free, write-after-free. The classic exploitable
+#              primitives.
+#   high     : other sanitizer reports — heap/stack/global READ overflows,
+#              UBSAN runtime errors, sanitizer-reported SEGV, leaks. The bug
+#              is real and the sanitizer pinned it; exploitability is less
+#              clear-cut than the write-bound classes.
+#   medium   : a plain (non-sanitizer) SIGSEGV / SIGABRT / assertion failure
+#              — the decoder crashed but no sanitizer was present to bound the
+#              primitive. Solid DoS-class signal, ambiguous on memory safety.
+#   low      : everything else that still earned a crash_hash — decoder-
+#              reported errors with no crash signal (clean non-zero exits the
+#              fuzzer flagged as crash/abort because of returncode, etc.).
+#
+# All four tiers are *strict over the stderr text only*: no decoder execution,
+# no extra I/O, no platform-specific probing. The classifier is a pure
+# function of the saved ``crashes/<hash>.txt`` content, so bucketing is fully
+# deterministic and runs in the same read-only pass as signature extraction.
+
+# Ordered highest-to-lowest. The CLI / JSON layouts depend on this order.
+SEVERITY_ORDER: tuple[str, ...] = ("critical", "high", "medium", "low")
+
+# Lifetime-corruption sanitizer reports — always critical when seen.
+_CRITICAL_DIRECT_RE = re.compile(
+    r"(heap-use-after-free"
+    r"|use-after-free"
+    r"|double-free"
+    r"|attempting double-free"
+    r"|write-after-free)",
+    re.IGNORECASE,
+)
+
+# A buffer-overflow report becomes critical only when the access was a WRITE
+# (the exploitable primitive). ASAN puts "WRITE of size N at 0x..." on a
+# separate line from the "heap-buffer-overflow" header, so we test for the
+# two tokens independently against the full report rather than try to span
+# newlines with a single ungreedy regex.
+_BUFOVERFLOW_RE = re.compile(
+    r"(heap-buffer-overflow|stack-buffer-overflow)",
+    re.IGNORECASE,
+)
+_WRITE_RE = re.compile(r"\bWRITE of\b", re.IGNORECASE)
+
+# Other sanitizer signals — read-bound, UBSAN, sanitizer-reported SEGV, leaks.
+_HIGH_RE = re.compile(
+    r"(addresssanitizer"
+    r"|undefinedbehaviorsanitizer"
+    r"|leaksanitizer"
+    r"|memorysanitizer"
+    r"|threadsanitizer"
+    r"|runtime error:"
+    r"|SUMMARY: \w*Sanitizer)",
+)
+
+# Plain crash signals — the decoder fell over but no sanitizer was on.
+_MEDIUM_RE = re.compile(
+    r"(segmentation fault"
+    r"|sigsegv"
+    r"|signal 11"
+    r"|sigabrt"
+    r"|signal 6"
+    r"|aborted"
+    r"|assertion .*failed"
+    r"|\*\*\* stack smashing detected"
+    r"|terminate called)",
+    re.IGNORECASE,
+)
+
+
+def severity_for(stderr: str) -> str:
+    """Classify one crash's stderr into a severity bucket.
+
+    Returns one of :data:`SEVERITY_ORDER` (``"critical" | "high" | "medium" |
+    "low"``). Pure function of the stderr text; the first matching tier wins.
+    """
+    if _CRITICAL_DIRECT_RE.search(stderr):
+        return "critical"
+    if _BUFOVERFLOW_RE.search(stderr) and _WRITE_RE.search(stderr):
+        return "critical"
+    if _HIGH_RE.search(stderr):
+        return "high"
+    if _MEDIUM_RE.search(stderr):
+        return "medium"
+    return "low"
+
+
 @dataclass
 class CrashSignature:
     """The fingerprint of a single crash artifact.
@@ -157,6 +259,7 @@ class CrashRecord:
     iteration: int
     size: int
     signature: CrashSignature
+    severity: str = "low"
 
 
 @dataclass
@@ -172,6 +275,7 @@ class CrashCluster:
     representative_hash: str
     representative_frames: list[str]
     member_hashes: list[str]
+    severity: str = "low"
 
 
 def _load_results(results_path: Path) -> list[dict]:
@@ -221,6 +325,7 @@ def cluster_crashes(
         stderr = txt_path.read_text() if txt_path.exists() else ""
         size = bin_path.stat().st_size if bin_path.exists() else 0
         sig = signature_for(stderr, frame_depth)
+        sev = severity_for(stderr)
         # The same crash_hash can appear from re-runs; keep the first (lowest
         # iteration) record per hash for stability.
         existing = records.get(crash_hash)
@@ -232,6 +337,7 @@ def cluster_crashes(
                 iteration=obj["iteration"],
                 size=size,
                 signature=sig,
+                severity=sev,
             )
 
     buckets: dict[tuple[str, str, str], list[CrashRecord]] = {}
@@ -245,6 +351,13 @@ def cluster_crashes(
         # lowest iteration for full determinism.
         members.sort(key=lambda r: (r.size, r.iteration, r.crash_hash))
         rep = members[0]
+        # Cluster severity = the highest severity any member earned. Members
+        # of one cluster share a signature so this almost always degenerates
+        # to a single value, but the worst-case wins on the rare disagreement.
+        cluster_sev = min(
+            (SEVERITY_ORDER.index(r.severity) for r in members),
+            default=SEVERITY_ORDER.index("low"),
+        )
         clusters.append(
             CrashCluster(
                 cluster_id=0,  # assigned after global sort
@@ -256,6 +369,7 @@ def cluster_crashes(
                 representative_hash=rep.crash_hash,
                 representative_frames=rep.signature.frames,
                 member_hashes=sorted(r.crash_hash for r in members),
+                severity=SEVERITY_ORDER[cluster_sev],
             )
         )
 
@@ -265,16 +379,42 @@ def cluster_crashes(
     return clusters
 
 
+def bucket_clusters(
+    clusters: list[CrashCluster],
+) -> dict[str, list[CrashCluster]]:
+    """Group clusters by severity bucket.
+
+    Returns an ordered dict with one entry per tier in :data:`SEVERITY_ORDER`
+    (highest severity first); empty tiers are kept so downstream consumers
+    always see the full ladder. Within each bucket the clusters keep the
+    incoming order (by descending member count, then signature) so callers
+    that already sorted on those keys get the same ordering inside a tier.
+    """
+    out: dict[str, list[CrashCluster]] = {tier: [] for tier in SEVERITY_ORDER}
+    for c in clusters:
+        out[c.severity].append(c)
+    return out
+
+
 def triage(
     output_dir: str | Path,
     decoder: str = "ffmpeg",
     frame_depth: int = 3,
+    bucket: bool = False,
 ) -> list[CrashCluster]:
     """Run the full triage pass: cluster, then write triage.jsonl + uniques.
 
     Writes ``<output_dir>/triage.jsonl`` (one cluster per line) and copies each
     cluster's representative ``<hash>.h265`` and ``<hash>.txt`` into
     ``<output_dir>/unique-crashes/``. Returns the cluster list.
+
+    When ``bucket`` is True, additionally writes a severity-bucketed view of
+    the same clusters: ``triage-buckets.json`` (per-bucket cluster counts,
+    member counts, and the cluster ids/representative hashes in each bucket)
+    and a ``unique-crashes/<severity>/`` subdirectory layout that copies each
+    representative PoC into the bucket of its severity. The default
+    (``bucket=False``) keeps the exact byte-identical output shape of earlier
+    releases.
     """
     out_dir = Path(output_dir)
     clusters = cluster_crashes(out_dir, decoder=decoder, frame_depth=frame_depth)
@@ -291,4 +431,47 @@ def triage(
                 src = crashes_dir / f"{c.representative_hash}{suffix}"
                 if src.exists():
                     shutil.copy2(src, unique_dir / src.name)
+
+    if bucket:
+        buckets = bucket_clusters(clusters)
+        # Copy representatives into per-severity subdirs. Existing flat copies
+        # under unique-crashes/ stay where they are so existing tools that
+        # read that layout do not break.
+        for sev, sev_clusters in buckets.items():
+            sev_dir = unique_dir / sev
+            sev_dir.mkdir(parents=True, exist_ok=True)
+            for c in sev_clusters:
+                for suffix in (".h265", ".txt"):
+                    src = crashes_dir / f"{c.representative_hash}{suffix}"
+                    if src.exists():
+                        shutil.copy2(src, sev_dir / src.name)
+
+        bucket_summary = {
+            "version": 1,
+            "total_clusters": len(clusters),
+            "total_crashes": sum(c.count for c in clusters),
+            "buckets": [
+                {
+                    "severity": sev,
+                    "cluster_count": len(sev_clusters),
+                    "crash_count": sum(c.count for c in sev_clusters),
+                    "clusters": [
+                        {
+                            "cluster_id": c.cluster_id,
+                            "representative_hash": c.representative_hash,
+                            "signature_kind": c.signature_kind,
+                            "signature": c.signature,
+                            "decoder": c.decoder,
+                            "mutator": c.mutator,
+                            "count": c.count,
+                        }
+                        for c in sev_clusters
+                    ],
+                }
+                for sev, sev_clusters in buckets.items()
+            ],
+        }
+        (out_dir / "triage-buckets.json").write_text(
+            json.dumps(bucket_summary, indent=2) + "\n"
+        )
     return clusters

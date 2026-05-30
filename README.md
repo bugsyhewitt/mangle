@@ -530,6 +530,65 @@ The `--decoder` label is recorded in the cluster key (so a combined triage of tw
 campaigns keeps per-decoder buckets distinct). Triage makes **no changes** to the
 fuzzing pipeline and is fully deterministic.
 
+#### Severity bucketing (`--triage-bucket`)
+
+Triage answers *"are these the same bug?"*; it does not answer *"which of these
+bugs do I look at first?"*. A campaign that deduplicates to 12 unique bugs still
+hands the operator a flat list — and reviewing a write-bound heap-buffer-overflow
+before a plain SIGABRT is the difference between catching an exploitable
+primitive same-day and burying it under DoS-class noise. `--triage-bucket`
+classifies each cluster into a four-tier severity ladder using *only* the saved
+`crashes/<hash>.txt` text the signature pass already reads — no decoder re-run,
+no new I/O, fully deterministic:
+
+```bash
+mangle triage \
+  --output-dir /tmp/fuzz-out \
+  --triage-bucket
+```
+
+The tiers (highest first, first match wins):
+
+- **critical** — sanitizer-confirmed write-bound or lifetime-corruption memory
+  bug: heap/stack-buffer-overflow **WRITE**, heap-use-after-free, double-free,
+  write-after-free. The classic exploitable primitives.
+- **high** — other sanitizer reports: read-bound buffer overflows, UBSAN runtime
+  errors, sanitizer-reported SEGV, leak-sanitizer findings. The bug is real and
+  the sanitizer pinned it; exploitability is less clear-cut than the write-bound
+  classes.
+- **medium** — a plain (non-sanitizer) SIGSEGV / SIGABRT / assertion failure.
+  Solid DoS-class signal, ambiguous on memory safety.
+- **low** — anything else that still earned a `crash_hash` (decoder-reported
+  errors with no crash signal, etc.).
+
+Each `triage.jsonl` cluster row now carries a `severity` field. With
+`--triage-bucket` two extra artifacts are written:
+
+- `/tmp/fuzz-out/triage-buckets.json` — the bucketed summary: `total_clusters`,
+  `total_crashes`, and a `buckets` array (one entry per tier, always all four
+  in order) listing `cluster_count`, `crash_count`, and the cluster ids and
+  representative hashes in that bucket.
+- `/tmp/fuzz-out/unique-crashes/<severity>/<hash>.{h265,txt}` — each
+  cluster's representative PoC copied into the subdir of its severity, so the
+  reviewer can `ls unique-crashes/critical/` and see the bugs that need
+  attention first. The original flat `unique-crashes/<hash>.{h265,txt}`
+  layout is preserved alongside, so existing tools that read it do not break.
+
+The CLI summary line prints the per-bucket bug counts:
+
+```
+severity buckets:
+  critical: 2 bug(s), 47 crash artifact(s)
+  high: 1 bug(s), 8 crash artifact(s)
+  medium: 4 bug(s), 23 crash artifact(s)
+  low: 1 bug(s), 1 crash artifact(s)
+```
+
+Omitting `--triage-bucket` preserves byte-identical legacy output — no
+`triage-buckets.json` is written, no severity subdirs appear under
+`unique-crashes/`, and only the new `severity` field on each cluster row is
+added (deterministic, populated from the same stderr already on disk).
+
 ### Minimise a crash to its smallest reproducer
 
 ```bash

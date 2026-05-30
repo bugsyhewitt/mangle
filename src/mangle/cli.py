@@ -372,6 +372,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="number of top sanitizer stack frames used as the signature",
     )
+    p_triage.add_argument(
+        "--triage-bucket",
+        action="store_true",
+        help=(
+            "group clusters into severity buckets (critical / high / medium "
+            "/ low) classified from the same crash stderr triage already "
+            "reads. Writes triage-buckets.json plus a "
+            "unique-crashes/<severity>/ subdir layout. Pure post-processing "
+            "— no decoder re-run."
+        ),
+    )
     p_triage.set_defaults(func=_cmd_triage)
 
     # reduce
@@ -745,10 +756,13 @@ def _cmd_corpus_trim(args: argparse.Namespace) -> int:
 
 
 def _cmd_triage(args: argparse.Namespace) -> int:
+    from .triage import SEVERITY_ORDER, bucket_clusters
+
     clusters = triage(
         output_dir=args.output_dir,
         decoder=args.decoder,
         frame_depth=args.frame_depth,
+        bucket=args.triage_bucket,
     )
     total_members = sum(c.count for c in clusters)
     print(
@@ -757,12 +771,24 @@ def _cmd_triage(args: argparse.Namespace) -> int:
     )
     for c in clusters:
         sig = c.signature if c.signature_kind == "asan" else f"stderr:{c.signature}"
+        sev_tag = f"[{c.severity}] " if args.triage_bucket else ""
         print(
-            f"  cluster {c.cluster_id}: {c.count}x [{c.mutator}] "
+            f"  cluster {c.cluster_id}: {sev_tag}{c.count}x [{c.mutator}] "
             f"{c.signature_kind} {sig}"
         )
     print(f"triage written to {args.output_dir}/triage.jsonl")
     print(f"unique PoCs in {args.output_dir}/unique-crashes/")
+    if args.triage_bucket:
+        buckets = bucket_clusters(clusters)
+        print("severity buckets:")
+        for sev in SEVERITY_ORDER:
+            sev_clusters = buckets[sev]
+            crash_count = sum(c.count for c in sev_clusters)
+            print(
+                f"  {sev}: {len(sev_clusters)} bug(s), "
+                f"{crash_count} crash artifact(s)"
+            )
+        print(f"bucket summary written to {args.output_dir}/triage-buckets.json")
     return 0
 
 
