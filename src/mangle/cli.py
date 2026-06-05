@@ -219,6 +219,21 @@ def build_parser() -> argparse.ArgumentParser:
             "one round of --concurrency iterations. N must be a positive integer."
         ),
     )
+    p_fuzz.add_argument(
+        "--max-time-without-crash",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "stop the campaign if no new unique crash signature is discovered for "
+            "this many consecutive wall-clock seconds (stagnation stop). The window "
+            "resets each time a novel crash is found; if no crash is ever found the "
+            "window runs from campaign start. Requires --crash-dedup (the stagnation "
+            "check counts *new unique* crashes, which requires in-campaign "
+            "deduplication to be active). The campaign stops at round boundaries — "
+            "in-flight decodes are never killed. SECONDS must be a positive number."
+        ),
+    )
     p_fuzz.set_defaults(func=_cmd_fuzz)
 
     # diff
@@ -640,6 +655,14 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.max_time_without_crash is not None and not args.crash_dedup:
+        print(
+            "error: --max-time-without-crash requires --crash-dedup "
+            "(the stagnation check counts new unique crashes, which requires "
+            "in-campaign deduplication to be active)",
+            file=sys.stderr,
+        )
+        return 2
     scheduler_state = None
     if args.scheduler_state is not None:
         if args.strategy == "uniform":
@@ -674,6 +697,7 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         crash_dedup=args.crash_dedup,
         dedup_frame_depth=args.dedup_frame_depth,
         max_crashes=args.max_crashes,
+        max_time_without_crash=args.max_time_without_crash,
     )
     counts = Counter(r.outcome for r in results)
     crashes = [r for r in results if r.crash_hash]
@@ -689,6 +713,11 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         budget_note += (
             f", stopped at {unique_now} unique crash(es) "
             f"(--max-crashes {args.max_crashes})"
+        )
+    if args.max_time_without_crash is not None:
+        budget_note += (
+            f", stagnation-stop after {args.max_time_without_crash:g}s without new crash "
+            f"(--max-time-without-crash {args.max_time_without_crash:g})"
         )
     if args.seed_from_crashes:
         n_seeds = len({r.base_seed for r in results if r.base_seed is not None})

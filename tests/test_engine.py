@@ -1910,3 +1910,218 @@ class TestMaxCrashes:
         assert rc == 2
         err = capsys.readouterr().err
         assert "--max-crashes requires --crash-dedup" in err
+
+
+class TestMaxTimeWithoutCrash:
+    """Tests for the --max-time-without-crash N stagnation stop condition."""
+
+    def test_campaign_stops_on_stagnation(self, tmp_path, monkeypatch):
+        # All iterations are clean — no crashes. The stagnation window starts at
+        # campaign start (no crash ever). With a small window and a clock that
+        # advances past it, the campaign should stop before all iterations run.
+        #
+        # Clock: starts at 0.0, steps +10.0 per read. Window = 5.0 s.
+        # After the first round (clock reads: 0.0 start, then 10.0 check) the
+        # elapsed time since last crash (which is the campaign start, 0.0) is
+        # 10.0 >= 5.0, so the campaign stops immediately after the first round.
+        fake_clock = _FakeClock(start=0.0, step=10.0)
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=50,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            concurrency=1,
+            crash_dedup=True,
+            max_time_without_crash=5.0,
+            clock=fake_clock,
+        )
+        # Campaign should have stopped well before 50 iterations.
+        assert len(results) < 50
+
+    def test_campaign_continues_while_crashes_arrive(self, tmp_path, monkeypatch):
+        # Every iteration produces a unique crash. The stagnation window should
+        # reset on every new unique crash, so the campaign keeps going.
+        # Clock advances 1.0 per read; window = 100.0 s (very wide). The campaign
+        # completes all iterations because the window is never exceeded — every
+        # round produces a new unique crash that resets the timer.
+        fake_clock = _FakeClock(start=0.0, step=1.0)
+        call_count = [0]
+
+        def outcomes(i):
+            # Each call gets a unique ASAN stderr so dedup_first is always True.
+            n = call_count[0]
+            call_count[0] += 1
+            return DecodeResult(Outcome.CRASH, -signal.SIGSEGV, f"AddressSanitizer unique #{n}\n#0 fn_{n}")
+
+        _patch_decoder(monkeypatch, outcomes)
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=8,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            concurrency=1,
+            crash_dedup=True,
+            max_time_without_crash=100.0,
+            clock=fake_clock,
+        )
+        # All 8 iterations completed because the stagnation window was never hit.
+        assert len(results) == 8
+        unique = sum(1 for r in results if r.dedup_first)
+        assert unique == 8
+
+    def test_campaign_stops_after_crash_window_expires(self, tmp_path, monkeypatch):
+        # One crash in the first iteration, then all clean. The stagnation window
+        # should reset when the crash arrives, then expire on subsequent rounds.
+        #
+        # Clock: step=1.0, window=50.0. The campaign start timestamp is 0.0.
+        # After round 0 (crash): clock() call to update _last_new_crash returns
+        # some value ~N. Subsequent rounds see elapsed=(clock()-N) growing by 1
+        # per call. With window=50 and step=1, after 50+ reads since the last
+        # crash update the stagnation check fires. The campaign runs more than 1
+        # iteration but stops well before 500.
+        #
+        # Simpler: use step=60.0 and window=30.0, but avoid triggering stagnation
+        # before the first round by starting clock BEFORE _last_new_crash is set,
+        # so the initial value and the first stagnation check share the same read.
+        # With concurrency=1 the round loop is:
+        #   1. _budget_exhausted() — skip (no time_limit)
+        #   2. max_crashes check — skip
+        #   3. _stagnated() → calls clock()  [read N]
+        #   4. dispatch round (1 iter)
+        #   5. update _last_new_crash → calls clock() [read N+1] if crash
+        #   6. next iteration: _stagnated() → calls clock() [read N+2]
+        #      elapsed = (N+2) - (N+1) = 1 step = 60.0 < 30? No → keep going
+        # Actually with step=60 and window=30: (N+2)-(N+1) = 60 > 30 → stops.
+        #
+        # We want the crash to be recorded AND then the next round to stagnate.
+        # Use step=1.0 so each read advances 1 s. Window=50 s. The campaign start
+        # sets _last_new_crash[0] = clock() (call #1 = 1.0). Stagnation check
+        # before round 0: clock() = 2.0; elapsed = 2-1 = 1 < 50 → run round.
+        # Round 0 produces a crash; _last_new_crash[0] = clock() = 3.0. Round 1
+        # check: clock() = 4.0; elapsed = 4-3 = 1 < 50 → run. ... This never
+        # stops early. We need a clock that jumps by 60 AFTER the first reset.
+        #
+        # Best approach: use a custom callable that returns small values for the
+        # first few reads then jumps. But that's fragile. Instead, use a concrete
+        # scenario: step=60.0, window=30.0, and ensure the initial _last_new_crash
+        # read and the first stagnation-check read are the SAME call (they won't be
+        # — there are two reads before round 0: one for _last_new_crash and one for
+        # the stagnation check). So elapsed at round-0 check = 60 > 30 and stops.
+        #
+        # To avoid that, start the clock from a negative value so the campaign-start
+        # read is 0.0 and the first stagnation check is 60.0 — elapsed = 60 > 30,
+        # still stops. The correct fix: set the window large enough that the first
+        # stagnation check does NOT fire, yet after ONE clock step post-crash the
+        # second stagnation check DOES fire.
+        #
+        # With step=1.0, each read advances 1 s. Window = 0.5 s → ANY gap fires.
+        # _last_new_crash = clock() [read k]. Round stagnation check calls clock()
+        # [read k+1]. elapsed = 1.0 >= 0.5 → stagnates before ANY round runs.
+        #
+        # Conclusion: a fixed-step clock always fires the stagnation check the
+        # cycle AFTER the crash reset because the check reads the clock once and
+        # the update reads it once, advancing by exactly one step. We need a window
+        # smaller than two steps but larger than one step. With step=10.0 and
+        # window=15.0, after crash reset: _last_new_crash = clock()=K; next check
+        # reads clock()=K+10; elapsed=10 < 15 → safe. Check after next round reads
+        # clock()=K+20; elapsed=20 >= 15 → stagnates. This works if the crash lands
+        # in round 0 AND the update-read and check-read bracket correctly.
+        #
+        # Use step=10.0, window=15.0, crash in iteration 0 only.
+        fake_clock = _FakeClock(start=0.0, step=10.0)
+        call_count = [0]
+
+        def outcomes(i):
+            n = call_count[0]
+            call_count[0] += 1
+            if n == 0:
+                return DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A)
+            return DecodeResult(Outcome.CLEAN, 0, "")
+
+        _patch_decoder(monkeypatch, outcomes)
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=50,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            concurrency=1,
+            crash_dedup=True,
+            max_time_without_crash=15.0,
+            clock=fake_clock,
+        )
+        # The crash appeared in round 0, the stagnation window expired after
+        # round 1 (or later), so the campaign stopped before all 50 iterations.
+        assert len(results) < 50
+        unique = sum(1 for r in results if r.dedup_first)
+        assert unique == 1
+
+    def test_max_time_without_crash_without_dedup_raises(self, tmp_path):
+        import pytest
+        with pytest.raises(ValueError, match="--max-time-without-crash requires --crash-dedup"):
+            engine.fuzz_file(
+                SEED,
+                tmp_path / "out",
+                iterations=4,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_rng=1,
+                crash_dedup=False,
+                max_time_without_crash=30.0,
+            )
+
+    def test_max_time_without_crash_zero_raises(self, tmp_path):
+        import pytest
+        with pytest.raises(ValueError, match="--max-time-without-crash must be a positive number"):
+            engine.fuzz_file(
+                SEED,
+                tmp_path / "out",
+                iterations=4,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_rng=1,
+                crash_dedup=True,
+                max_time_without_crash=0,
+            )
+
+    def test_max_time_without_crash_negative_raises(self, tmp_path):
+        import pytest
+        with pytest.raises(ValueError, match="--max-time-without-crash must be a positive number"):
+            engine.fuzz_file(
+                SEED,
+                tmp_path / "out",
+                iterations=4,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_rng=1,
+                crash_dedup=True,
+                max_time_without_crash=-5.0,
+            )
+
+    def test_cli_max_time_without_crash_without_dedup_returns_2(self, tmp_path, capsys):
+        out_dir = tmp_path / "out"
+        rc = main(
+            [
+                "fuzz",
+                "--seed",
+                str(SEED),
+                "--output-dir",
+                str(out_dir),
+                "--iterations",
+                "4",
+                "--max-time-without-crash",
+                "30",
+            ]
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "--max-time-without-crash requires --crash-dedup" in err
