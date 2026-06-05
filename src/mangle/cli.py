@@ -206,6 +206,19 @@ def build_parser() -> argparse.ArgumentParser:
             "the signature (default 3, matching `mangle triage --frame-depth`)"
         ),
     )
+    p_fuzz.add_argument(
+        "--max-crashes",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "stop the campaign after N unique crash signatures are accumulated. "
+            "Requires --crash-dedup (unique crash counting depends on in-campaign "
+            "deduplication being active). The campaign stops at round boundaries "
+            "so the actual number of crashes may slightly exceed N by at most "
+            "one round of --concurrency iterations. N must be a positive integer."
+        ),
+    )
     p_fuzz.set_defaults(func=_cmd_fuzz)
 
     # diff
@@ -620,6 +633,13 @@ def _cmd_mutate(args: argparse.Namespace) -> int:
 
 
 def _cmd_fuzz(args: argparse.Namespace) -> int:
+    if args.max_crashes is not None and not args.crash_dedup:
+        print(
+            "error: --max-crashes requires --crash-dedup "
+            "(unique crash counting is only possible when in-campaign deduplication is active)",
+            file=sys.stderr,
+        )
+        return 2
     scheduler_state = None
     if args.scheduler_state is not None:
         if args.strategy == "uniform":
@@ -653,6 +673,7 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         scheduler_state=scheduler_state,
         crash_dedup=args.crash_dedup,
         dedup_frame_depth=args.dedup_frame_depth,
+        max_crashes=args.max_crashes,
     )
     counts = Counter(r.outcome for r in results)
     crashes = [r for r in results if r.crash_hash]
@@ -662,6 +683,12 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
         budget_note = (
             f", time-limited to {args.time_limit:g}s "
             f"(of up to {args.iterations} iteration cap)"
+        )
+    if args.max_crashes is not None:
+        unique_now = sum(1 for r in crashes if r.dedup_first) if crashes else 0
+        budget_note += (
+            f", stopped at {unique_now} unique crash(es) "
+            f"(--max-crashes {args.max_crashes})"
         )
     if args.seed_from_crashes:
         n_seeds = len({r.base_seed for r in results if r.base_seed is not None})
