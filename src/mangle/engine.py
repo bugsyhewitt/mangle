@@ -298,6 +298,7 @@ async def fuzz_async(
     crash_dedup: bool = False,
     dedup_frame_depth: int = 3,
     max_crashes: int | None = None,
+    max_time_without_crash: float | None = None,
 ) -> list[IterationResult]:
     """Run ``iterations`` mutate+decode cycles and record outcomes.
 
@@ -348,6 +349,16 @@ async def fuzz_async(
     individually replayable: its mutator and per-iteration ``seed_rng`` are
     recorded in ``results.jsonl`` exactly as before. ``clock`` is the monotonic
     time source (injectable for testing).
+
+    ``max_time_without_crash`` (seconds) is an optional stagnation-stop:
+    if no *new* unique crash signature is discovered for this many consecutive
+    wall-clock seconds the campaign stops dispatching new iterations, even if
+    the ``iterations`` budget and ``time_limit`` have not been reached. The
+    window is measured from campaign start (or the last new crash, whichever is
+    more recent). Like ``max_crashes``, this guard requires ``crash_dedup=True``
+    — unique crash counting is only possible when in-campaign deduplication is
+    active. Checked at round boundaries (not mid-round); in-flight decodes are
+    never killed. ``None`` (the default) disables the stagnation check.
     """
     sources_supplied = sum(
         x is not None for x in (seed_path, seed_from_crashes, seed_corpus_dir)
@@ -373,6 +384,17 @@ async def fuzz_async(
         raise ValueError(
             "--max-crashes requires --crash-dedup: unique crash counting is only "
             "possible when in-campaign deduplication is active"
+        )
+    if max_time_without_crash is not None and max_time_without_crash <= 0:
+        raise ValueError(
+            f"--max-time-without-crash must be a positive number of seconds "
+            f"(got {max_time_without_crash})"
+        )
+    if max_time_without_crash is not None and not crash_dedup:
+        raise ValueError(
+            "--max-time-without-crash requires --crash-dedup: the stagnation "
+            "check counts *new unique* crashes, which is only possible when "
+            "in-campaign deduplication is active"
         )
     # Resolve the time source at call time (not at def time) so a test can patch
     # ``engine.time.monotonic`` and have it take effect here.
@@ -442,7 +464,21 @@ async def fuzz_async(
     def _budget_exhausted() -> bool:
         return deadline is not None and clock() >= deadline
 
-    if strategy == "uniform" and time_limit is None and max_crashes is None:
+    # Stagnation tracking: ``last_new_crash_time`` is the monotonic timestamp at
+    # which the most recent *new* unique crash was discovered (or the campaign
+    # start time if no crash has been found yet).  When max_time_without_crash is
+    # set we check at every round boundary whether the gap has been exceeded.
+    # Using a mutable container so the inner closure can rebind it.
+    # Only read the clock here when stagnation tracking is active — tests that
+    # patch the clock for time_limit tests must not see an extra read.
+    _last_new_crash = [clock() if max_time_without_crash is not None else 0.0]
+
+    def _stagnated() -> bool:
+        if max_time_without_crash is None:
+            return False
+        return clock() - _last_new_crash[0] >= max_time_without_crash
+
+    if strategy == "uniform" and time_limit is None and max_crashes is None and max_time_without_crash is None:
         # Single-shot dispatch preserves the exact v0.1 RNG stream and the full
         # parallelism of one big asyncio.gather. Only taken when there is no
         # time budget and no --max-crashes cap, so a plain ``--iterations``
@@ -488,6 +524,11 @@ async def fuzz_async(
             # crash_dedup.
             if max_crashes is not None and dedup is not None and len(dedup._seen) >= max_crashes:
                 break
+            # Stop when the stagnation window has elapsed with no new unique
+            # crash. Checked at round boundaries (not mid-round) for the same
+            # reason as the max_crashes check above.
+            if _stagnated():
+                break
             count = min(round_size, iterations - start)
             round_tasks = []
             picks = []
@@ -513,6 +554,14 @@ async def fuzz_async(
             round_results = await asyncio.gather(*round_tasks)
             for pick, res in zip(picks, round_results):
                 scheduler.update(pick, res.outcome in _REWARD_OUTCOMES)
+            # Update the stagnation clock whenever a *new* unique crash appeared
+            # in this round (dedup_first=True means the signature had not been
+            # seen before). Checked after every round so the window resets as
+            # soon as a novel crash lands.
+            if max_time_without_crash is not None and any(
+                r.dedup_first is True for r in round_results
+            ):
+                _last_new_crash[0] = clock()
             results.extend(round_results)
 
     results.sort(key=lambda r: r.iteration)
@@ -565,6 +614,7 @@ def fuzz_file(
     crash_dedup: bool = False,
     dedup_frame_depth: int = 3,
     max_crashes: int | None = None,
+    max_time_without_crash: float | None = None,
 ) -> list[IterationResult]:
     """Synchronous wrapper around :func:`fuzz_async`."""
     return asyncio.run(
@@ -586,6 +636,7 @@ def fuzz_file(
             crash_dedup=crash_dedup,
             dedup_frame_depth=dedup_frame_depth,
             max_crashes=max_crashes,
+            max_time_without_crash=max_time_without_crash,
         )
     )
 
