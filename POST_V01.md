@@ -779,6 +779,7 @@ already recorded by the item #11 parser extension).
 | 14 | pps-slice-header-extension | PPS→slice-header extension gate | Slice-header skip OOB read | ~80 | ✅ DONE |
 | 15 | pps-lists-modification | PPS→slice-header ref-pic-list reorder gate | Ref-list index OOB read | ~75 | ✅ DONE |
 | 16 | pps-deblocking-control-gate | PPS deblocking-control gate inconsistency | PPS-tail desync / derive-path crash | ~85 | ✅ DONE |
+| 17 | --max-crashes N campaign cap | Fuzz campaign control | Operational / CI | ~60 | ✅ DONE |
 
 ---
 

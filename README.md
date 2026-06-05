@@ -190,6 +190,28 @@ earlier releases — every crash writes its artifact pair, no
 `dedup-signatures.json` is touched, and the new results.jsonl fields are
 recorded as `null`.
 
+#### Unique-crash campaign cap (`--max-crashes`)
+
+`--max-crashes N` stops the fuzz campaign after `N` unique crash signatures are
+accumulated. It requires `--crash-dedup` (unique counting depends on
+in-campaign deduplication being active). The stop is checked at round
+boundaries (rounds of `--concurrency` iterations each), so the actual crash
+count may exceed `N` by at most one round's worth of concurrent iterations.
+
+```bash
+mangle fuzz \
+  --seed tests/fixtures/clean.h265 \
+  --output-dir /tmp/fuzz-out \
+  --iterations 100000 \
+  --crash-dedup \
+  --max-crashes 10     # stop once 10 distinct bugs have been found
+```
+
+This is useful for CI pipelines and timed fuzzing loops: set `--iterations`
+as a large safety cap and let `--max-crashes` be the real termination
+condition. `--max-crashes` and `--time-limit` can be combined — whichever
+limit is hit first stops the campaign.
+
 #### Adaptive mutator prioritisation (`--strategy`)
 
 By default (`--strategy uniform`) every mutator is equally likely on every

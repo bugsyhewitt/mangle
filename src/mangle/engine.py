@@ -297,6 +297,7 @@ async def fuzz_async(
     scheduler_state: dict | None = None,
     crash_dedup: bool = False,
     dedup_frame_depth: int = 3,
+    max_crashes: int | None = None,
 ) -> list[IterationResult]:
     """Run ``iterations`` mutate+decode cycles and record outcomes.
 
@@ -363,6 +364,15 @@ async def fuzz_async(
     if time_limit is not None and time_limit <= 0:
         raise ValueError(
             f"--time-limit must be a positive number of seconds (got {time_limit})"
+        )
+    if max_crashes is not None and max_crashes <= 0:
+        raise ValueError(
+            f"--max-crashes must be a positive integer (got {max_crashes})"
+        )
+    if max_crashes is not None and not crash_dedup:
+        raise ValueError(
+            "--max-crashes requires --crash-dedup: unique crash counting is only "
+            "possible when in-campaign deduplication is active"
         )
     # Resolve the time source at call time (not at def time) so a test can patch
     # ``engine.time.monotonic`` and have it take effect here.
@@ -432,11 +442,11 @@ async def fuzz_async(
     def _budget_exhausted() -> bool:
         return deadline is not None and clock() >= deadline
 
-    if strategy == "uniform" and time_limit is None:
+    if strategy == "uniform" and time_limit is None and max_crashes is None:
         # Single-shot dispatch preserves the exact v0.1 RNG stream and the full
         # parallelism of one big asyncio.gather. Only taken when there is no
-        # time budget, so a plain ``--iterations`` campaign is byte-for-byte the
-        # same as earlier releases.
+        # time budget and no --max-crashes cap, so a plain ``--iterations``
+        # campaign is byte-for-byte the same as earlier releases.
         tasks = []
         for i in range(iterations):
             mutator_name = scheduler.select(base_rng)
@@ -469,6 +479,14 @@ async def fuzz_async(
             # Stop launching new work once the wall-clock budget is spent. Already
             # dispatched rounds have completed; in-flight decodes are never killed.
             if _budget_exhausted():
+                break
+            # Stop once the unique-crash cap is reached. Checked at round
+            # boundaries (not mid-round) because dedup state is updated
+            # asynchronously within a round and a mid-round check would
+            # require a lock. dedup is guaranteed non-None here because
+            # fuzz_async() raises ValueError if max_crashes is set without
+            # crash_dedup.
+            if max_crashes is not None and dedup is not None and len(dedup._seen) >= max_crashes:
                 break
             count = min(round_size, iterations - start)
             round_tasks = []
@@ -546,6 +564,7 @@ def fuzz_file(
     scheduler_state: dict | None = None,
     crash_dedup: bool = False,
     dedup_frame_depth: int = 3,
+    max_crashes: int | None = None,
 ) -> list[IterationResult]:
     """Synchronous wrapper around :func:`fuzz_async`."""
     return asyncio.run(
@@ -566,6 +585,7 @@ def fuzz_file(
             scheduler_state,
             crash_dedup=crash_dedup,
             dedup_frame_depth=dedup_frame_depth,
+            max_crashes=max_crashes,
         )
     )
 

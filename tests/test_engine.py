@@ -1813,3 +1813,100 @@ class TestCrashDedupCli:
         assert rc == 0
         payload = json.loads((out_dir / "dedup-signatures.json").read_text())
         assert payload["frame_depth"] == 1
+
+
+class TestMaxCrashes:
+    """Tests for the --max-crashes N campaign stop condition."""
+
+    def test_campaign_stops_at_max_crashes(self, tmp_path, monkeypatch):
+        # Two distinct crash signatures (A and B alternating). max_crashes=1 →
+        # campaign should stop after the first unique signature is recorded.
+        # With concurrency=1 and round_size=1 the check fires after each
+        # round, so the campaign stops as soon as one unique crash lands.
+        def outcomes(i):
+            return DecodeResult(Outcome.CRASH, -signal.SIGSEGV, _ASAN_A if i % 2 == 0 else _ASAN_B)
+
+        _patch_decoder(monkeypatch, outcomes)
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=20,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            concurrency=1,
+            crash_dedup=True,
+            max_crashes=1,
+        )
+        unique_crashes = sum(1 for r in results if r.dedup_first)
+        # Exactly one unique crash should have triggered the stop.
+        assert unique_crashes == 1
+        # The campaign ran fewer than all 20 iterations.
+        assert len(results) < 20
+
+    def test_campaign_runs_to_completion_when_under_max(self, tmp_path, monkeypatch):
+        # All iterations are clean — no crashes. max_crashes=5 is never reached.
+        # The campaign should run to the full iteration count.
+        _patch_decoder(monkeypatch, lambda i: DecodeResult(Outcome.CLEAN, 0, ""))
+        out_dir = tmp_path / "fuzz-out"
+        results = engine.fuzz_file(
+            SEED,
+            out_dir,
+            iterations=8,
+            decoder="ffmpeg",
+            timeout=5.0,
+            seed_rng=1,
+            concurrency=2,
+            crash_dedup=True,
+            max_crashes=5,
+        )
+        assert len(results) == 8
+        assert all(r.outcome == "clean" for r in results)
+
+    def test_max_crashes_without_crash_dedup_raises(self, tmp_path):
+        import pytest
+        with pytest.raises(ValueError, match="--max-crashes requires --crash-dedup"):
+            engine.fuzz_file(
+                SEED,
+                tmp_path / "out",
+                iterations=4,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_rng=1,
+                crash_dedup=False,
+                max_crashes=2,
+            )
+
+    def test_max_crashes_zero_raises(self, tmp_path):
+        import pytest
+        with pytest.raises(ValueError, match="--max-crashes must be a positive integer"):
+            engine.fuzz_file(
+                SEED,
+                tmp_path / "out",
+                iterations=4,
+                decoder="ffmpeg",
+                timeout=5.0,
+                seed_rng=1,
+                crash_dedup=True,
+                max_crashes=0,
+            )
+
+    def test_cli_max_crashes_without_dedup_returns_2(self, tmp_path, capsys):
+        out_dir = tmp_path / "out"
+        rc = main(
+            [
+                "fuzz",
+                "--seed",
+                str(SEED),
+                "--output-dir",
+                str(out_dir),
+                "--iterations",
+                "4",
+                "--max-crashes",
+                "2",
+            ]
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "--max-crashes requires --crash-dedup" in err
