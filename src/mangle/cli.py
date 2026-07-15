@@ -719,25 +719,15 @@ def _cmd_fuzz(args: argparse.Namespace) -> int:
             f", stagnation-stop after {args.max_time_without_crash:g}s without new crash "
             f"(--max-time-without-crash {args.max_time_without_crash:g})"
         )
-    if args.seed_from_crashes:
+    source_note = ""
+    if args.seed_from_crashes or args.seed_corpus_dir:
         n_seeds = len({r.base_seed for r in results if r.base_seed is not None})
-        print(
-            f"ran {len(results)} iterations against {args.decoder} "
-            f"({args.strategy} scheduler), fed from {n_seeds} crash seed(s)"
-            f"{budget_note}"
-        )
-    elif args.seed_corpus_dir:
-        n_seeds = len({r.base_seed for r in results if r.base_seed is not None})
-        print(
-            f"ran {len(results)} iterations against {args.decoder} "
-            f"({args.strategy} scheduler), fed from {n_seeds} corpus seed(s)"
-            f"{budget_note}"
-        )
-    else:
-        print(
-            f"ran {len(results)} iterations against {args.decoder} "
-            f"({args.strategy} scheduler){budget_note}"
-        )
+        kind = "crash" if args.seed_from_crashes else "corpus"
+        source_note = f", fed from {n_seeds} {kind} seed(s)"
+    print(
+        f"ran {len(results)} iterations against {args.decoder} "
+        f"({args.strategy} scheduler){source_note}{budget_note}"
+    )
     for outcome in ("clean", "crash", "abort", "timeout", "hang"):
         if counts.get(outcome):
             print(f"  {outcome}: {counts[outcome]}")
