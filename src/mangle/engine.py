@@ -92,52 +92,31 @@ class IterationResult:
     dedup_first: bool | None = None
 
 
-def _collect_crash_seeds(crashes_dir: str | Path) -> list[tuple[str, bytes]]:
-    """Return ``(basename, bytes)`` for every crash artifact in a directory.
+def _collect_seeds(
+    directory: str | Path,
+    label: str,
+    artifacts_name: str = "seed files",
+) -> list[tuple[str, bytes]]:
+    """Return ``(basename, bytes)`` for every ``*.h265`` file in *directory*.
 
-    Reads the ``<hash>.h265`` mutants a previous campaign wrote under its
-    ``crashes/`` directory and returns them sorted by basename so the resulting
-    seed pool — and therefore every per-iteration seed assignment derived from
-    it — is deterministic regardless of filesystem listing order.
+    Used for both ``--seed-from-crashes`` (``label="crash"``,
+    ``artifacts_name="crash artifacts"``) and ``--seed-corpus-dir``
+    (``label="corpus"``). Files are returned sorted by basename so the seed
+    pool — and every per-iteration seed assignment derived from it — is
+    deterministic regardless of filesystem listing order. Non-``*.h265`` files
+    (e.g. a sibling ``manifest.json``) are ignored.
     """
-    d = Path(crashes_dir)
+    d = Path(directory)
     if not d.is_dir():
         raise FileNotFoundError(
-            f"no such crash directory: {crashes_dir} "
-            "(expected a previous campaign's crashes/ directory of *.h265 artifacts)"
+            f"no such {label} directory: {directory} "
+            f"(expected a directory of *.h265 seed files)"
         )
     files = sorted(d.glob("*.h265"), key=lambda p: p.name)
     seeds = [(p.name, p.read_bytes()) for p in files]
     if not seeds:
         raise ValueError(
-            f"no *.h265 crash artifacts found in {crashes_dir} — nothing to seed from"
-        )
-    return seeds
-
-
-def _collect_corpus_seeds(corpus_dir: str | Path) -> list[tuple[str, bytes]]:
-    """Return ``(basename, bytes)`` for every ``*.h265`` seed in a corpus directory.
-
-    The pool driver behind ``--seed-corpus-dir``: spreads a campaign's iterations
-    across an arbitrary directory of seed files (typically the output of
-    ``mangle corpus`` or ``mangle corpus-trim``, but any directory of valid
-    H.265 streams works). Returned sorted by basename so the seed assignment is
-    deterministic regardless of filesystem listing order, mirroring
-    ``_collect_crash_seeds``. Non-``*.h265`` files in the directory are ignored
-    so a sibling ``manifest.json`` (the shape ``mangle corpus`` writes) does not
-    get fed to the decoder.
-    """
-    d = Path(corpus_dir)
-    if not d.is_dir():
-        raise FileNotFoundError(
-            f"no such corpus directory: {corpus_dir} "
-            "(expected a directory of *.h265 seed files)"
-        )
-    files = sorted(d.glob("*.h265"), key=lambda p: p.name)
-    seeds = [(p.name, p.read_bytes()) for p in files]
-    if not seeds:
-        raise ValueError(
-            f"no *.h265 seed files found in {corpus_dir} — nothing to seed from"
+            f"no *.h265 {artifacts_name} found in {directory} — nothing to seed from"
         )
     return seeds
 
@@ -198,6 +177,11 @@ class _DedupRegistry:
             if is_first:
                 self._seen.add(sig)
         return sig, is_first
+
+    @property
+    def unique_count(self) -> int:
+        """Number of distinct crash signatures seen so far."""
+        return len(self._seen)
 
     def persist(self) -> None:
         """Write the seen-signatures set to disk for resume."""
@@ -423,10 +407,10 @@ async def fuzz_async(
     # base_seed=None.
     if seed_from_crashes is not None:
         seed_pool: list[tuple[str | None, bytes]] = list(
-            _collect_crash_seeds(seed_from_crashes)
+            _collect_seeds(seed_from_crashes, "crash", artifacts_name="crash artifacts")
         )
     elif seed_corpus_dir is not None:
-        seed_pool = list(_collect_corpus_seeds(seed_corpus_dir))
+        seed_pool = list(_collect_seeds(seed_corpus_dir, "corpus"))
     else:
         seed_pool = [(None, Path(seed_path).read_bytes())]
 
@@ -522,7 +506,7 @@ async def fuzz_async(
             # require a lock. dedup is guaranteed non-None here because
             # fuzz_async() raises ValueError if max_crashes is set without
             # crash_dedup.
-            if max_crashes is not None and dedup is not None and len(dedup._seen) >= max_crashes:
+            if max_crashes is not None and dedup is not None and dedup.unique_count >= max_crashes:
                 break
             # Stop when the stagnation window has elapsed with no new unique
             # crash. Checked at round boundaries (not mid-round) for the same
@@ -692,26 +676,18 @@ async def _run_diff_iteration(
             tmp.write(mutated)
             tmp_path = tmp.name
         try:
-            if compare_output:
-                divergence = await loop.run_in_executor(
-                    None,
-                    lambda: run_decoder_pair(
-                        left_decoder,
-                        right_decoder,
-                        tmp_path,
-                        timeout,
-                        compare_output=True,
-                    ),
-                )
-            else:
-                divergence = await loop.run_in_executor(
-                    None,
-                    run_decoder_pair,
+            # run_in_executor does not accept kwargs, so always wrap in a
+            # lambda — this also handles the compare_output=False case cleanly.
+            divergence = await loop.run_in_executor(
+                None,
+                lambda: run_decoder_pair(
                     left_decoder,
                     right_decoder,
                     tmp_path,
                     timeout,
-                )
+                    compare_output=compare_output,
+                ),
+            )
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
