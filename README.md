@@ -1,5 +1,9 @@
 # mangle
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/bugsyhewitt/bugsyhewitt.github.io/main/public/cards/mangle.jpg" alt="mangle" width="680">
+</p>
+
 A structured **H.265 (HEVC)** bitstream fuzzer for security research.
 
 `mangle` generates **syntactically-correct but semantically spec-non-compliant**
