@@ -806,10 +806,9 @@ def rps_overflow(nals: list[NalUnit], rng: random.Random) -> MutationResult:
         # num_negative_pics span by rebuilding the whole st_ref_pic_set(0).
         first = sps.short_term_rps[0]
         target = rng.choice(["num_negative_pics", "num_positive_pics"])
-        crafted = ShortTermRps(
-            num_negative_pics=overflow_count if target == "num_negative_pics" else first.num_negative_pics,
-            num_positive_pics=overflow_count if target == "num_positive_pics" else first.num_positive_pics,
-        )
+        neg = overflow_count if target == "num_negative_pics" else first.num_negative_pics
+        pos = overflow_count if target == "num_positive_pics" else first.num_positive_pics
+        crafted = ShortTermRps(num_negative_pics=neg, num_positive_pics=pos)
         # Keep the deltas parseable: emit one zero-delta used pair per picture.
         crafted.delta_poc_s0_minus1 = [0] * crafted.num_negative_pics
         crafted.used_by_curr_pic_s0_flag = [1] * crafted.num_negative_pics
@@ -963,14 +962,20 @@ def vps_layer_count(nals: list[NalUnit], rng: random.Random) -> MutationResult:
         # Field is 6 bits; 63 fits (0x3F), 127 does not — clamp to 6-bit max
         new_layers_encoded = min(new_layers, 63)  # 6-bit field max is 63 (0x3F)
         new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_layers_encoded)
-        detail = f"vps_max_layers_minus1: {vps.vps_max_layers_minus1} -> {new_layers_encoded} (overflow HEVC_MAX_LAYERS=63)"
+        detail = (
+            f"vps_max_layers_minus1: {vps.vps_max_layers_minus1}"
+            f" -> {new_layers_encoded} (overflow HEVC_MAX_LAYERS=63)"
+        )
 
     elif choice == 1:
         # Mutation 2: vps_max_sub_layers_minus1 overflow (3-bit field, max=7)
         span = vps.span("vps_max_sub_layers_minus1")
         new_sub = 7  # max 3-bit value; spec range is 0..6, so 7 is the violation
         new_rbsp = splice_fixed_bits(rbsp, span.bit_offset, span.bit_length, new_sub)
-        detail = f"vps_max_sub_layers_minus1: {vps.vps_max_sub_layers_minus1} -> {new_sub} (spec range 0..6)"
+        detail = (
+            f"vps_max_sub_layers_minus1: {vps.vps_max_sub_layers_minus1}"
+            f" -> {new_sub} (spec range 0..6)"
+        )
 
     else:
         # Mutation 3: flip nesting_flag with sub_layers clamped to 0
@@ -980,7 +985,9 @@ def vps_layer_count(nals: list[NalUnit], rng: random.Random) -> MutationResult:
         # Re-parse to get updated nesting_flag position (offsets unchanged, same field)
         nesting_span = vps.span("vps_temporal_id_nesting_flag")
         flipped = 1 - vps.vps_temporal_id_nesting_flag
-        new_rbsp = splice_fixed_bits(tmp_rbsp, nesting_span.bit_offset, nesting_span.bit_length, flipped)
+        new_rbsp = splice_fixed_bits(
+            tmp_rbsp, nesting_span.bit_offset, nesting_span.bit_length, flipped
+        )
         detail = (
             f"vps_temporal_id_nesting_flag: {vps.vps_temporal_id_nesting_flag} -> {flipped} "
             f"(vps_max_sub_layers_minus1 clamped to 0; spec violation)"

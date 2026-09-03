@@ -1057,7 +1057,8 @@ class SeiMessage:
     """One SEI message located within a SEI NAL RBSP.
 
     Attributes:
-        payload_type: SEI payloadType value (e.g. 0=buffering_period, 1=pic_timing, 6=recovery_point).
+        payload_type: SEI payloadType value
+            (e.g. 0=buffering_period, 1=pic_timing, 6=recovery_point).
         payload_offset: byte offset where the payload data starts within the RBSP
             (i.e. after the payloadType and payloadSize length-prefix bytes).
         payload_size: number of bytes in the payload (as declared by the SEI message header).

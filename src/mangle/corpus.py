@@ -35,7 +35,7 @@ from .bitstream import (
     rbsp_to_ebsp,
     split_nal_units,
 )
-from .hevc import parse_sps, splice_fixed_bits, splice_ue_field
+from .hevc import parse_sps, splice_ue_field
 
 # Boundary dimension set: 1 (degenerate), 2 (sub-CTB), 16 (one CTB row), 64
 # (the seed's typical size), 256, 4096 (4K-ish), 65535 (ue(v) extreme). These
@@ -102,7 +102,7 @@ def _dimension_seeds(
     sps = parse_sps(rbsp)
     try:
         width_span = sps.span("pic_width_in_luma_samples")
-        height_span = sps.span("pic_height_in_luma_samples")
+        sps.span("pic_height_in_luma_samples")  # validate field exists
     except KeyError:
         skipped.append(
             CorpusEntry(

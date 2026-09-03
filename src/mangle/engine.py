@@ -462,7 +462,8 @@ async def fuzz_async(
             return False
         return clock() - _last_new_crash[0] >= max_time_without_crash
 
-    if strategy == "uniform" and time_limit is None and max_crashes is None and max_time_without_crash is None:
+    no_limits = time_limit is None and max_crashes is None and max_time_without_crash is None
+    if strategy == "uniform" and no_limits:
         # Single-shot dispatch preserves the exact v0.1 RNG stream and the full
         # parallelism of one big asyncio.gather. Only taken when there is no
         # time budget and no --max-crashes cap, so a plain ``--iterations``
